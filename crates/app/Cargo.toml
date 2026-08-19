@@ -1,0 +1,18 @@
+[package]
+name = "neuroevolution-racing-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "neuroevolution-racing"
+path = "src/main.rs"
+
+[dependencies]
+avian2d.workspace = true
+bevy.workspace = true
+bevy_egui.workspace = true
+egui_plot.workspace = true
+neuroevolution = { path = "../neuroevolution" }
+serde.workspace = true
+
