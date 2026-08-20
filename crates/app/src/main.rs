@@ -1,10 +1,12 @@
+mod display;
 mod rendering;
 mod simulation;
 mod ui;
 
 use avian2d::prelude::*;
-use bevy::{prelude::*, window::WindowResolution};
+use bevy::{diagnostic::FrameTimeDiagnosticsPlugin, prelude::*, window::WindowResolution};
 use bevy_egui::EguiPlugin;
+use display::DisplayPlugin;
 use rendering::RenderingPlugin;
 use simulation::SimulationPlugin;
 use ui::DashboardPlugin;
@@ -23,7 +25,13 @@ fn main() {
         }))
         .add_plugins(PhysicsPlugins::default().with_length_unit(20.0))
         .insert_resource(Gravity::ZERO)
+        .add_plugins(FrameTimeDiagnosticsPlugin::default())
         .add_plugins(EguiPlugin::default())
-        .add_plugins((SimulationPlugin, RenderingPlugin, DashboardPlugin))
+        .add_plugins((
+            SimulationPlugin,
+            DisplayPlugin,
+            RenderingPlugin,
+            DashboardPlugin,
+        ))
         .run();
 }

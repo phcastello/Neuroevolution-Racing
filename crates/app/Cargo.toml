@@ -15,4 +15,4 @@ bevy_egui.workspace = true
 egui_plot.workspace = true
 neuroevolution = { path = "../neuroevolution" }
 serde.workspace = true
-
+ron.workspace = true

@@ -15,8 +15,9 @@ bevy = { version = "0.19.1", default-features = false, features = [
     "bevy_winit",
     "default_font",
     "multi_threaded",
+    # WSLg's Wayland/Vulkan surface is lost during interactive resize with
+    # Bevy 0.19.1; X11/XWayland remains stable and handles monitor selection.
     "x11",
-    "wayland",
     "custom_cursor",
     "sysinfo_plugin",
 ] }
@@ -24,6 +25,7 @@ avian2d = "0.7.0"
 bevy_egui = "0.42.0"
 egui_plot = "0.37.0"
 serde = { version = "1.0", features = ["derive"] }
+ron = "0.12.0"
 
 [profile.dev]
 opt-level = 1

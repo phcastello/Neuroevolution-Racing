@@ -1,0 +1,9 @@
+(
+    tracks: [
+        "monza",
+        "red_bull_ring",
+        "interlagos",
+        "catalunya",
+        "silverstone",
+    ],
+)

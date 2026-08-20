@@ -1,3 +1,4 @@
+use avian2d::prelude::PhysicsLayer;
 use bevy::prelude::*;
 
 #[derive(Component, Debug)]
@@ -8,11 +9,16 @@ pub struct Car {
 #[derive(Component, Debug, Default)]
 pub struct SelectedCar;
 
+#[derive(Component, Debug, Default)]
+pub struct ManualCar;
+
+#[derive(Component, Debug, Default)]
+pub struct TemporaryControlled;
+
 #[derive(Component, Debug)]
 pub struct KinematicCar {
     pub heading: f32,
     pub speed: f32,
-    pub previous_position: Vec2,
 }
 
 #[derive(Component, Clone, Debug)]
@@ -34,28 +40,48 @@ impl Default for SensorReadings {
 
 #[derive(Component, Clone, Debug)]
 pub struct CarProgress {
-    pub expected_checkpoint: usize,
-    pub completed_checkpoints: u64,
-    pub laps: u32,
-    pub toward_next: f32,
+    pub track_distance: f32,
+    pub best_track_distance: f32,
+    pub normalized_progress: f32,
+    pub nearest_segment: usize,
+    pub projected_point: Vec2,
+    pub(crate) centerline_distance: f32,
 }
 
-impl Default for CarProgress {
-    fn default() -> Self {
+impl CarProgress {
+    pub(crate) fn new(
+        track_distance: f32,
+        total_track_length: f32,
+        nearest_segment: usize,
+        projected_point: Vec2,
+    ) -> Self {
         Self {
-            expected_checkpoint: 1,
-            completed_checkpoints: 0,
-            laps: 0,
-            toward_next: 0.0,
+            track_distance,
+            best_track_distance: track_distance,
+            normalized_progress: (track_distance / total_track_length).clamp(0.0, 1.0),
+            nearest_segment,
+            projected_point,
+            centerline_distance: track_distance,
         }
     }
 }
 
 #[derive(Component, Clone, Copy, Debug)]
 pub struct ControllerTuning {
-    pub lane_offset: f32,
     pub steering_bias: f32,
 }
 
 #[derive(Component, Debug)]
 pub struct TrackWall;
+
+#[derive(PhysicsLayer, Default)]
+pub enum SimulationLayer {
+    #[default]
+    Car,
+    TrackWall,
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default)]
+pub struct TrackDebug {
+    pub enabled: bool,
+}
