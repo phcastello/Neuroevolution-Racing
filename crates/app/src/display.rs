@@ -11,7 +11,8 @@ use bevy::{
 use bevy_egui::input::EguiWantsInput;
 
 use crate::simulation::{
-    ManualCar, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track, TrackBounds,
+    CarObservation, ManualCar, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
+    TrackBounds,
 };
 
 pub const TOP_BAR_HEIGHT: f32 = 38.0;
@@ -24,6 +25,10 @@ const ZOOM_SENSITIVITY: f32 = 0.12;
 const ROTATION_SPEED: f32 = 1.35;
 const SIGNIFICANT_RESIZE_PIXELS: u32 = 4;
 const MAX_PAN_DELTA_PER_FRAME: f32 = 120.0;
+const FOLLOW_DEFAULT_PROJECTION_SCALE: f32 = 0.55;
+const FOLLOW_MAX_SPEED_ZOOM_OUT: f32 = 0.07;
+const FOLLOW_SPEED_ZOOM_RESPONSE: f32 = 4.0;
+const FOLLOW_LOOK_AHEAD: f32 = 52.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayMode {
@@ -85,6 +90,9 @@ pub struct CameraViewState {
     pub rotation: f32,
     pub behavior: CameraBehavior,
     base_projection_scale: f32,
+    free_zoom: f32,
+    follow_zoom: f32,
+    speed_zoom_multiplier: f32,
     initialized: bool,
     fit_requested: bool,
     reset_requested: bool,
@@ -92,6 +100,7 @@ pub struct CameraViewState {
     last_scale_factor: f32,
     last_scene: Option<(SimulationMode, TestDriveEnvironment)>,
     pan_cursor: Option<Vec2>,
+    last_behavior: CameraBehavior,
 }
 
 impl Default for CameraViewState {
@@ -102,6 +111,9 @@ impl Default for CameraViewState {
             rotation: 0.0,
             behavior: CameraBehavior::Free,
             base_projection_scale: 1.0,
+            free_zoom: 1.0,
+            follow_zoom: 1.0,
+            speed_zoom_multiplier: 1.0,
             initialized: false,
             fit_requested: true,
             reset_requested: false,
@@ -109,6 +121,7 @@ impl Default for CameraViewState {
             last_scale_factor: 1.0,
             last_scene: None,
             pan_cursor: None,
+            last_behavior: CameraBehavior::Free,
         }
     }
 }
@@ -124,6 +137,10 @@ impl CameraViewState {
 
     pub fn projection_scale(&self) -> f32 {
         self.base_projection_scale / self.zoom
+    }
+
+    fn visual_projection_scale(&self) -> f32 {
+        self.projection_scale() * self.speed_zoom_multiplier
     }
 }
 
@@ -361,6 +378,10 @@ fn handle_camera_input(input: CameraInput) {
         state.center = cursor_world - (cursor_world - state.center) * scale_ratio;
     }
     state.zoom = new_zoom;
+    match state.behavior {
+        CameraBehavior::Free => state.free_zoom = new_zoom,
+        CameraBehavior::FollowCar => state.follow_zoom = new_zoom,
+    }
 }
 
 fn cursor_is_over_simulation(window: &Window, cursor: Vec2) -> bool {
@@ -372,11 +393,12 @@ fn cursor_is_over_simulation(window: &Window, cursor: Vec2) -> bool {
 }
 
 fn update_camera_view(
+    time: Res<Time<Real>>,
     window: Query<&Window, With<PrimaryWindow>>,
     track: Res<Track>,
     mode: Res<SimulationMode>,
     test_drive: Res<TestDriveSettings>,
-    manual_car: Query<&Transform, With<ManualCar>>,
+    manual_car: Query<(&Transform, &CarObservation), With<ManualCar>>,
     mut state: ResMut<CameraViewState>,
 ) {
     let Ok(window) = window.single() else {
@@ -396,7 +418,11 @@ fn update_camera_view(
     if *mode != SimulationMode::TestDrive {
         state.behavior = CameraBehavior::Free;
     }
-    if state.reset_requested {
+    let behavior_changed = state.behavior != state.last_behavior;
+    let entered_follow = behavior_changed && state.behavior == CameraBehavior::FollowCar;
+    let exited_follow = behavior_changed && state.behavior == CameraBehavior::Free;
+    let reset_requested = state.reset_requested;
+    if reset_requested {
         state.rotation = 0.0;
         state.reset_requested = false;
         state.fit_requested = true;
@@ -417,7 +443,10 @@ fn update_camera_view(
             Some(fit) => {
                 state.center = fit.center;
                 state.base_projection_scale = fit.projection_scale;
-                state.zoom = 1.0;
+                if state.behavior == CameraBehavior::Free {
+                    state.zoom = 1.0;
+                    state.free_zoom = 1.0;
+                }
                 state.initialized = true;
                 state.fit_requested = false;
             }
@@ -425,12 +454,34 @@ fn update_camera_view(
         }
     }
 
+    if entered_follow {
+        state.free_zoom = state.zoom;
+        state.follow_zoom = follow_default_zoom(state.base_projection_scale);
+        state.zoom = state.follow_zoom;
+        state.speed_zoom_multiplier = 1.0;
+    } else if reset_requested && state.behavior == CameraBehavior::FollowCar {
+        state.follow_zoom = follow_default_zoom(state.base_projection_scale);
+        state.zoom = state.follow_zoom;
+        state.speed_zoom_multiplier = 1.0;
+    } else if exited_follow {
+        state.follow_zoom = state.zoom;
+        state.zoom = state.free_zoom;
+        state.speed_zoom_multiplier = 1.0;
+    }
+    state.last_behavior = state.behavior;
+
     if state.behavior == CameraBehavior::FollowCar
         && *mode == SimulationMode::TestDrive
-        && let Ok(car_transform) = manual_car.single()
+        && let Ok((car_transform, observation)) = manual_car.single()
     {
+        let target_multiplier = speed_visual_multiplier(observation.normalized_speed);
+        let blend = 1.0 - (-FOLLOW_SPEED_ZOOM_RESPONSE * time.delta_secs()).exp();
+        state.speed_zoom_multiplier +=
+            (target_multiplier - state.speed_zoom_multiplier) * blend.clamp(0.0, 1.0);
+        let forward = Vec2::from_angle(car_transform.rotation.to_euler(EulerRot::XYZ).2);
         state.center = car_transform.translation.truncate()
-            + camera_panel_offset(state.projection_scale(), state.rotation);
+            + forward * FOLLOW_LOOK_AHEAD
+            + camera_panel_offset(state.visual_projection_scale(), state.rotation);
     }
 }
 
@@ -451,8 +502,16 @@ fn apply_camera_view(
             continue;
         };
         orthographic.scaling_mode = ScalingMode::WindowSize;
-        orthographic.scale = state.projection_scale();
+        orthographic.scale = state.visual_projection_scale();
     }
+}
+
+fn follow_default_zoom(base_projection_scale: f32) -> f32 {
+    (base_projection_scale / FOLLOW_DEFAULT_PROJECTION_SCALE).clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
+fn speed_visual_multiplier(normalized_speed: f32) -> f32 {
+    1.0 + normalized_speed.clamp(0.0, 1.0) * FOLLOW_MAX_SPEED_ZOOM_OUT
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -632,6 +691,23 @@ mod tests {
             .is_none()
         );
         assert!(calculate_camera_fit(bounds(), UVec2::new(1920, 1080), 0.0, 0.0).is_none());
+    }
+
+    #[test]
+    fn follow_default_uses_a_consistent_world_scale() {
+        for base_scale in [1.1, 3.0, 5.5] {
+            let zoom = follow_default_zoom(base_scale);
+            assert!((base_scale / zoom - FOLLOW_DEFAULT_PROJECTION_SCALE).abs() < 1.0e-5);
+        }
+    }
+
+    #[test]
+    fn speed_zoom_out_is_bounded_to_seven_percent() {
+        assert_eq!(speed_visual_multiplier(-1.0), 1.0);
+        assert_eq!(speed_visual_multiplier(0.0), 1.0);
+        assert!((speed_visual_multiplier(0.5) - 1.035).abs() < 1.0e-6);
+        assert!((speed_visual_multiplier(1.0) - 1.07).abs() < 1.0e-6);
+        assert_eq!(speed_visual_multiplier(2.0), 1.07);
     }
 
     #[test]

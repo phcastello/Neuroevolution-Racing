@@ -5,7 +5,7 @@
     category: StreetCircuit,
     role: Validation,
     difficulty: VeryHard,
-    width: 72.0,
+    width: 86.4,
     samples_per_control_point: 14,
     start_index: 0,
     description: Some("Narrow-feeling street circuit with dense direction changes, a hairpin-like section, short straights, and a technical harbor return."),

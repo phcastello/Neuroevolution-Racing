@@ -16,7 +16,7 @@ crates/app  ──────>  crates/neuroevolution
 - `crates/neuroevolution`: deliberately minimal pure-Rust library. It contains only the `neural` and `genetic` module boundaries and student TODOs. It does **not** depend on Bevy, Avian2D, egui, or an ML/GA library.
 - `crates/app`: fixed-timestep simulation, sampled centerline track, Avian2D collisions and spatial queries, rendering, temporary controller, continuous progress tracking, and egui dashboard.
 
-`CarController` receives an explicit six-value `CarObservation`: five local wall sensors and normalized speed. The temporary controller receives centerline look-ahead through a separate navigation context, exists only to exercise the simulation, and performs no learning.
+`CarController` receives an explicit six-value `CarObservation`: five local wall sensors at ±60°, ±30°, and 0° (front), plus normalized speed. The temporary controller receives centerline look-ahead through a separate navigation context, exists only to exercise the simulation, and performs no learning.
 
 ## Technology
 
@@ -65,7 +65,7 @@ Test Drive is a developer physics playground, not a training or genetic-algorith
 
 Keyboard controls are `W` = acceleration `+1`, `S` = acceleration `-1`, `A` = steering `+1` (left/counter-clockwise), `D` = steering `-1` (right/clockwise), and `R` = reset car. Opposing keys cancel to zero. The dashboard's Sliders input mode supplies intermediate values directly in `[-1, +1]`. Reset restores position, heading, speed, controls, sensor values, and track progress where applicable.
 
-Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The observation's normalized speed uses an independent asymptotic curve in `[0, 1]`; this normalization does not clamp or otherwise alter physical velocity.
+Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The physical world scale is `1 unit = 16.07142 cm`, and the dashboard shows speed in `u/s` with an optional `km/h` conversion. The observation's normalized speed uses an independent asymptotic curve in `[0, 1]`; this normalization does not clamp or otherwise alter physical velocity.
 
 Both keyboard and sliders are only control sources. They write the same canonical component consumed by every vehicle:
 
@@ -79,6 +79,31 @@ future MLP ──────────┘                    │
 
 The human never modifies a transform or receives privileged movement mechanics. `CarControls` clamps both scalar channels to `[-1, +1]`; the one shared integration/collision system consumes it regardless of source. Therefore a future MLP that supplies the same two values from the same initial state and timestep receives identical vehicle-state evolution. The Test Drive dashboard displays the final component values actually reaching physics, the exact six-scalar `CarObservation`, raw speed/heading/position/progress, and the shared `SimulationConfig` values.
 
+## Car sprite assets
+
+Cars render as child sprites centered on the physical vehicle transform. The
+ten-car population deterministically uses `car_01` through `car_05` and
+`car_07` through `car_11`. The defective `car_06` was removed and `car_03`
+takes its former population slot; `car_12` remains Test Drive-only. Every
+visual is normalized to fill the same 28x15 physical footprint, collision
+query, sensor origin, controls, and progress behavior.
+
+The 11 ready-to-load RGBA assets under `assets/cars` are generated once from
+the supplied source sheet, never cropped at runtime:
+
+```bash
+python -m pip install Pillow
+python tools/extract_car_sprites.py
+python tools/extract_car_sprites.py --check
+```
+
+Each PNG has a 280x150 transparent canvas, fills the physical footprint, and
+faces +X/right. The
+generated contact sheet is inspection-only and is not loaded by the game. See
+[`assets/cars/README.md`](assets/cars/README.md) for the source/license note;
+the supplied stock-image-derived artwork should be treated as a development
+placeholder unless it is appropriately licensed for distribution.
+
 ## Current status
 
 Implemented infrastructure:
@@ -91,6 +116,7 @@ Implemented infrastructure:
 - responsive rotation-aware camera fitting plus bounded cursor-centered zoom, Q/E rotation, middle-drag pan, reset, and Test Drive follow behavior;
 - resizable window and queried monitor/video-mode fullscreen support, with graceful closest-mode/native fallbacks;
 - ten arcade-like kinematic cars driven by a deterministic temporary controller through the canonical `CarControls` boundary;
+- eleven normalized transparent car sprite assets, with a deterministic ten-car training set and cosmetic Test Drive selection;
 - a one-car Test Drive mode with Track/Open Field environments, keyboard/analog actuator sources, reset, and live physics/observation telemetry;
 - five Avian2D raycast sensors per car, explicitly filtered to track walls;
 - continuous distance-along-track progress, normalized progress, and maximum reached distance;

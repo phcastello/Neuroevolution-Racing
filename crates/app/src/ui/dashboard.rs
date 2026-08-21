@@ -8,6 +8,7 @@ use bevy_egui::{EguiContexts, egui};
 use crate::display::{
     CameraBehavior, CameraViewState, DASHBOARD_WIDTH, DisplayMode, DisplaySettings, TOP_BAR_HEIGHT,
 };
+use crate::rendering::{CAR_SPRITE_LABELS, CarVisualSettings};
 use crate::simulation::{
     Car, CarControls, CarObservation, CarProgress, KinematicCar, ManualControlMode, PlaybackState,
     SelectedCar, SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
@@ -17,6 +18,8 @@ use crate::simulation::{
 use super::{
     FitnessHistory, fitness_plot::draw_fitness_plot, network_view::draw_network_placeholder,
 };
+
+const KMH_PER_UNIT_PER_SECOND: f32 = 0.578_52;
 
 type SelectedCarTelemetry<'w, 's> = Query<
     'w,
@@ -40,6 +43,7 @@ pub struct DashboardData<'w, 's> {
     track_library: Res<'w, TrackLibrary>,
     track_selection: ResMut<'w, TrackSelection>,
     track_debug: ResMut<'w, TrackDebug>,
+    car_visuals: ResMut<'w, CarVisualSettings>,
     history: Res<'w, FitnessHistory>,
     display: ResMut<'w, DisplaySettings>,
     camera: ResMut<'w, CameraViewState>,
@@ -228,6 +232,26 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             data.test_drive.slider_controls =
                                 CarControls::new(acceleration, steering);
                         }
+                        ui.horizontal(|ui| {
+                            ui.label("Vehicle sprite:");
+                            egui::ComboBox::from_id_salt("vehicle_sprite_selector")
+                                .selected_text(
+                                    CAR_SPRITE_LABELS[data
+                                        .car_visuals
+                                        .test_drive_sprite
+                                        .min(CAR_SPRITE_LABELS.len() - 1)],
+                                )
+                                .show_ui(ui, |ui| {
+                                    for (index, label) in CAR_SPRITE_LABELS.iter().enumerate() {
+                                        ui.selectable_value(
+                                            &mut data.car_visuals.test_drive_sprite,
+                                            index,
+                                            *label,
+                                        );
+                                    }
+                                });
+                        });
+                        ui.small("Cosmetic only; vehicle physics and controls stay identical.");
                         if ui.button("Reset Car  [R]").clicked() {
                             data.test_drive.reset_requested = true;
                         }
@@ -267,6 +291,8 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     });
                     ui.small("Space toggles pause. Simulation logic runs at a fixed 60 Hz.");
                     ui.checkbox(&mut data.track_debug.enabled, "Track debug");
+                    ui.checkbox(&mut data.car_visuals.show_hitbox, "Show car hitbox");
+                    ui.checkbox(&mut data.car_visuals.show_sensors, "Show sensors");
 
                     ui.separator();
                     ui.heading("Display");
@@ -340,7 +366,11 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     if let Some((car, controls, observation, transform, progress)) =
                         data.selected.iter().next()
                     {
-                        ui.label(format!("Speed: {:+.1}", car.speed));
+                        ui.label(format!(
+                            "Speed: {:+.1} u/s ({:+.1} km/h)",
+                            car.speed,
+                            car.speed * KMH_PER_UNIT_PER_SECOND
+                        ));
                         if *data.mode == SimulationMode::TestDrive {
                             ui.label(format!("Heading: {:+.1}°", car.heading.to_degrees()));
                             ui.label(format!(
@@ -373,11 +403,11 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         ui.add_space(4.0);
                         ui.label("MLP observation (live CarObservation)");
                         for (label, value) in [
-                            ("Left", observation.sensors[0]),
-                            ("Front-left", observation.sensors[1]),
+                            ("Left 60°", observation.sensors[0]),
+                            ("Left 30°", observation.sensors[1]),
                             ("Front", observation.sensors[2]),
-                            ("Front-right", observation.sensors[3]),
-                            ("Right", observation.sensors[4]),
+                            ("Right 30°", observation.sensors[3]),
+                            ("Right 60°", observation.sensors[4]),
                             ("Speed", observation.normalized_speed),
                         ] {
                             ui.horizontal(|ui| {

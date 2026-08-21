@@ -63,18 +63,16 @@ impl TemporaryController {
 
 impl CarController for TemporaryController {
     fn control(&mut self, observation: &CarObservation) -> CarControls {
-        let [left, front_left, front, front_right, right] = observation.sensors;
-        let obstacle_steering = (front_left - front_right) * 0.9 + (left - right) * 0.35;
+        let [left_60, left_30, front, right_30, right_60] = observation.sensors;
+        let obstacle_steering = (left_30 - right_30) * 0.9 + (left_60 - right_60) * 0.35;
         let steering = (self.navigation.target_bearing * 1.65 + obstacle_steering).clamp(-1.0, 1.0);
 
-        let corner_slowdown = self.navigation.target_bearing.abs().clamp(0.0, 1.0);
-        let desired_speed = 0.92 - corner_slowdown * 0.30;
+        // Do not impose a target-speed ceiling on the temporary training cars.
+        // They keep accelerating until an immediate frontal obstacle requires braking.
         let acceleration = if front < 0.16 {
             -0.75
-        } else if observation.normalized_speed < desired_speed {
-            1.0
         } else {
-            -0.12
+            1.0
         };
 
         CarControls::new(acceleration, steering)
@@ -117,5 +115,16 @@ mod tests {
         let direction = Vec2::from_angle(-almost_pi);
         let angle = signed_angle_to(almost_pi, direction);
         assert!((angle - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn temporary_controller_keeps_accelerating_at_high_normalized_speed() {
+        let mut controller = TemporaryController::default();
+        let controls = controller.control(&CarObservation {
+            sensors: [1.0; 5],
+            normalized_speed: 0.99,
+        });
+
+        assert_eq!(controls.acceleration, 1.0);
     }
 }

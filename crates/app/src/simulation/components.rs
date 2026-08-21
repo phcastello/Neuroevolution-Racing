@@ -23,7 +23,7 @@ pub struct KinematicCar {
 
 #[derive(Component, Clone, Debug)]
 pub struct SensorReadings {
-    /// Normalized distances ordered left, front-left, front, front-right, right.
+    /// Normalized distances ordered +60°, +30°, 0° (front), -30°, -60°.
     pub normalized: [f32; 5],
     /// World-space endpoints retained for selected-car debug rendering.
     pub endpoints: [Vec2; 5],

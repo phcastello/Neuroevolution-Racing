@@ -1,4 +1,4 @@
-use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+use std::f32::consts::{FRAC_PI_3, FRAC_PI_6};
 
 use avian2d::prelude::*;
 use bevy::prelude::*;
@@ -19,7 +19,7 @@ use super::{
 };
 
 // Array order is left -> right, matching the future MLP input contract.
-const SENSOR_ANGLES: [f32; 5] = [FRAC_PI_2, FRAC_PI_4, 0.0, -FRAC_PI_4, -FRAC_PI_2];
+const SENSOR_ANGLES: [f32; 5] = [FRAC_PI_3, FRAC_PI_6, 0.0, -FRAC_PI_6, -FRAC_PI_3];
 const WALL_THICKNESS: f32 = 14.0;
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -338,6 +338,13 @@ struct VehicleState {
     speed: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ResolvedVehicleMotion {
+    state: VehicleState,
+    rotation_collided: bool,
+    translation_collided: bool,
+}
+
 fn normalize_speed(speed: f32, normalization_scale: f32) -> f32 {
     let scale = normalization_scale.max(f32::EPSILON);
     (1.0 - (-speed.abs() / scale).exp()).clamp(0.0, 1.0)
@@ -393,6 +400,47 @@ fn integrate_vehicle(
     }
 }
 
+/// Resolves rotation and translation independently so that rejecting a movement
+/// can never leave the car rotated into a wall.
+fn resolve_vehicle_motion(
+    current: VehicleState,
+    integrated: VehicleState,
+    mut intersects_wall: impl FnMut(Vec2, f32) -> bool,
+) -> ResolvedVehicleMotion {
+    let rotation_collided = intersects_wall(current.position, integrated.heading);
+    let heading = if rotation_collided {
+        current.heading
+    } else {
+        integrated.heading
+    };
+
+    // If steering was rejected, keep moving along the last valid heading. This
+    // lets the car continue parallel to a wall instead of snagging on it.
+    let intended_displacement = integrated.position - current.position;
+    let translation_target = if rotation_collided {
+        current.position
+            + Vec2::from_angle(heading) * intended_displacement.length() * integrated.speed.signum()
+    } else {
+        integrated.position
+    };
+    let translation_collided = intersects_wall(translation_target, heading);
+    let position = if translation_collided {
+        current.position
+    } else {
+        translation_target
+    };
+
+    ResolvedVehicleMotion {
+        state: VehicleState {
+            position,
+            heading,
+            speed: integrated.speed,
+        },
+        rotation_collided,
+        translation_collided,
+    }
+}
+
 pub fn apply_vehicle_physics(
     time: Res<Time<Fixed>>,
     config: Res<SimulationConfig>,
@@ -410,23 +458,20 @@ pub fn apply_vehicle_physics(
             speed: state.speed,
         };
         let integrated = integrate_vehicle(current, *controls, &config, dt);
-        let collided = !spatial_query
-            .shape_intersections(
-                &car_shape,
-                integrated.position,
-                integrated.heading,
-                &wall_filter,
-            )
-            .is_empty();
+        let resolved = resolve_vehicle_motion(current, integrated, |position, heading| {
+            !spatial_query
+                .shape_intersections(&car_shape, position, heading, &wall_filter)
+                .is_empty()
+        });
 
-        if collided {
+        if resolved.translation_collided {
             state.speed = -integrated.speed.abs().min(18.0) * 0.35;
         } else {
             state.speed = integrated.speed;
-            transform.translation.x = integrated.position.x;
-            transform.translation.y = integrated.position.y;
         }
-        state.heading = integrated.heading;
+        transform.translation.x = resolved.state.position.x;
+        transform.translation.y = resolved.state.position.y;
+        state.heading = resolved.state.heading;
         transform.rotation = Quat::from_rotation_z(state.heading);
     }
 }
@@ -627,6 +672,55 @@ mod tests {
         let manual_result = integrate_vehicle(initial, controls, &config, 1.0 / 60.0);
         let future_mlp_result = integrate_vehicle(initial, controls, &config, 1.0 / 60.0);
         assert_eq!(manual_result, future_mlp_result);
+    }
+
+    #[test]
+    fn rotation_into_a_wall_is_rejected_without_discarding_safe_translation() {
+        let current = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.0,
+            speed: 20.0,
+        };
+        let integrated = VehicleState {
+            position: Vec2::new(0.0, 1.0),
+            heading: std::f32::consts::FRAC_PI_2,
+            speed: 20.0,
+        };
+
+        // A horizontal wall whose near edge is 9 units above the car center.
+        // The parallel car reaches y=7.5; after a 90-degree turn it reaches y=14.
+        let resolved = resolve_vehicle_motion(current, integrated, |position, heading| {
+            let half_extent_y =
+                heading.sin().abs() * (CAR_LENGTH * 0.5) + heading.cos().abs() * (CAR_WIDTH * 0.5);
+            position.y + half_extent_y >= 9.0
+        });
+
+        assert!(resolved.rotation_collided);
+        assert!(!resolved.translation_collided);
+        assert_eq!(resolved.state.heading, current.heading);
+        assert_eq!(resolved.state.position, Vec2::new(1.0, 0.0));
+    }
+
+    #[test]
+    fn translation_into_a_wall_does_not_change_the_last_safe_pose() {
+        let current = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.0,
+            speed: 20.0,
+        };
+        let integrated = VehicleState {
+            position: Vec2::new(0.0, 2.0),
+            ..current
+        };
+
+        let resolved = resolve_vehicle_motion(current, integrated, |position, _| {
+            position.y + CAR_WIDTH * 0.5 >= 9.0
+        });
+
+        assert!(!resolved.rotation_collided);
+        assert!(resolved.translation_collided);
+        assert_eq!(resolved.state.heading, current.heading);
+        assert_eq!(resolved.state.position, current.position);
     }
 
     #[test]
