@@ -67,6 +67,8 @@ Keyboard controls are `W` = acceleration `+1`, `S` = acceleration `-1`, `A` = st
 
 Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The physical world scale is `1 unit = 16.07142 cm`, and the dashboard shows speed in `u/s` with an optional `km/h` conversion. `1 unit/s = 0.57852 km/h`. The observation's normalized speed uses an independent asymptotic curve in `[0, 1]`; this normalization does not clamp or otherwise alter physical velocity.
 
+Steering requests an angular rate, but shared vehicle physics limits the achievable rate using lateral acceleration: `a_lateral = |v| * |omega|`, so `omega_max = a_lateral_max / |v|`. Normal turn rate remains dominant at low speed; at high speed the grip limit increases the minimum turning radius and makes braking necessary for tight corners. This is still a simplified kinematic model: the car moves along its heading, with no tire slip, drifting, or full vehicle dynamics.
+
 Both keyboard and sliders are only control sources. They write the same canonical component consumed by every vehicle:
 
 ```text

@@ -12,7 +12,8 @@ use crate::rendering::{CAR_SPRITE_LABELS, CarVisualSettings};
 use crate::simulation::{
     Car, CarControls, CarObservation, CarProgress, KinematicCar, ManualControlMode, PlaybackState,
     SelectedCar, SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
-    TrackDebug, TrackLibrary, TrackSelection,
+    TrackDebug, TrackLibrary, TrackSelection, desired_yaw_rate, limited_yaw_rate,
+    max_grip_yaw_rate,
 };
 
 use super::{
@@ -381,6 +382,24 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                                 "MLP-equivalent output: [steering: {:+.2}, acceleration: {:+.2}]",
                                 controls.steering, controls.acceleration
                             ));
+                            let requested_yaw_rate =
+                                desired_yaw_rate(car.speed, controls.steering, &data.config);
+                            let grip_yaw_limit = max_grip_yaw_rate(car.speed, &data.config);
+                            let actual_yaw_rate =
+                                limited_yaw_rate(car.speed, controls.steering, &data.config);
+                            ui.label("Live cornering limits");
+                            for (label, value, unit) in [
+                                ("Requested yaw rate", requested_yaw_rate, "rad/s"),
+                                ("Grip-limited max", grip_yaw_limit, "rad/s"),
+                                ("Actual yaw rate", actual_yaw_rate, "rad/s"),
+                                (
+                                    "Estimated lateral accel",
+                                    (car.speed * actual_yaw_rate).abs(),
+                                    "u/sÂ²",
+                                ),
+                            ] {
+                                ui.monospace(format!("{label}: {value:.2} {unit}"));
+                            }
                         }
                         if let Some(progress) = progress {
                             ui.label(format!(
@@ -430,6 +449,10 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                                     ("Accel falloff", data.config.acceleration_falloff_speed),
                                     ("Speed normalization", data.config.speed_normalization_scale),
                                     ("Turn rate", data.config.turn_rate),
+                                    (
+                                        "Max lateral acceleration",
+                                        data.config.max_lateral_acceleration,
+                                    ),
                                 ] {
                                     ui.label(label);
                                     ui.monospace(format!("{value:.2}"));
