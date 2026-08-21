@@ -21,6 +21,7 @@ use super::{
 // Array order is left -> right, matching the future MLP input contract.
 const SENSOR_ANGLES: [f32; 5] = [FRAC_PI_3, FRAC_PI_6, 0.0, -FRAC_PI_6, -FRAC_PI_3];
 const WALL_THICKNESS: f32 = 14.0;
+const MIN_GRIP_SPEED: f32 = 10.0;
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SimulationSet {
@@ -364,6 +365,22 @@ fn coast_toward_rest(speed: f32, deceleration: f32, dt: f32) -> f32 {
     }
 }
 
+pub(crate) fn desired_yaw_rate(speed: f32, steering: f32, config: &SimulationConfig) -> f32 {
+    let speed_ratio = normalize_speed(speed, config.speed_normalization_scale).clamp(0.15, 1.0);
+    steering * config.turn_rate * speed_ratio
+}
+
+pub(crate) fn max_grip_yaw_rate(speed: f32, config: &SimulationConfig) -> f32 {
+    let effective_speed = speed.abs().max(MIN_GRIP_SPEED);
+    config.max_lateral_acceleration.max(0.0) / effective_speed
+}
+
+pub(crate) fn limited_yaw_rate(speed: f32, steering: f32, config: &SimulationConfig) -> f32 {
+    let desired = desired_yaw_rate(speed, steering, config);
+    let grip_limit = max_grip_yaw_rate(speed, config);
+    desired.clamp(-grip_limit, grip_limit)
+}
+
 fn integrate_vehicle(
     state: VehicleState,
     controls: CarControls,
@@ -390,8 +407,8 @@ fn integrate_vehicle(
         };
         state.speed + controls.acceleration * effective_rate * dt
     };
-    let speed_ratio = normalize_speed(speed, config.speed_normalization_scale).clamp(0.15, 1.0);
-    let heading = state.heading + controls.steering * config.turn_rate * speed_ratio * dt;
+    let yaw_rate = limited_yaw_rate(speed, controls.steering, config);
+    let heading = state.heading + yaw_rate * dt;
     let position = state.position + Vec2::from_angle(heading) * speed * dt;
     VehicleState {
         position,
@@ -672,6 +689,82 @@ mod tests {
         let manual_result = integrate_vehicle(initial, controls, &config, 1.0 / 60.0);
         let future_mlp_result = integrate_vehicle(initial, controls, &config, 1.0 / 60.0);
         assert_eq!(manual_result, future_mlp_result);
+    }
+
+    #[test]
+    fn high_speed_reduces_yaw_rate_and_increases_turning_radius() {
+        let config = SimulationConfig::default();
+        let controls = CarControls::new(0.0, 1.0);
+        let dt = 1.0 / 60.0;
+        let low_speed = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.0,
+            speed: 20.0,
+        };
+        let high_speed = VehicleState {
+            speed: 500.0,
+            ..low_speed
+        };
+
+        let low_result = integrate_vehicle(low_speed, controls, &config, dt);
+        let high_result = integrate_vehicle(high_speed, controls, &config, dt);
+        let low_yaw_rate = (low_result.heading - low_speed.heading) / dt;
+        let high_yaw_rate = (high_result.heading - high_speed.heading) / dt;
+        let low_radius = low_result.speed.abs() / low_yaw_rate.abs();
+        let high_radius = high_result.speed.abs() / high_yaw_rate.abs();
+
+        assert!(high_yaw_rate.abs() < low_yaw_rate.abs());
+        assert!(high_radius > low_radius);
+    }
+
+    #[test]
+    fn integrated_yaw_rate_respects_lateral_acceleration_limit() {
+        let config = SimulationConfig::default();
+        let initial = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.0,
+            speed: 500.0,
+        };
+        let dt = 1.0 / 60.0;
+        let result = integrate_vehicle(initial, CarControls::new(0.0, 1.0), &config, dt);
+        let actual_yaw_rate = (result.heading - initial.heading) / dt;
+        let lateral_acceleration = (result.speed * actual_yaw_rate).abs();
+
+        assert!(lateral_acceleration <= config.max_lateral_acceleration + 1.0e-3);
+        assert!((lateral_acceleration - config.max_lateral_acceleration).abs() < 1.0e-2);
+    }
+
+    #[test]
+    fn low_speed_steering_remains_limited_by_normal_turn_rate() {
+        let config = SimulationConfig::default();
+        let speed = 5.0;
+        let requested = desired_yaw_rate(speed, 1.0, &config);
+        let actual = limited_yaw_rate(speed, 1.0, &config);
+
+        assert!((actual - requested).abs() < 1.0e-6);
+        assert!(actual > 0.0);
+    }
+
+    #[test]
+    fn reverse_is_finite_and_uses_the_same_grip_magnitude() {
+        let config = SimulationConfig::default();
+        let forward_yaw_rate = limited_yaw_rate(500.0, 1.0, &config);
+        let reverse_yaw_rate = limited_yaw_rate(-500.0, 1.0, &config);
+        let reverse = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.0,
+            speed: -500.0,
+        };
+        let result = integrate_vehicle(reverse, CarControls::new(0.0, 1.0), &config, 1.0 / 60.0);
+
+        assert_eq!(forward_yaw_rate, reverse_yaw_rate);
+        assert!(result.position.is_finite());
+        assert!(result.heading.is_finite());
+        assert!(result.speed.is_finite());
+        assert!(
+            (reverse.speed.abs() * reverse_yaw_rate.abs())
+                <= config.max_lateral_acceleration + 1.0e-3
+        );
     }
 
     #[test]

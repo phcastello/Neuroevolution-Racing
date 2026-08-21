@@ -69,11 +69,7 @@ impl CarController for TemporaryController {
 
         // Do not impose a target-speed ceiling on the temporary training cars.
         // They keep accelerating until an immediate frontal obstacle requires braking.
-        let acceleration = if front < 0.16 {
-            -0.75
-        } else {
-            1.0
-        };
+        let acceleration = if front < 0.16 { -0.75 } else { 1.0 };
 
         CarControls::new(acceleration, steering)
     }

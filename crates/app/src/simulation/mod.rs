@@ -7,6 +7,7 @@ pub use components::{
     Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings, TrackDebug,
 };
 pub use controller::{CarControls, CarObservation};
+pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
 pub use track::{DEFAULT_TRACK_ID, Track, TrackBounds, TrackLibrary};
 
 use bevy::{prelude::*, time::Fixed};
@@ -46,6 +47,7 @@ pub struct SimulationConfig {
     pub acceleration_falloff_speed: f32,
     pub speed_normalization_scale: f32,
     pub turn_rate: f32,
+    pub max_lateral_acceleration: f32,
     pub temporary_controller_look_ahead: f32,
     pub progress_search_radius: usize,
 }
@@ -61,6 +63,7 @@ impl Default for SimulationConfig {
             acceleration_falloff_speed: 140.0,
             speed_normalization_scale: 65.0,
             turn_rate: 2.15,
+            max_lateral_acceleration: 225.0,
             temporary_controller_look_ahead: 72.0,
             progress_search_radius: 24,
         }
