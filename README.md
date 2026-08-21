@@ -16,7 +16,15 @@ crates/app  ──────>  crates/neuroevolution
 - `crates/neuroevolution`: deliberately minimal pure-Rust library. It contains only the `neural` and `genetic` module boundaries and student TODOs. It does **not** depend on Bevy, Avian2D, egui, or an ML/GA library.
 - `crates/app`: fixed-timestep simulation, sampled centerline track, Avian2D collisions and spatial queries, rendering, temporary controller, continuous progress tracking, and egui dashboard.
 
-`CarController` receives an explicit six-value `CarObservation`: five local wall sensors at ±60°, ±30°, and 0° (front), plus normalized speed. The temporary controller receives centerline look-ahead through a separate navigation context, exists only to exercise the simulation, and performs no learning.
+`CarController` receives an explicit six-value `CarObservation`. Its stable future-MLP input order is:
+
+```text
+[0] left +60° sensor     [3] right -30° sensor
+[1] left +30° sensor     [4] right -60° sensor
+[2] front 0° sensor      [5] normalized speed
+```
+
+The stable network output order is `[0] steering, [1] acceleration`; a small app-side adapter maps that order to the existing `CarControls::new(acceleration, steering)` API. The temporary controller receives centerline look-ahead through a separate navigation context, exists only to exercise the simulation, and performs no learning.
 
 ## Technology
 
@@ -65,7 +73,9 @@ Test Drive is a developer physics playground, not a training or genetic-algorith
 
 Keyboard controls are `W` = acceleration `+1`, `S` = acceleration `-1`, `A` = steering `+1` (left/counter-clockwise), `D` = steering `-1` (right/clockwise), and `R` = reset car. Opposing keys cancel to zero. The dashboard's Sliders input mode supplies intermediate values directly in `[-1, +1]`. Reset restores position, heading, speed, controls, sensor values, and track progress where applicable.
 
-Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The physical world scale is `1 unit = 16.07142 cm`, and the dashboard shows speed in `u/s` with an optional `km/h` conversion. `1 unit/s = 0.57852 km/h`. The observation's normalized speed uses an independent asymptotic curve in `[0, 1]`; this normalization does not clamp or otherwise alter physical velocity.
+Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The physical world scale is `1 unit = 16.07142 cm`, and the dashboard shows speed in `u/s` with an optional `km/h` conversion. `1 unit/s = 0.57852 km/h`. The observation uses `normalized_speed = abs(v) / (abs(v) + scale)` with a default scale of `250.0`; this asymptotic mapping stays in `[0, 1]` and does not clamp or otherwise alter the unbounded physical velocity.
+
+The five wall rays keep the fixed `+60°, +30°, 0°, -30°, -60°` angles and normalize hit distance so `0` means a wall at the origin and `1` means no wall within the default `750.0`-unit maximum range.
 
 Steering requests an angular rate, but shared vehicle physics limits the achievable rate using lateral acceleration: `a_lateral = |v| * |omega|`, so `omega_max = a_lateral_max / |v|`. Normal turn rate remains dominant at low speed; at high speed the grip limit increases the minimum turning radius and makes braking necessary for tight corners. This is still a simplified kinematic model: the car moves along its heading, with no tire slip, drifting, or full vehicle dynamics.
 
@@ -89,6 +99,12 @@ ten-car population deterministically uses `car_01` through `car_05` and
 takes its former population slot; `car_12` remains Test Drive-only. Every
 visual is normalized to fill the same 28x15 physical footprint, collision
 query, sensor origin, controls, and progress behavior.
+
+All non-manual population members spawn on top of one another from the same
+track-derived position and heading, with identical speed, controls,
+observation, and progress state. Future intentional start perturbations may
+vary lateral offset, heading, or speed, but each compared individual must
+receive the same perturbation within an evaluation.
 
 The 11 ready-to-load RGBA assets under `assets/cars` are generated once from
 the supplied source sheet, never cropped at runtime:

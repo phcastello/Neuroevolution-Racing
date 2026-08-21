@@ -8,8 +8,8 @@ use super::{
     CAR_LENGTH, CAR_WIDTH, ManualControlMode, PlaybackState, SimulationConfig, SimulationMode,
     TestDriveEnvironment, TestDriveSettings, TrackLibrary, TrackSelection,
     components::{
-        Car, CarProgress, ControllerTuning, KinematicCar, ManualCar, SelectedCar, SensorReadings,
-        SimulationLayer, TemporaryControlled, TrackWall,
+        Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings, SimulationLayer,
+        TemporaryControlled, TrackWall,
     },
     controller::{
         CarController, CarControls, CarObservation, TemporaryController,
@@ -22,6 +22,11 @@ use super::{
 const SENSOR_ANGLES: [f32; 5] = [FRAC_PI_3, FRAC_PI_6, 0.0, -FRAC_PI_6, -FRAC_PI_3];
 const WALL_THICKNESS: f32 = 14.0;
 const MIN_GRIP_SPEED: f32 = 10.0;
+const CANONICAL_START_DISTANCE: f32 = 16.0;
+const CANONICAL_INITIAL_SPEED: f32 = 45.0;
+// Preserve the pre-cleanup low-speed steering response independently of the
+// controller observation's normalization scale.
+const STEERING_RESPONSE_SPEED_SCALE: f32 = 65.0;
 
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SimulationSet {
@@ -40,7 +45,6 @@ type TemporaryCars<'w, 's> = Query<
         &'static KinematicCar,
         &'static CarObservation,
         &'static CarProgress,
-        &'static ControllerTuning,
         &'static mut CarControls,
     ),
     With<TemporaryControlled>,
@@ -136,55 +140,55 @@ fn spawn_track_colliders(commands: &mut Commands, track: &Track) {
 }
 
 fn spawn_temporary_cars(commands: &mut Commands, track: &Track, config: &SimulationConfig) {
-    let usable_width = (track.width - CAR_WIDTH - 12.0).max(0.0);
-    let columns = ((usable_width / (CAR_WIDTH + 5.0)).floor() as usize + 1)
-        .clamp(1, 5)
-        .min(config.population_size.max(1));
-    let column_spacing = if columns > 1 {
-        usable_width.min((columns - 1) as f32 * 17.0) / (columns - 1) as f32
-    } else {
-        0.0
-    };
+    let start = canonical_population_start(track);
     for id in 0..config.population_size {
-        let row = (id / columns) as f32;
-        let column = id % columns;
-        let lateral_offset = (column as f32 - (columns - 1) as f32 * 0.5) * column_spacing;
-        let grid_distance = 16.0 + row * 34.0;
-        let center = track.point_at_distance(grid_distance);
-        let center_projection = track.project(center);
-        let forward = track.samples[center_projection.segment_index].tangent;
-        let position = center + forward.perp() * lateral_offset;
-        let heading = forward.y.atan2(forward.x);
-        let projection = track.project(position);
         let mut entity = commands.spawn((
             Car { id },
             KinematicCar {
-                heading,
-                speed: 45.0 + id as f32 * 0.7,
+                heading: start.heading,
+                speed: start.speed,
             },
             SensorReadings::default(),
-            CarObservation {
-                sensors: [1.0; 5],
-                normalized_speed: 0.0,
-            },
-            CarControls::NEUTRAL,
-            CarProgress::new(
-                projection.track_distance,
-                track.total_length,
-                projection.segment_index,
-                projection.point,
-            ),
-            ControllerTuning {
-                steering_bias: (lateral_offset * 0.00025).clamp(-0.012, 0.012),
-            },
+            start.observation,
+            start.controls,
+            start.progress.clone(),
             TemporaryControlled,
             CollisionLayers::new([SimulationLayer::Car], [SimulationLayer::TrackWall]),
-            Transform::from_translation(position.extend(2.0))
-                .with_rotation(Quat::from_rotation_z(heading)),
+            Transform::from_translation(start.position.extend(2.0))
+                .with_rotation(Quat::from_rotation_z(start.heading)),
         ));
         if id == 0 {
             entity.insert(SelectedCar);
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CanonicalPopulationStart {
+    position: Vec2,
+    heading: f32,
+    speed: f32,
+    controls: CarControls,
+    observation: CarObservation,
+    progress: CarProgress,
+}
+
+fn canonical_population_start(track: &Track) -> CanonicalPopulationStart {
+    let position = track.point_at_distance(CANONICAL_START_DISTANCE);
+    let projection = track.project(position);
+    let tangent = track.samples[projection.segment_index].tangent;
+    CanonicalPopulationStart {
+        position,
+        heading: tangent.y.atan2(tangent.x),
+        speed: CANONICAL_INITIAL_SPEED,
+        controls: CarControls::NEUTRAL,
+        observation: CarObservation::INITIAL,
+        progress: CarProgress::new(
+            projection.track_distance,
+            track.total_length,
+            projection.segment_index,
+            projection.point,
+        ),
     }
 }
 
@@ -199,10 +203,7 @@ fn spawn_manual_car(commands: &mut Commands, track: &Track, environment: TestDri
             speed: 0.0,
         },
         SensorReadings::default(),
-        CarObservation {
-            sensors: [1.0; 5],
-            normalized_speed: 0.0,
-        },
+        CarObservation::INITIAL,
         CarControls::NEUTRAL,
         CollisionLayers::new([SimulationLayer::Car], [SimulationLayer::TrackWall]),
         Transform::from_translation(position.extend(2.0))
@@ -220,7 +221,7 @@ fn manual_spawn_state(
     if environment == TestDriveEnvironment::OpenField {
         return (Vec2::ZERO, 0.0, None);
     }
-    let position = track.point_at_distance(16.0);
+    let position = track.point_at_distance(CANONICAL_START_DISTANCE);
     let projection = track.project(position);
     let tangent = track.samples[projection.segment_index].tangent;
     (
@@ -272,13 +273,13 @@ pub fn produce_temporary_controls(
     mut cars: TemporaryCars,
 ) {
     let mut controller = TemporaryController::default();
-    for (transform, state, observation, progress, tuning, mut controls) in &mut cars {
+    for (transform, state, observation, progress, mut controls) in &mut cars {
         let position = transform.translation.truncate();
         let target = track.point_at_distance(
             progress.centerline_distance + config.temporary_controller_look_ahead,
         );
         let target_direction = target - position;
-        let bearing = signed_angle_to(state.heading, target_direction) + tuning.steering_bias;
+        let bearing = signed_angle_to(state.heading, target_direction);
         controller.set_navigation_context(TemporaryNavigationContext {
             target_bearing: bearing,
         });
@@ -347,8 +348,30 @@ struct ResolvedVehicleMotion {
 }
 
 fn normalize_speed(speed: f32, normalization_scale: f32) -> f32 {
-    let scale = normalization_scale.max(f32::EPSILON);
-    (1.0 - (-speed.abs() / scale).exp()).clamp(0.0, 1.0)
+    if speed.is_nan() {
+        return 0.0;
+    }
+    if speed.is_infinite() {
+        return 1.0;
+    }
+
+    let magnitude = speed.abs();
+    if magnitude == 0.0 {
+        return 0.0;
+    }
+    let scale = if normalization_scale.is_finite() && normalization_scale > 0.0 {
+        normalization_scale
+    } else {
+        f32::EPSILON
+    };
+
+    // Algebraically equivalent to magnitude / (magnitude + scale), written
+    // this way to avoid overflow for extreme finite inputs.
+    (1.0 / (1.0 + scale / magnitude)).clamp(0.0, 1.0)
+}
+
+fn steering_speed_ratio(speed: f32) -> f32 {
+    (1.0 - (-speed.abs() / STEERING_RESPONSE_SPEED_SCALE).exp()).clamp(0.0, 1.0)
 }
 
 fn propulsion_efficiency(speed: f32, falloff_speed: f32) -> f32 {
@@ -366,7 +389,7 @@ fn coast_toward_rest(speed: f32, deceleration: f32, dt: f32) -> f32 {
 }
 
 pub(crate) fn desired_yaw_rate(speed: f32, steering: f32, config: &SimulationConfig) -> f32 {
-    let speed_ratio = normalize_speed(speed, config.speed_normalization_scale).clamp(0.15, 1.0);
+    let speed_ratio = steering_speed_ratio(speed).clamp(0.15, 1.0);
     steering * config.turn_rate * speed_ratio
 }
 
@@ -586,6 +609,74 @@ pub fn toggle_pause_from_keyboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn population_members_share_the_complete_canonical_start_state() {
+        let library = TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let mut app = App::new();
+        app.insert_resource(track)
+            .insert_resource(SimulationConfig {
+                population_size: 6,
+                ..default()
+            })
+            .insert_resource(SimulationMode::Training)
+            .insert_resource(TestDriveSettings::default())
+            .add_systems(Update, rebuild_simulation);
+        app.update();
+
+        let expected = canonical_population_start(app.world().resource::<Track>());
+        let track_length = app.world().resource::<Track>().total_length;
+        let mut ids = Vec::new();
+        let mut cars = app.world_mut().query::<(
+            &Car,
+            &Transform,
+            &KinematicCar,
+            &CarControls,
+            &CarObservation,
+            &CarProgress,
+        )>();
+        for (car, transform, state, controls, observation, progress) in cars.iter(app.world()) {
+            ids.push(car.id);
+            assert_eq!(transform.translation.truncate(), expected.position);
+            assert_eq!(transform.rotation, Quat::from_rotation_z(expected.heading));
+            assert_eq!(state.heading, expected.heading);
+            assert_eq!(state.speed, CANONICAL_INITIAL_SPEED);
+            assert_eq!(state.speed, expected.speed);
+            assert_eq!(*controls, expected.controls);
+            assert_eq!(*observation, expected.observation);
+            assert_eq!(progress.track_distance, expected.progress.track_distance);
+            assert_eq!(
+                progress.best_track_distance,
+                expected.progress.best_track_distance
+            );
+            assert_eq!(
+                progress.normalized_progress,
+                expected.progress.normalized_progress
+            );
+            assert_eq!(progress.nearest_segment, expected.progress.nearest_segment);
+            assert_eq!(progress.projected_point, expected.progress.projected_point);
+            assert_eq!(
+                progress.centerline_distance,
+                expected.progress.centerline_distance
+            );
+            assert!((0.0..=track_length).contains(&progress.track_distance));
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, (0..6).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn sensor_angles_and_default_range_match_the_frozen_input_contract() {
+        for (actual, expected) in SENSOR_ANGLES
+            .map(f32::to_degrees)
+            .into_iter()
+            .zip([60.0, 30.0, 0.0, -30.0, -60.0])
+        {
+            assert!((actual - expected).abs() < 1.0e-4);
+        }
+        assert_eq!(SimulationConfig::default().sensor_max_distance, 750.0);
+    }
 
     #[test]
     fn switching_tracks_replaces_walls_cars_and_progress_state() {
@@ -876,11 +967,70 @@ mod tests {
     }
 
     #[test]
-    fn speed_observation_is_asymptotic_and_does_not_clamp_physics() {
+    fn speed_observation_is_zero_and_symmetric() {
         let scale = SimulationConfig::default().speed_normalization_scale;
         assert_eq!(normalize_speed(0.0, scale), 0.0);
-        assert!((normalize_speed(scale, scale) - (1.0 - (-1.0_f32).exp())).abs() < 1.0e-6);
-        assert!(normalize_speed(scale * 10.0, scale) < 1.0);
+        for speed in [1.0, 100.0, 250.0, 519.0] {
+            assert_eq!(
+                normalize_speed(speed, scale),
+                normalize_speed(-speed, scale)
+            );
+        }
+    }
+
+    #[test]
+    fn speed_observation_is_monotonic_finite_and_bounded() {
+        let scale = SimulationConfig::default().speed_normalization_scale;
+        let speeds = [0.0, 1.0, 50.0, 173.0, 259.0, 346.0, 432.0, 519.0, f32::MAX];
+        let normalized = speeds.map(|speed| normalize_speed(speed, scale));
+
+        assert!(normalized.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(
+            normalized
+                .iter()
+                .all(|value| value.is_finite() && (0.0..=1.0).contains(value))
+        );
+        for speed in [f32::NEG_INFINITY, f32::INFINITY, f32::NAN] {
+            let value = normalize_speed(speed, scale);
+            assert!(value.is_finite() && (0.0..=1.0).contains(&value));
+        }
+        for invalid_scale in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            let value = normalize_speed(100.0, invalid_scale);
+            assert!(value.is_finite() && (0.0..=1.0).contains(&value));
+        }
+    }
+
+    #[test]
+    fn racing_speeds_retain_meaningful_normalized_separation() {
+        const UNITS_PER_SECOND_TO_KM_H: f32 = 0.57852;
+        let scale = SimulationConfig::default().speed_normalization_scale;
+        assert_eq!(scale, 250.0);
+        let normalized = [150.0, 200.0, 250.0, 300.0]
+            .map(|km_h| normalize_speed(km_h / UNITS_PER_SECOND_TO_KM_H, scale));
+
+        assert!(normalized.windows(2).all(|pair| pair[1] - pair[0] > 0.03));
+        assert!(normalized[0] > 0.45);
+        assert!(normalized[3] < 0.75);
+    }
+
+    #[test]
+    fn observation_scale_does_not_change_vehicle_physics() {
+        let initial = VehicleState {
+            position: Vec2::ZERO,
+            heading: 0.3,
+            speed: 120.0,
+        };
+        let controls = CarControls::new(0.8, 0.7);
+        let default_config = SimulationConfig::default();
+        let different_observation_scale = SimulationConfig {
+            speed_normalization_scale: 1.0,
+            ..default_config.clone()
+        };
+
+        assert_eq!(
+            integrate_vehicle(initial, controls, &default_config, 1.0 / 60.0),
+            integrate_vehicle(initial, controls, &different_observation_scale, 1.0 / 60.0)
+        );
     }
 
     #[test]

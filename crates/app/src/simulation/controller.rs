@@ -1,9 +1,34 @@
 use bevy::prelude::*;
 
-#[derive(Component, Clone, Copy, Debug)]
+/// Six-scalar controller input boundary.
+///
+/// `sensors` is ordered left +60 degrees, left +30 degrees, front, right -30
+/// degrees, right -60 degrees. Normalized speed is always the final input.
+#[derive(Component, Clone, Copy, Debug, PartialEq)]
 pub struct CarObservation {
     pub sensors: [f32; 5],
     pub normalized_speed: f32,
+}
+
+impl CarObservation {
+    pub const INITIAL: Self = Self {
+        sensors: [1.0; 5],
+        normalized_speed: 0.0,
+    };
+
+    /// Returns the stable future-MLP input order without exposing Bevy to the
+    /// pure AI crate.
+    pub fn as_inputs(self) -> [f32; 6] {
+        let [left_60, left_30, front, right_30, right_60] = self.sensors;
+        [
+            left_60,
+            left_30,
+            front,
+            right_30,
+            right_60,
+            self.normalized_speed,
+        ]
+    }
 }
 
 #[derive(Component, Clone, Copy, Debug, Default, PartialEq)]
@@ -32,6 +57,12 @@ fn sanitize_control(value: f32) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Adapts the stable future-network output order `[steering, acceleration]`
+/// to the app's existing `CarControls::new(acceleration, steering)` API.
+pub fn controls_from_network_outputs(outputs: [f32; 2]) -> CarControls {
+    CarControls::new(outputs[1], outputs[0])
 }
 
 /// Small seam that will later allow the app to call a controller backed by the
@@ -71,7 +102,7 @@ impl CarController for TemporaryController {
         // They keep accelerating until an immediate frontal obstacle requires braking.
         let acceleration = if front < 0.16 { -0.75 } else { 1.0 };
 
-        CarControls::new(acceleration, steering)
+        controls_from_network_outputs([steering, acceleration])
     }
 }
 
@@ -94,6 +125,12 @@ mod tests {
             std::mem::size_of::<CarObservation>(),
             6 * std::mem::size_of::<f32>()
         );
+
+        let observation = CarObservation {
+            sensors: [0.1, 0.2, 0.3, 0.4, 0.5],
+            normalized_speed: 0.6,
+        };
+        assert_eq!(observation.as_inputs(), [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]);
     }
 
     #[test]
@@ -103,6 +140,17 @@ mod tests {
             CarControls::new(f32::NAN, f32::INFINITY),
             CarControls::NEUTRAL
         );
+    }
+
+    #[test]
+    fn network_outputs_map_steering_then_acceleration() {
+        let controls = controls_from_network_outputs([0.7, -0.3]);
+        assert_eq!(controls.steering, 0.7);
+        assert_eq!(controls.acceleration, -0.3);
+
+        let sanitized = controls_from_network_outputs([2.0, f32::NAN]);
+        assert_eq!(sanitized.steering, 1.0);
+        assert_eq!(sanitized.acceleration, 0.0);
     }
 
     #[test]

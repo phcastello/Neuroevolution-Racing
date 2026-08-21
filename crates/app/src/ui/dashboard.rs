@@ -422,13 +422,16 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         ui.add_space(4.0);
                         ui.label("MLP observation (live CarObservation)");
                         for (label, value) in [
-                            ("Left 60°", observation.sensors[0]),
-                            ("Left 30°", observation.sensors[1]),
-                            ("Front", observation.sensors[2]),
-                            ("Right 30°", observation.sensors[3]),
-                            ("Right 60°", observation.sensors[4]),
-                            ("Speed", observation.normalized_speed),
-                        ] {
+                            "Left 60°",
+                            "Left 30°",
+                            "Front",
+                            "Right 30°",
+                            "Right 60°",
+                            "Speed",
+                        ]
+                        .into_iter()
+                        .zip(observation.as_inputs())
+                        {
                             ui.horizontal(|ui| {
                                 ui.label(format!("{label:>11}:"));
                                 ui.monospace(format!("{value:.2}"));

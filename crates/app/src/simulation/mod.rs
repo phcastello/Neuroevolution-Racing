@@ -56,12 +56,12 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
             population_size: 10,
-            sensor_max_distance: 400.0,
+            sensor_max_distance: 750.0,
             acceleration_rate: 125.0,
             braking_rate: 175.0,
             coasting_deceleration: 12.0,
             acceleration_falloff_speed: 140.0,
-            speed_normalization_scale: 65.0,
+            speed_normalization_scale: 250.0,
             turn_rate: 2.15,
             max_lateral_acceleration: 225.0,
             temporary_controller_look_ahead: 72.0,

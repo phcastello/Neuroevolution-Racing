@@ -66,11 +66,6 @@ impl CarProgress {
     }
 }
 
-#[derive(Component, Clone, Copy, Debug)]
-pub struct ControllerTuning {
-    pub steering_bias: f32,
-}
-
 #[derive(Component, Debug)]
 pub struct TrackWall;
 
