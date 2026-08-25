@@ -1,3 +1,10 @@
-//! Genetic-algorithm module boundary.
-//!
-//! TODO(student): implement genetic evolution manually.
+pub mod config;
+mod genome;
+mod individual;
+mod population;
+mod operators;
+
+pub use config::Config;
+
+#[cfg(test)]
+mod tests;
