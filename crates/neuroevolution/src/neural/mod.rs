@@ -1,3 +1,8 @@
-//! Neural-network module boundary.
-//!
-//! TODO(student): implement the MLP manually.
+mod mlp;
+mod layer;
+mod activation;
+mod architecture;
+
+pub use activation::Activation;
+pub use architecture::Architecture;
+pub use mlp::Mlp;

@@ -1,6 +1,7 @@
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::genetic::{Config, genome::Genome, population::Population};
+use crate::neural::{Activation, Architecture, Mlp};
 
 fn calculate_fitness(target: &Genome, genome: &Genome) -> f32 {
     let mut fitness: f32 = 0.0;
@@ -23,6 +24,26 @@ fn evaluate_unevaluated_population_against_target(population: &mut Population, t
             individual.set_fitness(fitness);
         }
     }
+}
+
+#[test]
+fn random_genome_builds_a_valid_mlp_with_the_architecture_parameter_count() {
+    let architecture = Architecture::new(vec![6, 8, 2], vec![Activation::Tanh, Activation::Tanh])
+        .unwrap();
+    assert_eq!(architecture.parameter_count(), 74);
+
+    let mut config = Config::default();
+    config.genome_length = architecture.parameter_count();
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let genome = Genome::random(&config, &mut rng);
+
+    assert_eq!(genome.len(), 74);
+
+    let mlp = Mlp::from_parameters(&architecture, genome.genes()).unwrap();
+    let output = mlp.forward(&[0.0; 6]).unwrap();
+
+    assert_eq!(output.len(), 2);
+    assert!(output.iter().all(|value| value.is_finite()));
 }
 
 #[test]
