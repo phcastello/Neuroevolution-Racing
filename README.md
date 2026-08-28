@@ -54,15 +54,17 @@ The Linux build intentionally uses X11/XWayland. WSLg's native Wayland path can 
 
 ## Training and genetic algorithm
 
-Training starts with a deterministic seeded population of 500 genomes. Each genome contains all 74 parameters of the `6 → 8 → 2` dense MLP: weights and biases for both layers. Every individual starts from the same position, heading, speed, observation, and controls, then drives for a 20-second fixed-timestep evaluation.
+Training starts with a deterministic seeded population of 500 genomes. Each genome contains all 74 parameters of the `6 → 8 → 2` dense MLP: weights and biases for both layers. Every individual starts from the same position, heading, speed, observation, and controls. Its independent episode ends on lap completion, a real translational wall collision, lack of significant track progress for 2.5 seconds, or a 60-second safety timeout.
 
-Fitness is the greatest forward distance reached along the active track during that evaluation. When the timer finishes, the application assigns fitness to every individual, records the best and average values, preserves the configured elite fraction, selects parents by tournament, applies uniform crossover and Gaussian mutation, increments the generation, and respawns one car per new genome.
+Each generation selects one reproducible three-track subset from the training suite and uses the same tracks for every individual. A track score combines normalized lap progress with normalized useful progress speed, subtracts a bounded collision penalty, and gives completed laps a bonus. Training fitness is the mean of those track scores. The evaluated generation's champion then runs once on a randomly selected held-out validation track; that validation score is recorded but never enters fitness or evolution. Only after validation does the application preserve elites, select parents by tournament, apply uniform crossover and Gaussian mutation, and increment the generation.
+
+The default episode formula is `1.0 × normalized_progress + 0.20 × normalized_useful_speed + 0.10 if completed - 0.08 if collided`. Useful speed is new best track distance per elapsed second, clamped after division by the configurable `120 u/s` normalization scale; raw absolute car speed is never rewarded.
 
 The dashboard displays:
 
-- the current generation, population and live evaluation timer;
+- the current generation, phase, active/finished episode counts and safety timer;
 - real best/average fitness history from completed generations;
-- the live first-place individual and its current fitness during an evaluation;
+- the live first-place individual and its current normalized progress;
 - that leader's actual neural network, including every neuron activation, weight sign, and relative weight magnitude.
 
 The selected car is reassigned continuously to whichever individual has reached the greatest forward distance in the current generation. Network activations are captured by a generic MLP forward-trace API and exposed through controller telemetry, keeping egui and visualization details out of the neural implementation. Completed generations still contribute best and average samples to the fitness plot.
@@ -155,13 +157,13 @@ Implemented infrastructure:
 - local centerline projection continuity and one-lap start/finish wrap handling;
 - optional debug drawing for the generated centerline, dense sampled points, larger authored control points, and selected-car projection;
 - fixed 60 Hz simulation behavior with pause and speed controls;
-- timed generation evaluation and automatic GA evolution in Training mode;
+- independent episode termination, multi-track training fitness, held-out champion validation, and automatic GA evolution in Training mode;
 - real generation counter and best/average fitness history;
 - live visualization of the current generation leader's `6 → 8 → 2` network using its actual weights and per-inference neuron activations;
 - Champion mode groundwork and a reserved Race mode;
-- unit-tested RON parsing, malformed definitions, role filtering, all bundled track files, generated geometry and borders, arc-length projection/progress, runtime replacement, camera fitting, video-mode selection, observation shape, and controller angle helpers.
+- unit-tested RON parsing, malformed definitions, role filtering, all bundled track files, generated geometry and borders, arc-length projection/progress, runtime replacement, camera fitting, video-mode selection, and observation shape.
 
-Intentionally **not implemented**: gradient-based training/backpropagation, multi-track fitness aggregation, persistence/checkpoint loading, a completed Champion showcase, and Race mode. Learning is performed exclusively through the manually implemented genetic algorithm.
+Intentionally **not implemented**: gradient-based training/backpropagation, persistence/checkpoint loading, a completed Champion showcase, and Race mode. Learning is performed exclusively through the manually implemented genetic algorithm.
 
 ## Data-driven tracks
 
@@ -192,7 +194,7 @@ These are project-owned, simplified 2D coordinate approximations designed as env
 
 The runtime `Track` remains separate from `TrackDefinition`. For each adjacent quartet of closed-loop control points it evaluates the Catmull–Rom spline, samples the centerline, computes tangents and cumulative arc length, and offsets the tangents to form left/right borders. Projection and normalized progress operate only on this generated data and never need to know the active circuit id.
 
-Selecting another dashboard entry updates the active definition in place. The simulation removes the old cars, progress state, colliders, road mesh, and wall visuals; generates a fresh `Track`; respawns the population with controllers rebuilt from the current genomes; and lets the changed track bounds trigger a camera refit. Training currently evaluates one active track at a time; multi-track fitness aggregation remains future work.
+Outside Training mode, selecting another dashboard entry updates the active definition in place. The simulation removes the old cars, progress state, colliders, road mesh, and wall visuals; generates a fresh `Track`; respawns controllers from the relevant genomes; and lets the changed track bounds trigger a camera refit. During Training, the explicit training/validation cycle owns track selection so a manual switch cannot leak held-out data into evolution.
 
 ## Development checks
 

@@ -71,45 +71,9 @@ pub fn controls_from_network_outputs(outputs: [f32; MLP_OUTPUT_SIZE]) -> CarCont
     CarControls::new(outputs[1], outputs[0])
 }
 
-/// Small seam that will later allow the app to call a controller backed by the
-/// manually implemented MLP without coupling that MLP to Bevy.
+/// Controller seam kept independent from Bevy-specific simulation systems.
 pub trait CarController {
     fn control(&mut self, observation: &CarObservation) -> CarControls;
-}
-
-/// Privileged centerline information used only by the infrastructure driver.
-/// It is deliberately separate from `CarObservation`, which is the future MLP
-/// boundary and always contains exactly five sensors plus normalized speed.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct TemporaryNavigationContext {
-    pub target_bearing: f32,
-}
-
-/// Deliberately simple infrastructure-only controller. It follows a centerline
-/// look-ahead target and steers away from nearby walls; it performs no learning.
-#[derive(Default)]
-pub struct TemporaryController {
-    navigation: TemporaryNavigationContext,
-}
-
-impl TemporaryController {
-    pub fn set_navigation_context(&mut self, navigation: TemporaryNavigationContext) {
-        self.navigation = navigation;
-    }
-}
-
-impl CarController for TemporaryController {
-    fn control(&mut self, observation: &CarObservation) -> CarControls {
-        let [left_60, left_30, front, right_30, right_60] = observation.sensors;
-        let obstacle_steering = (left_30 - right_30) * 0.9 + (left_60 - right_60) * 0.35;
-        let steering = (self.navigation.target_bearing * 1.65 + obstacle_steering).clamp(-1.0, 1.0);
-
-        // Do not impose a target-speed ceiling on the temporary training cars.
-        // They keep accelerating until an immediate frontal obstacle requires braking.
-        let acceleration = if front < 0.16 { -0.75 } else { 1.0 };
-
-        controls_from_network_outputs([steering, acceleration])
-    }
 }
 
 #[derive(Component)]
@@ -175,15 +139,6 @@ impl CarController for MlpController {
     }
 }
 
-pub fn signed_angle_to(from_heading: f32, direction: Vec2) -> f32 {
-    let target = direction.y.atan2(direction.x);
-    wrap_angle(target - from_heading)
-}
-
-fn wrap_angle(angle: f32) -> f32 {
-    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,25 +184,6 @@ mod tests {
         let sanitized = controls_from_network_outputs([2.0, f32::NAN]);
         assert_eq!(sanitized.steering, 1.0);
         assert_eq!(sanitized.acceleration, 0.0);
-    }
-
-    #[test]
-    fn signed_angle_uses_shortest_turn() {
-        let almost_pi = std::f32::consts::PI - 0.1;
-        let direction = Vec2::from_angle(-almost_pi);
-        let angle = signed_angle_to(almost_pi, direction);
-        assert!((angle - 0.2).abs() < 0.001);
-    }
-
-    #[test]
-    fn temporary_controller_keeps_accelerating_at_high_normalized_speed() {
-        let mut controller = TemporaryController::default();
-        let controls = controller.control(&CarObservation {
-            sensors: [1.0; 5],
-            normalized_speed: 0.99,
-        });
-
-        assert_eq!(controls.acceleration, 1.0);
     }
 
     #[test]

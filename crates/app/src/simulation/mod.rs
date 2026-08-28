@@ -10,7 +10,7 @@ pub use components::{
 pub(crate) use controller::MlpController;
 pub use controller::{CarControls, CarObservation};
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
-pub use track::{DEFAULT_TRACK_ID, Track, TrackBounds, TrackLibrary};
+pub use track::{Track, TrackBounds, TrackLibrary};
 
 use bevy::{prelude::*, time::Fixed};
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use systems::{
     toggle_pause_from_keyboard, update_track_progress,
 };
 
-pub(crate) use training::{GenerationStats, TrainingState};
+pub(crate) use training::{EvaluationState, GenerationStats, TrainingPhase, TrainingState};
 
 #[derive(Resource, Clone, Debug)]
 pub struct TrackSelection {
@@ -53,7 +53,6 @@ pub struct SimulationConfig {
     pub speed_normalization_scale: f32,
     pub turn_rate: f32,
     pub max_lateral_acceleration: f32,
-    pub temporary_controller_look_ahead: f32,
     pub progress_search_radius: usize,
 }
 
@@ -69,7 +68,6 @@ impl Default for SimulationConfig {
             speed_normalization_scale: 250.0,
             turn_rate: 2.15,
             max_lateral_acceleration: 225.0,
-            temporary_controller_look_ahead: 72.0,
             progress_search_radius: 24,
         }
     }
@@ -139,24 +137,29 @@ impl Plugin for SimulationPlugin {
         let library = TrackLibrary::load_default()
             .unwrap_or_else(|error| panic!("failed to load track library: {error}"));
         let available_track_count = library.all_tracks().count();
+        let simulation_config = SimulationConfig::default();
+        let training_state = TrainingState::with_config(
+            simulation_config.population_size,
+            &library,
+            training::EvaluationConfig::default(),
+        )
+        .expect("failed to create training state");
+        let initial_track_id = training_state
+            .current_track_id()
+            .expect("training must start on a track");
         let definition = library
-            .definition(DEFAULT_TRACK_ID)
-            .unwrap_or_else(|| panic!("default track {DEFAULT_TRACK_ID:?} is missing"));
+            .definition(initial_track_id)
+            .unwrap_or_else(|| panic!("initial training track {initial_track_id:?} is missing"));
         let track = Track::from_definition(definition)
             .unwrap_or_else(|error| panic!("failed to build default track: {error}"));
         let selection = TrackSelection {
-            active_id: DEFAULT_TRACK_ID.into(),
+            active_id: initial_track_id.into(),
             status: format!(
                 "Loaded {} • {available_track_count} tracks available",
                 definition.name
             ),
             requested_id: None,
         };
-        let simulation_config = SimulationConfig::default();
-
-        let training_state = TrainingState::new(simulation_config.population_size)
-            .expect("failed to create training state");
-
         app.insert_resource(simulation_config)
             .insert_resource(training_state)
             .init_resource::<SimulationMode>()

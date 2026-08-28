@@ -8,7 +8,6 @@ use std::{
 use bevy::prelude::*;
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_TRACK_ID: &str = "interlagos";
 const MIN_TOTAL_LENGTH: f32 = 1.0;
 const GEOMETRY_EPSILON: f32 = 1.0e-4;
 

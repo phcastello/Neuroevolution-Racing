@@ -5,7 +5,9 @@ use bevy::prelude::*;
 use bevy_egui::input::EguiWantsInput;
 use neuroevolution::neural::Mlp;
 
-use crate::simulation::training::TrainingState;
+use crate::simulation::training::{
+    EvaluationState, FinishReason, TrackAdvance, TrainingPhase, TrainingState, episode_score,
+};
 
 use super::{
     CAR_LENGTH, CAR_WIDTH, ManualControlMode, PlaybackState, SimulationConfig, SimulationMode,
@@ -47,6 +49,7 @@ type TemporaryCars<'w, 's> = Query<
         &'static mut MlpController,
         &'static mut CarControls,
         Has<SelectedCar>,
+        &'static EvaluationState,
     ),
     With<TemporaryControlled>,
 >;
@@ -74,10 +77,15 @@ pub fn apply_track_selection(
     library: Res<TrackLibrary>,
     mut selection: ResMut<TrackSelection>,
     mut track: ResMut<Track>,
+    mode: Res<SimulationMode>,
 ) {
     let Some(requested_id) = selection.requested_id.take() else {
         return;
     };
+    if *mode == SimulationMode::Training {
+        selection.status = "Track selection is managed by the training cycle".into();
+        return;
+    }
     let Some(definition) = library.definition(&requested_id) else {
         selection.status = format!("Unknown track: {requested_id}");
         return;
@@ -120,7 +128,7 @@ pub fn rebuild_simulation(
     if *mode == SimulationMode::TestDrive {
         spawn_manual_car(&mut commands, &track, test_drive.environment);
     } else {
-        spawn_temporary_cars(&mut commands, &track, &training);
+        spawn_temporary_cars(&mut commands, &track, &training, *mode);
     }
 }
 
@@ -140,32 +148,87 @@ fn spawn_track_colliders(commands: &mut Commands, track: &Track) {
     }
 }
 
-fn spawn_temporary_cars(commands: &mut Commands, track: &Track, training: &TrainingState) {
+fn spawn_temporary_cars(
+    commands: &mut Commands,
+    track: &Track,
+    training: &TrainingState,
+    mode: SimulationMode,
+) {
     let start = canonical_population_start(track);
-    for (id, individual) in training.population().individuals().iter().enumerate() {
-        let mlp =
-            Mlp::from_parameters(training.architecture(), individual.genome().genes()).unwrap();
-        let controller = MlpController::new(mlp, individual.genome().genes()).unwrap();
-
-        let mut entity = commands.spawn((
-            Car { id },
-            controller,
-            KinematicCar {
-                heading: start.heading,
-                speed: start.speed,
-            },
-            SensorReadings::default(),
-            start.observation,
-            start.controls,
-            start.progress.clone(),
-            TemporaryControlled,
-            CollisionLayers::new([SimulationLayer::Car], [SimulationLayer::TrackWall]),
-            Transform::from_translation(start.position.extend(2.0))
-                .with_rotation(Quat::from_rotation_z(start.heading)),
-        ));
-        if id == 0 {
-            entity.insert(SelectedCar);
+    match mode {
+        SimulationMode::Training => match training.phase() {
+            TrainingPhase::TrainingTrack { .. } => {
+                for (id, individual) in training.population().individuals().iter().enumerate() {
+                    spawn_evaluated_car(
+                        commands,
+                        training,
+                        &start,
+                        id,
+                        individual.genome().genes(),
+                        id == 0,
+                    );
+                }
+            }
+            TrainingPhase::Validation { .. } => {
+                if let (Some(id), Some(genome)) = (
+                    training.champion_population_index(),
+                    training.champion_genome(),
+                ) {
+                    spawn_evaluated_car(commands, training, &start, id, genome, true);
+                }
+            }
+            TrainingPhase::Evolving => {}
+        },
+        SimulationMode::Champion => {
+            if let Some(genome) = training.champion_genome() {
+                spawn_evaluated_car(commands, training, &start, 0, genome, true);
+            }
         }
+        SimulationMode::Race => {
+            for (id, individual) in training.population().individuals().iter().enumerate() {
+                spawn_evaluated_car(
+                    commands,
+                    training,
+                    &start,
+                    id,
+                    individual.genome().genes(),
+                    id == 0,
+                );
+            }
+        }
+        SimulationMode::TestDrive => unreachable!(),
+    }
+}
+
+fn spawn_evaluated_car(
+    commands: &mut Commands,
+    training: &TrainingState,
+    start: &CanonicalPopulationStart,
+    id: usize,
+    genome: &[f32],
+    selected: bool,
+) {
+    let mlp = Mlp::from_parameters(training.architecture(), genome).unwrap();
+    let controller = MlpController::new(mlp, genome).unwrap();
+    let mut entity = commands.spawn((
+        Car { id },
+        controller,
+        KinematicCar {
+            heading: start.heading,
+            speed: start.speed,
+        },
+        SensorReadings::default(),
+        start.observation,
+        start.controls,
+        start.progress.clone(),
+        EvaluationState::new(start.progress.best_track_distance),
+        TemporaryControlled,
+        CollisionLayers::new([SimulationLayer::Car], [SimulationLayer::TrackWall]),
+        Transform::from_translation(start.position.extend(2.0))
+            .with_rotation(Quat::from_rotation_z(start.heading)),
+    ));
+    if selected {
+        entity.insert(SelectedCar);
     }
 }
 
@@ -251,12 +314,16 @@ pub fn sample_sensors(
             &KinematicCar,
             &mut SensorReadings,
             &mut CarObservation,
+            Option<&EvaluationState>,
         ),
         With<Car>,
     >,
 ) {
     let filter = SpatialQueryFilter::from_mask([SimulationLayer::TrackWall]);
-    for (transform, state, mut sensors, mut observation) in &mut cars {
+    for (transform, state, mut sensors, mut observation, evaluation) in &mut cars {
+        if evaluation.is_some_and(EvaluationState::is_finished) {
+            continue;
+        }
         let origin = transform.translation.truncate();
         for (index, relative_angle) in SENSOR_ANGLES.iter().enumerate() {
             let direction = Vec2::from_angle(state.heading + relative_angle);
@@ -274,7 +341,11 @@ pub fn sample_sensors(
 }
 
 pub fn produce_temporary_controls(mut cars: TemporaryCars) {
-    for (observation, mut controller, mut controls, selected) in &mut cars {
+    for (observation, mut controller, mut controls, selected, evaluation) in &mut cars {
+        if evaluation.is_finished() {
+            *controls = CarControls::NEUTRAL;
+            continue;
+        }
         *controls = if selected {
             controller.control_with_telemetry(observation)
         } else {
@@ -481,13 +552,29 @@ pub fn apply_vehicle_physics(
     time: Res<Time<Fixed>>,
     config: Res<SimulationConfig>,
     spatial_query: SpatialQuery,
-    mut cars: Query<(&mut Transform, &mut KinematicCar, &CarControls), With<Car>>,
+    mut cars: Query<
+        (
+            &mut Transform,
+            &mut KinematicCar,
+            &mut CarControls,
+            Option<&mut EvaluationState>,
+        ),
+        With<Car>,
+    >,
 ) {
     let dt = time.delta_secs();
     let car_shape = Collider::rectangle(CAR_LENGTH, CAR_WIDTH);
     let wall_filter = SpatialQueryFilter::from_mask([SimulationLayer::TrackWall]);
 
-    for (mut transform, mut state, controls) in &mut cars {
+    for (mut transform, mut state, mut controls, mut evaluation) in &mut cars {
+        if evaluation
+            .as_ref()
+            .is_some_and(|evaluation| evaluation.is_finished())
+        {
+            *controls = CarControls::NEUTRAL;
+            state.speed = 0.0;
+            continue;
+        }
         let current = VehicleState {
             position: transform.translation.truncate(),
             heading: state.heading,
@@ -501,7 +588,13 @@ pub fn apply_vehicle_physics(
         });
 
         if resolved.translation_collided {
-            state.speed = -integrated.speed.abs().min(18.0) * 0.35;
+            if let Some(evaluation) = evaluation.as_deref_mut() {
+                evaluation.finish(FinishReason::Collision);
+                *controls = CarControls::NEUTRAL;
+                state.speed = 0.0;
+            } else {
+                state.speed = -integrated.speed.abs().min(18.0) * 0.35;
+            }
         } else {
             state.speed = integrated.speed;
         }
@@ -515,9 +608,12 @@ pub fn apply_vehicle_physics(
 pub fn update_track_progress(
     track: Res<Track>,
     config: Res<SimulationConfig>,
-    mut cars: Query<(&Transform, &mut CarProgress), With<Car>>,
+    mut cars: Query<(&Transform, &mut CarProgress, Option<&EvaluationState>), With<Car>>,
 ) {
-    for (transform, mut progress) in &mut cars {
+    for (transform, mut progress, evaluation) in &mut cars {
+        if evaluation.is_some_and(EvaluationState::is_finished) {
+            continue;
+        }
         let position = transform.translation.truncate();
         let projection = track.project_near(
             position,
@@ -542,19 +638,34 @@ pub fn update_track_progress(
 
 pub fn select_current_leader(
     mut commands: Commands,
-    cars: Query<(Entity, &Car, &CarProgress, Has<SelectedCar>), With<TemporaryControlled>>,
+    cars: Query<
+        (
+            Entity,
+            &Car,
+            &CarProgress,
+            &EvaluationState,
+            Has<SelectedCar>,
+        ),
+        With<TemporaryControlled>,
+    >,
 ) {
     let leader = cars
         .iter()
-        .max_by(|(_, car_a, progress_a, _), (_, car_b, progress_b, _)| {
-            progress_a
-                .best_track_distance
-                .total_cmp(&progress_b.best_track_distance)
-                .then_with(|| car_b.id.cmp(&car_a.id))
-        })
-        .map(|(entity, _, _, _)| entity);
+        .max_by(
+            |(_, car_a, progress_a, evaluation_a, _), (_, car_b, progress_b, evaluation_b, _)| {
+                (!evaluation_a.is_finished())
+                    .cmp(&(!evaluation_b.is_finished()))
+                    .then_with(|| {
+                        progress_a
+                            .best_track_distance
+                            .total_cmp(&progress_b.best_track_distance)
+                    })
+                    .then_with(|| car_b.id.cmp(&car_a.id))
+            },
+        )
+        .map(|(entity, _, _, _, _)| entity);
 
-    for (entity, _, _, selected) in &cars {
+    for (entity, _, _, _, selected) in &cars {
         if Some(entity) == leader && !selected {
             commands.entity(entity).insert(SelectedCar);
         } else if Some(entity) != leader && selected {
@@ -566,45 +677,106 @@ pub fn select_current_leader(
 pub fn finish_generation_evaluation(
     time: Res<Time<Fixed>>,
     mut training: ResMut<TrainingState>,
-    cars: Query<(Entity, &Car, &CarProgress), With<TemporaryControlled>>,
+    mut cars: Query<(Entity, &Car, &CarProgress, &mut EvaluationState), With<TemporaryControlled>>,
     mut commands: Commands,
-    track: Res<Track>,
+    mut track: ResMut<Track>,
+    library: Res<TrackLibrary>,
+    mut selection: ResMut<TrackSelection>,
     mode: Res<SimulationMode>,
 ) {
     if *mode != SimulationMode::Training {
         return;
     }
-    let evaluation_finished = training
-        .advance_evaluation(time.delta_secs())
-        .expect("fixed time delta should be finite and non-negative");
-
-    if !evaluation_finished {
+    let evaluation_config = training.evaluation_config().clone();
+    let delta_seconds = time.delta_secs();
+    for (_, _, progress, mut evaluation) in &mut cars {
+        evaluation.update(
+            delta_seconds,
+            progress.best_track_distance,
+            track.total_length,
+            &evaluation_config,
+        );
+    }
+    if cars.is_empty()
+        || cars
+            .iter()
+            .any(|(_, _, _, evaluation)| !evaluation.is_finished())
+    {
         return;
     }
 
-    for (_, car, progress) in &cars {
-        let individual = training
-            .population_mut()
-            .individuals_mut()
-            .get_mut(car.id)
-            .unwrap_or_else(|| panic!("car {} has no corresponding individual", car.id));
-        individual.set_fitness(progress.best_track_distance);
+    let phase = training.phase().clone();
+    let mut scored = cars
+        .iter()
+        .map(|(entity, car, progress, evaluation)| {
+            (
+                entity,
+                car.id,
+                episode_score(
+                    &evaluation,
+                    progress.best_track_distance,
+                    track.total_length,
+                    &evaluation_config,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(_, id, _)| *id);
+    for (entity, _, _) in &scored {
+        commands.entity(*entity).despawn();
     }
+    let advance = match phase {
+        TrainingPhase::TrainingTrack { .. } => training
+            .record_training_results(
+                &scored
+                    .iter()
+                    .map(|(_, _, result)| *result)
+                    .collect::<Vec<_>>(),
+            )
+            .expect("failed to record training episode scores"),
+        TrainingPhase::Validation { .. } => training
+            .record_validation_result(scored[0].2)
+            .expect("failed to record held-out validation score"),
+        TrainingPhase::Evolving => return,
+    };
 
-    let stats = training
-        .evolve_generation()
-        .expect("failed to evolve population");
-
-    println!(
-        "Generation {} finished | Best fitness: {:.5} | Average fitness: {:.5}",
-        stats.generation, stats.best_fitness, stats.average_fitness
-    );
-
-    for (entity, _, _) in &cars {
-        commands.entity(entity).despawn();
-    }
-
-    spawn_temporary_cars(&mut commands, &track, &training);
+    let next_track_id = match advance {
+        TrackAdvance::Training(track_id) | TrackAdvance::Validation(track_id) => track_id,
+        TrackAdvance::ReadyToEvolve => {
+            let validation = training
+                .latest_validation()
+                .cloned()
+                .expect("validation was just recorded");
+            let stats = training
+                .evolve_generation()
+                .expect("failed to evolve population");
+            let counts = training.last_finish_counts();
+            println!(
+                "Generation {} | Training fitness: best={:.5} average={:.5} | Validation: track={} score={:.5} reason={} | Finish reasons: completed={} collision={} stalled={} timeout={}",
+                stats.generation,
+                stats.best_fitness,
+                stats.average_fitness,
+                validation.track_id,
+                validation.score,
+                validation.finish_reason.label(),
+                counts.completed,
+                counts.collision,
+                counts.stalled,
+                counts.timeout,
+            );
+            training
+                .current_track_id()
+                .expect("new generation starts on a training track")
+                .to_string()
+        }
+    };
+    let definition = library
+        .definition(&next_track_id)
+        .unwrap_or_else(|| panic!("training requested missing track {next_track_id:?}"));
+    *track = Track::from_definition(definition).expect("configured track should build");
+    selection.active_id = next_track_id;
+    selection.requested_id = None;
+    selection.status = format!("Training cycle loaded {}", definition.name);
 }
 
 pub fn handle_test_drive_input(
@@ -673,6 +845,16 @@ pub fn toggle_pause_from_keyboard(
 mod tests {
     use super::*;
 
+    fn training_state(population_size: usize) -> TrainingState {
+        let library = TrackLibrary::load_default().unwrap();
+        TrainingState::with_config(
+            population_size,
+            &library,
+            crate::simulation::training::EvaluationConfig::default(),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn selected_car_tracks_the_current_generation_leader() {
         let mut app = App::new();
@@ -681,9 +863,12 @@ mod tests {
         for (id, fitness) in [(0, 12.0), (1, 48.0), (2, 31.0)] {
             let mut progress = CarProgress::new(0.0, 100.0, 0, Vec2::ZERO);
             progress.best_track_distance = fitness;
-            let mut entity = app
-                .world_mut()
-                .spawn((Car { id }, progress, TemporaryControlled));
+            let mut entity = app.world_mut().spawn((
+                Car { id },
+                progress,
+                EvaluationState::new(0.0),
+                TemporaryControlled,
+            ));
             if id == 0 {
                 entity.insert(SelectedCar);
             }
@@ -706,7 +891,7 @@ mod tests {
         let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
         let mut app = App::new();
         app.insert_resource(track)
-            .insert_resource(TrainingState::new(6).unwrap())
+            .insert_resource(training_state(6))
             .insert_resource(SimulationConfig {
                 population_size: 6,
                 ..default()
@@ -783,9 +968,9 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(library)
             .insert_resource(initial)
-            .insert_resource(TrainingState::new(3).unwrap())
+            .insert_resource(training_state(3))
             .insert_resource(selection)
-            .insert_resource(SimulationMode::Training)
+            .insert_resource(SimulationMode::Race)
             .insert_resource(TestDriveSettings::default())
             .insert_resource(SimulationConfig {
                 population_size: 3,
@@ -1131,7 +1316,7 @@ mod tests {
         let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
         let mut app = App::new();
         app.insert_resource(track)
-            .insert_resource(TrainingState::new(1).unwrap())
+            .insert_resource(training_state(1))
             .insert_resource(SimulationConfig::default())
             .insert_resource(SimulationMode::TestDrive)
             .insert_resource(TestDriveSettings::default())
@@ -1174,64 +1359,74 @@ mod tests {
     }
 
     #[test]
-    fn generation_evaluation_finishes_only_when_its_duration_elapses() {
-        let mut training = TrainingState::new(2).unwrap();
-        training.set_evaluation_duration(1.0).unwrap();
-        let expected_champion = training.population().individuals()[1]
-            .genome()
-            .genes()
-            .to_vec();
+    fn finished_population_advances_track_without_evolving_early() {
         let library = TrackLibrary::load_default().unwrap();
-        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
-
-        let mut first_progress = CarProgress::new(0.0, 100.0, 0, Vec2::ZERO);
+        let training = training_state(2);
+        let initial_track_id = training.current_track_id().unwrap().to_string();
+        let track = Track::from_definition(library.definition(&initial_track_id).unwrap()).unwrap();
+        let track_length = track.total_length;
+        let selection = TrackSelection {
+            active_id: initial_track_id,
+            status: String::new(),
+            requested_id: None,
+        };
+        let mut first_progress = CarProgress::new(0.0, track_length, 0, Vec2::ZERO);
         first_progress.best_track_distance = 42.0;
-        let mut second_progress = CarProgress::new(0.0, 100.0, 0, Vec2::ZERO);
+        let mut second_progress = CarProgress::new(0.0, track_length, 0, Vec2::ZERO);
         second_progress.best_track_distance = 73.0;
+        let first_evaluation = EvaluationState {
+            finish_reason: Some(FinishReason::Collision),
+            elapsed: 1.0,
+            time_without_progress: 0.0,
+            last_significant_progress: 42.0,
+            initial_progress: 0.0,
+        };
+        let second_evaluation = EvaluationState {
+            finish_reason: Some(FinishReason::Stalled),
+            elapsed: 1.0,
+            time_without_progress: 1.0,
+            last_significant_progress: 73.0,
+            initial_progress: 0.0,
+        };
 
         let mut app = App::new();
         app.insert_resource(training)
+            .insert_resource(library)
             .insert_resource(track)
+            .insert_resource(selection)
             .insert_resource(SimulationMode::Training)
             .insert_resource(Time::<Fixed>::from_seconds(0.5))
             .add_systems(FixedUpdate, finish_generation_evaluation);
-        app.world_mut()
-            .spawn((Car { id: 0 }, first_progress, TemporaryControlled));
-        app.world_mut()
-            .spawn((Car { id: 1 }, second_progress, TemporaryControlled));
-
-        app.world_mut()
-            .resource_mut::<Time<Fixed>>()
-            .advance_by(std::time::Duration::from_secs_f32(0.5));
-        app.world_mut().run_schedule(FixedUpdate);
-        assert_eq!(
-            app.world().resource::<TrainingState>().evaluation_elapsed(),
-            0.5
-        );
-        assert!(
-            app.world()
-                .resource::<TrainingState>()
-                .population()
-                .individuals()
-                .iter()
-                .all(|individual| individual.fitness().is_none())
-        );
+        app.world_mut().spawn((
+            Car { id: 0 },
+            first_progress,
+            first_evaluation,
+            TemporaryControlled,
+        ));
+        app.world_mut().spawn((
+            Car { id: 1 },
+            second_progress,
+            second_evaluation,
+            TemporaryControlled,
+        ));
 
         app.world_mut()
             .resource_mut::<Time<Fixed>>()
             .advance_by(std::time::Duration::from_secs_f32(0.5));
         app.world_mut().run_schedule(FixedUpdate);
         let training = app.world().resource::<TrainingState>();
-        assert_eq!(training.evaluation_elapsed(), 0.0);
-        assert_eq!(training.generation(), 1);
-        assert_eq!(training.history().len(), 1);
-        assert_eq!(training.history()[0].best_fitness, 73.0);
-        assert_eq!(training.history()[0].average_fitness, 57.5);
-        assert_eq!(
-            training.champion_genome(),
-            Some(expected_champion.as_slice())
+        assert_eq!(training.generation(), 0);
+        assert!(training.history().is_empty());
+        assert!(
+            training
+                .population()
+                .individuals()
+                .iter()
+                .all(|individual| individual.fitness().is_none())
         );
-        assert_eq!(training.population().individuals()[0].fitness(), Some(73.0));
-        assert_eq!(training.population().individuals()[1].fitness(), None);
+        assert!(matches!(
+            training.phase(),
+            TrainingPhase::TrainingTrack { index: 1, .. }
+        ));
     }
 }

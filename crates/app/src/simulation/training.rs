@@ -1,12 +1,256 @@
-use super::controller::{MLP_INPUT_SIZE, MLP_OUTPUT_SIZE};
-use bevy::prelude::Resource;
+use super::{
+    TrackLibrary,
+    controller::{MLP_INPUT_SIZE, MLP_OUTPUT_SIZE},
+};
+use bevy::prelude::{Component, Resource};
 use neuroevolution::{
     genetic::{Config, Population},
     neural::{Activation, Architecture},
 };
-use rand::{SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
-const DEFAULT_EVALUATION_DURATION: f32 = 20.0;
+const EVALUATION_RNG_SALT: u64 = 0x4556_414c_5541_5445;
+const DEFAULT_TRAINING_TRACKS_PER_GENERATION: Option<usize> = Some(3);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    Completed,
+    Collision,
+    Stalled,
+    Timeout,
+}
+
+impl FinishReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Collision => "collision",
+            Self::Stalled => "stalled",
+            Self::Timeout => "timeout",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FinishReasonCounts {
+    pub completed: usize,
+    pub collision: usize,
+    pub stalled: usize,
+    pub timeout: usize,
+}
+
+impl FinishReasonCounts {
+    fn record(&mut self, reason: FinishReason) {
+        match reason {
+            FinishReason::Completed => self.completed += 1,
+            FinishReason::Collision => self.collision += 1,
+            FinishReason::Stalled => self.stalled += 1,
+            FinishReason::Timeout => self.timeout += 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingTrackSelection {
+    All,
+    RandomSubset(usize),
+}
+
+/// Parameters for episode termination and the deliberately small score formula.
+/// Progress is dominant, useful speed is a tie-breaker, and collision is a bounded penalty.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EvaluationConfig {
+    pub maximum_episode_duration: f32,
+    pub stall_timeout: f32,
+    pub significant_progress_epsilon: f32,
+    pub progress_weight: f32,
+    pub speed_weight: f32,
+    pub collision_penalty: f32,
+    pub completion_bonus: f32,
+    pub progress_speed_normalization: f32,
+    pub training_track_selection: TrainingTrackSelection,
+}
+
+impl Default for EvaluationConfig {
+    fn default() -> Self {
+        Self {
+            maximum_episode_duration: 60.0,
+            stall_timeout: 2.5,
+            significant_progress_epsilon: 6.0,
+            progress_weight: 1.0,
+            speed_weight: 0.20,
+            collision_penalty: 0.08,
+            completion_bonus: 0.10,
+            progress_speed_normalization: 120.0,
+            training_track_selection: match DEFAULT_TRAINING_TRACKS_PER_GENERATION {
+                Some(count) => TrainingTrackSelection::RandomSubset(count),
+                None => TrainingTrackSelection::All,
+            },
+        }
+    }
+}
+
+impl EvaluationConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("maximum_episode_duration", self.maximum_episode_duration),
+            ("stall_timeout", self.stall_timeout),
+            (
+                "significant_progress_epsilon",
+                self.significant_progress_epsilon,
+            ),
+            (
+                "progress_speed_normalization",
+                self.progress_speed_normalization,
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(format!("{name} must be finite and greater than zero"));
+            }
+        }
+        for (name, value) in [
+            ("progress_weight", self.progress_weight),
+            ("speed_weight", self.speed_weight),
+            ("collision_penalty", self.collision_penalty),
+            ("completion_bonus", self.completion_bonus),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{name} must be finite and non-negative"));
+            }
+        }
+        if matches!(
+            self.training_track_selection,
+            TrainingTrackSelection::RandomSubset(0)
+        ) {
+            return Err("training track subset size must be greater than zero".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Component, Clone, Debug, PartialEq)]
+pub struct EvaluationState {
+    pub finish_reason: Option<FinishReason>,
+    pub elapsed: f32,
+    pub time_without_progress: f32,
+    pub last_significant_progress: f32,
+    pub initial_progress: f32,
+}
+
+impl EvaluationState {
+    pub fn new(initial_progress: f32) -> Self {
+        Self {
+            finish_reason: None,
+            elapsed: 0.0,
+            time_without_progress: 0.0,
+            last_significant_progress: initial_progress,
+            initial_progress,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+
+    pub fn finish(&mut self, reason: FinishReason) {
+        if self.finish_reason.is_none() {
+            self.finish_reason = Some(reason);
+        }
+    }
+
+    /// Advances termination logic after track progress has been updated for the tick.
+    pub fn update(
+        &mut self,
+        delta_seconds: f32,
+        best_track_distance: f32,
+        total_track_length: f32,
+        config: &EvaluationConfig,
+    ) {
+        if self.is_finished() {
+            return;
+        }
+        self.elapsed += delta_seconds.max(0.0);
+
+        // The accumulated tracker reaches total_length only by crossing the lap boundary
+        // in the forward direction; regression/wrap-around therefore cannot complete a lap.
+        if best_track_distance >= total_track_length {
+            self.finish(FinishReason::Completed);
+            return;
+        }
+
+        if best_track_distance - self.last_significant_progress
+            >= config.significant_progress_epsilon
+        {
+            self.last_significant_progress = best_track_distance;
+            self.time_without_progress = 0.0;
+        } else {
+            self.time_without_progress += delta_seconds.max(0.0);
+        }
+
+        if self.time_without_progress >= config.stall_timeout {
+            self.finish(FinishReason::Stalled);
+        } else if self.elapsed >= config.maximum_episode_duration {
+            self.finish(FinishReason::Timeout);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EpisodeResult {
+    pub score: f32,
+    pub normalized_progress: f32,
+    pub normalized_progress_speed: f32,
+    pub elapsed: f32,
+    pub finish_reason: FinishReason,
+}
+
+/// Computes one track score. Track progress is normalized by lap length and useful
+/// speed uses only new best distance, never the car's raw/absolute velocity.
+pub fn episode_score(
+    state: &EvaluationState,
+    best_track_distance: f32,
+    total_track_length: f32,
+    config: &EvaluationConfig,
+) -> EpisodeResult {
+    let normalized_progress = if total_track_length > f32::EPSILON {
+        (best_track_distance / total_track_length).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let useful_distance = (best_track_distance - state.initial_progress).max(0.0);
+    let useful_speed = if state.elapsed > f32::EPSILON {
+        useful_distance / state.elapsed
+    } else {
+        0.0
+    };
+    let normalized_progress_speed =
+        (useful_speed / config.progress_speed_normalization).clamp(0.0, 1.0);
+    let finish_reason = state
+        .finish_reason
+        .expect("episode score requires a finished evaluation");
+    let collision_penalty = if finish_reason == FinishReason::Collision {
+        config.collision_penalty
+    } else {
+        0.0
+    };
+    let completion_bonus = if finish_reason == FinishReason::Completed {
+        config.completion_bonus
+    } else {
+        0.0
+    };
+    let score = config.progress_weight * normalized_progress
+        + config.speed_weight * normalized_progress_speed
+        + completion_bonus
+        - collision_penalty;
+
+    EpisodeResult {
+        score,
+        normalized_progress,
+        normalized_progress_speed,
+        elapsed: state.elapsed,
+        finish_reason,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GenerationStats {
@@ -15,52 +259,195 @@ pub struct GenerationStats {
     pub average_fitness: f32,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidationStats {
+    pub generation: usize,
+    pub track_id: String,
+    pub score: f32,
+    pub normalized_progress: f32,
+    pub elapsed: f32,
+    pub finish_reason: FinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrainingPhase {
+    TrainingTrack {
+        track_id: String,
+        index: usize,
+        total: usize,
+    },
+    Validation {
+        track_id: String,
+    },
+    Evolving,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrackAdvance {
+    Training(String),
+    Validation(String),
+    ReadyToEvolve,
+}
+
 #[derive(Resource)]
 pub struct TrainingState {
     architecture: Architecture,
-    config: Config,
+    genetic_config: Config,
+    evaluation_config: EvaluationConfig,
     population: Population,
-    rng: StdRng,
-    evaluation_elapsed: f32,
-    evaluation_duration: f32,
+    evolution_rng: StdRng,
+    evaluation_rng: StdRng,
+    training_track_ids: Vec<String>,
+    validation_track_ids: Vec<String>,
+    selected_training_tracks: Vec<String>,
+    training_score_sums: Vec<f32>,
+    completed_training_tracks: usize,
+    phase: TrainingPhase,
     history: Vec<GenerationStats>,
+    validation_history: Vec<ValidationStats>,
+    pending_stats: Option<GenerationStats>,
     champion_genome: Option<Vec<f32>>,
+    champion_population_index: Option<usize>,
+    finish_counts: FinishReasonCounts,
+    last_finish_counts: FinishReasonCounts,
 }
 
 impl TrainingState {
-    pub fn new(population_size: usize) -> Result<Self, String> {
-        let layer_sizes = vec![MLP_INPUT_SIZE, 8, MLP_OUTPUT_SIZE];
-        let activations = vec![Activation::Tanh, Activation::Tanh];
-        let architecture = Architecture::new(layer_sizes, activations)?;
+    pub fn with_config(
+        population_size: usize,
+        library: &TrackLibrary,
+        evaluation_config: EvaluationConfig,
+    ) -> Result<Self, String> {
+        evaluation_config.validate()?;
+        let training_track_ids = library
+            .training_tracks()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let validation_track_ids = library
+            .validation_tracks()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        if training_track_ids.is_empty() || validation_track_ids.is_empty() {
+            return Err("training and validation track suites must not be empty".into());
+        }
 
-        let config = Config {
+        let architecture = Architecture::new(
+            vec![MLP_INPUT_SIZE, 8, MLP_OUTPUT_SIZE],
+            vec![Activation::Tanh, Activation::Tanh],
+        )?;
+        let genetic_config = Config {
             population_size,
             genome_length: architecture.parameter_count(),
             ..Config::default()
         };
-
-        let mut rng = StdRng::seed_from_u64(config.seed);
-        let population = Population::new(&config, &mut rng)?;
-
-        Ok(Self {
+        let mut evolution_rng = StdRng::seed_from_u64(genetic_config.seed);
+        let population = Population::new(&genetic_config, &mut evolution_rng)?;
+        let evaluation_rng = StdRng::seed_from_u64(genetic_config.seed ^ EVALUATION_RNG_SALT);
+        let mut state = Self {
             architecture,
-            config,
+            genetic_config,
+            evaluation_config,
             population,
-            rng,
-            evaluation_elapsed: 0.0,
-            evaluation_duration: DEFAULT_EVALUATION_DURATION,
+            evolution_rng,
+            evaluation_rng,
+            training_track_ids,
+            validation_track_ids,
+            selected_training_tracks: Vec::new(),
+            training_score_sums: vec![0.0; population_size],
+            completed_training_tracks: 0,
+            phase: TrainingPhase::Evolving,
             history: Vec::new(),
+            validation_history: Vec::new(),
+            pending_stats: None,
             champion_genome: None,
-        })
+            champion_population_index: None,
+            finish_counts: FinishReasonCounts::default(),
+            last_finish_counts: FinishReasonCounts::default(),
+        };
+        state.start_generation();
+        Ok(state)
     }
 
-    pub fn evolve_generation(&mut self) -> Result<GenerationStats, &'static str> {
-        let best = self
+    fn start_generation(&mut self) {
+        self.selected_training_tracks = self.training_track_ids.clone();
+        if let TrainingTrackSelection::RandomSubset(count) =
+            self.evaluation_config.training_track_selection
+        {
+            for index in (1..self.selected_training_tracks.len()).rev() {
+                let swap_with = self.evaluation_rng.random_range(0..=index);
+                self.selected_training_tracks.swap(index, swap_with);
+            }
+            self.selected_training_tracks
+                .truncate(count.min(self.selected_training_tracks.len()));
+        }
+        self.training_score_sums.fill(0.0);
+        self.completed_training_tracks = 0;
+        self.finish_counts = FinishReasonCounts::default();
+        self.pending_stats = None;
+        self.champion_population_index = None;
+        self.phase = TrainingPhase::TrainingTrack {
+            track_id: self.selected_training_tracks[0].clone(),
+            index: 0,
+            total: self.selected_training_tracks.len(),
+        };
+    }
+
+    pub fn record_training_results(
+        &mut self,
+        results: &[EpisodeResult],
+    ) -> Result<TrackAdvance, String> {
+        let TrainingPhase::TrainingTrack { index, total, .. } = self.phase else {
+            return Err("training results can only be recorded during a training track".into());
+        };
+        if results.len() != self.population.len() {
+            return Err(format!(
+                "expected {} episode results, got {}",
+                self.population.len(),
+                results.len()
+            ));
+        }
+        for (individual_index, (sum, result)) in
+            self.training_score_sums.iter_mut().zip(results).enumerate()
+        {
+            if !result.score.is_finite() {
+                return Err(format!(
+                    "episode score for individual {individual_index} is not finite"
+                ));
+            }
+            *sum += result.score;
+            self.finish_counts.record(result.finish_reason);
+        }
+        self.completed_training_tracks += 1;
+
+        if index + 1 < total {
+            let next_index = index + 1;
+            let track_id = self.selected_training_tracks[next_index].clone();
+            self.phase = TrainingPhase::TrainingTrack {
+                track_id: track_id.clone(),
+                index: next_index,
+                total,
+            };
+            return Ok(TrackAdvance::Training(track_id));
+        }
+
+        for (individual, score_sum) in self
             .population
-            .best_individual()?
-            .ok_or("a populacao nao pode estar vazia")?;
-        let best_fitness = best.fitness().unwrap();
-        let champion_genome = best.genome().genes().to_vec();
+            .individuals_mut()
+            .iter_mut()
+            .zip(&self.training_score_sums)
+        {
+            individual.set_fitness(*score_sum / self.completed_training_tracks as f32);
+        }
+        let (champion_population_index, champion) = self
+            .population
+            .individuals()
+            .iter()
+            .enumerate()
+            .max_by(|(_, left), (_, right)| {
+                left.fitness().unwrap().total_cmp(&right.fitness().unwrap())
+            })
+            .ok_or_else(|| "population must not be empty".to_string())?;
+        let best_fitness = champion.fitness().unwrap();
         let average_fitness = self
             .population
             .individuals()
@@ -68,18 +455,57 @@ impl TrainingState {
             .map(|individual| individual.fitness().unwrap())
             .sum::<f32>()
             / self.population.len() as f32;
-        let stats = GenerationStats {
+        self.pending_stats = Some(GenerationStats {
             generation: self.population.generation(),
             best_fitness,
             average_fitness,
+        });
+        self.champion_genome = Some(champion.genome().genes().to_vec());
+        self.champion_population_index = Some(champion_population_index);
+
+        let validation_index = self
+            .evaluation_rng
+            .random_range(0..self.validation_track_ids.len());
+        let track_id = self.validation_track_ids[validation_index].clone();
+        self.phase = TrainingPhase::Validation {
+            track_id: track_id.clone(),
         };
-        let next_population = self.population.evolve(&self.config, &mut self.rng)?;
+        Ok(TrackAdvance::Validation(track_id))
+    }
 
+    pub fn record_validation_result(
+        &mut self,
+        result: EpisodeResult,
+    ) -> Result<TrackAdvance, String> {
+        let TrainingPhase::Validation { track_id } = &self.phase else {
+            return Err("validation result can only be recorded during validation".into());
+        };
+        self.validation_history.push(ValidationStats {
+            generation: self.population.generation(),
+            track_id: track_id.clone(),
+            score: result.score,
+            normalized_progress: result.normalized_progress,
+            elapsed: result.elapsed,
+            finish_reason: result.finish_reason,
+        });
+        self.phase = TrainingPhase::Evolving;
+        Ok(TrackAdvance::ReadyToEvolve)
+    }
+
+    pub fn evolve_generation(&mut self) -> Result<GenerationStats, &'static str> {
+        if self.phase != TrainingPhase::Evolving {
+            return Err("generation can only evolve after held-out validation");
+        }
+        let stats = self
+            .pending_stats
+            .ok_or("training fitness must be finalized before evolution")?;
+        let next_population = self
+            .population
+            .evolve(&self.genetic_config, &mut self.evolution_rng)?;
         self.population = next_population;
-        self.champion_genome = Some(champion_genome);
         self.history.push(stats);
-        self.reset_evaluation_time();
-
+        self.last_finish_counts = self.finish_counts;
+        self.start_generation();
         Ok(stats)
     }
 
@@ -87,12 +513,12 @@ impl TrainingState {
         &self.architecture
     }
 
-    pub fn population(&self) -> &Population {
-        &self.population
+    pub fn evaluation_config(&self) -> &EvaluationConfig {
+        &self.evaluation_config
     }
 
-    pub fn population_mut(&mut self) -> &mut Population {
-        &mut self.population
+    pub fn population(&self) -> &Population {
+        &self.population
     }
 
     pub fn generation(&self) -> usize {
@@ -103,149 +529,260 @@ impl TrainingState {
         &self.history
     }
 
+    pub fn latest_validation(&self) -> Option<&ValidationStats> {
+        self.validation_history.last()
+    }
+
     pub fn champion_genome(&self) -> Option<&[f32]> {
         self.champion_genome.as_deref()
     }
 
-    pub fn evaluation_elapsed(&self) -> f32 {
-        self.evaluation_elapsed
+    pub fn champion_population_index(&self) -> Option<usize> {
+        self.champion_population_index
     }
 
-    pub fn evaluation_duration(&self) -> f32 {
-        self.evaluation_duration
+    #[cfg(test)]
+    pub fn selected_training_tracks(&self) -> &[String] {
+        &self.selected_training_tracks
     }
 
-    pub fn evaluation_remaining(&self) -> f32 {
-        (self.evaluation_duration - self.evaluation_elapsed).max(0.0)
+    pub fn phase(&self) -> &TrainingPhase {
+        &self.phase
     }
 
-    pub fn evaluation_progress(&self) -> f32 {
-        (self.evaluation_elapsed / self.evaluation_duration).clamp(0.0, 1.0)
-    }
-
-    pub fn advance_evaluation(&mut self, delta_seconds: f32) -> Result<bool, &'static str> {
-        if !delta_seconds.is_finite() || delta_seconds < 0.0 {
-            return Err("delta_seconds deve ser finito e nao negativo");
+    pub fn current_track_id(&self) -> Option<&str> {
+        match &self.phase {
+            TrainingPhase::TrainingTrack { track_id, .. }
+            | TrainingPhase::Validation { track_id } => Some(track_id),
+            TrainingPhase::Evolving => None,
         }
-
-        self.evaluation_elapsed =
-            (self.evaluation_elapsed + delta_seconds).min(self.evaluation_duration);
-
-        Ok(self.evaluation_finished())
     }
 
-    pub fn reset_evaluation_time(&mut self) {
-        self.evaluation_elapsed = 0.0;
+    pub fn current_training_fitness(&self) -> Option<GenerationStats> {
+        self.pending_stats
     }
 
-    pub fn set_evaluation_duration(&mut self, duration_seconds: f32) -> Result<(), &'static str> {
-        if !duration_seconds.is_finite() || duration_seconds <= 0.0 {
-            return Err("a duracao da avaliacao deve ser finita e maior que zero");
-        }
-
-        self.evaluation_duration = duration_seconds;
-        self.reset_evaluation_time();
-        Ok(())
-    }
-
-    pub fn evaluation_finished(&self) -> bool {
-        self.evaluation_elapsed >= self.evaluation_duration
+    pub fn last_finish_counts(&self) -> FinishReasonCounts {
+        self.last_finish_counts
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_EVALUATION_DURATION, TrainingState};
+    use super::*;
 
-    fn training_state() -> TrainingState {
-        TrainingState::new(2).expect("training state should be valid")
+    fn finished_state(reason: FinishReason, elapsed: f32) -> EvaluationState {
+        EvaluationState {
+            finish_reason: Some(reason),
+            elapsed,
+            time_without_progress: 0.0,
+            last_significant_progress: 0.0,
+            initial_progress: 0.0,
+        }
+    }
+
+    fn result(score: f32) -> EpisodeResult {
+        EpisodeResult {
+            score,
+            normalized_progress: score.clamp(0.0, 1.0),
+            normalized_progress_speed: 0.0,
+            elapsed: 1.0,
+            finish_reason: FinishReason::Stalled,
+        }
     }
 
     #[test]
-    fn evaluation_timer_starts_at_zero() {
-        let state = training_state();
-
-        assert_eq!(state.evaluation_elapsed(), 0.0);
-        assert_eq!(state.evaluation_duration(), DEFAULT_EVALUATION_DURATION);
-        assert_eq!(state.evaluation_remaining(), DEFAULT_EVALUATION_DURATION);
-        assert_eq!(state.evaluation_progress(), 0.0);
-        assert!(!state.evaluation_finished());
+    fn collision_finishes_episode_immediately() {
+        let mut state = EvaluationState::new(0.0);
+        state.finish(FinishReason::Collision);
+        state.update(1.0, 10.0, 100.0, &EvaluationConfig::default());
+        assert_eq!(state.finish_reason, Some(FinishReason::Collision));
+        assert_eq!(state.elapsed, 0.0);
     }
 
     #[test]
-    fn advancing_timer_stops_at_duration_and_reports_completion() {
-        let mut state = training_state();
+    fn stall_and_timeout_terminate_episodes() {
+        let mut config = EvaluationConfig::default();
+        config.stall_timeout = 2.0;
+        config.maximum_episode_duration = 10.0;
+        let mut stalled = EvaluationState::new(0.0);
+        stalled.update(2.0, 0.0, 100.0, &config);
+        assert_eq!(stalled.finish_reason, Some(FinishReason::Stalled));
 
-        assert!(!state.advance_evaluation(7.5).unwrap());
-        assert_eq!(state.evaluation_elapsed(), 7.5);
-        assert_eq!(state.evaluation_remaining(), 12.5);
-
-        assert!(state.advance_evaluation(20.0).unwrap());
-        assert_eq!(state.evaluation_elapsed(), DEFAULT_EVALUATION_DURATION);
-        assert_eq!(state.evaluation_remaining(), 0.0);
-        assert_eq!(state.evaluation_progress(), 1.0);
+        config.stall_timeout = 20.0;
+        config.maximum_episode_duration = 1.0;
+        let mut timed_out = EvaluationState::new(0.0);
+        timed_out.update(1.0, 0.0, 100.0, &config);
+        assert_eq!(timed_out.finish_reason, Some(FinishReason::Timeout));
     }
 
     #[test]
-    fn resetting_timer_starts_a_new_evaluation() {
-        let mut state = training_state();
+    fn significant_progress_resets_stall_even_at_low_instantaneous_speed() {
+        let mut config = EvaluationConfig::default();
+        config.stall_timeout = 2.0;
+        config.significant_progress_epsilon = 1.0;
+        let mut state = EvaluationState::new(0.0);
+        state.update(1.5, 0.5, 100.0, &config);
+        assert_eq!(state.time_without_progress, 1.5);
+        state.update(0.6, 1.1, 100.0, &config);
+        assert_eq!(state.time_without_progress, 0.0);
+        assert!(!state.is_finished());
+    }
+
+    #[test]
+    fn reaching_accumulated_lap_length_completes_episode() {
+        let mut state = EvaluationState::new(16.0);
+        state.update(0.1, 100.0, 100.0, &EvaluationConfig::default());
+        assert_eq!(state.finish_reason, Some(FinishReason::Completed));
+    }
+
+    #[test]
+    fn score_rewards_progress_and_useful_speed_and_penalizes_collision() {
+        let config = EvaluationConfig::default();
+        let clean = finished_state(FinishReason::Stalled, 10.0);
+        let collision = finished_state(FinishReason::Collision, 10.0);
+        assert!(
+            episode_score(&clean, 60.0, 100.0, &config).score
+                > episode_score(&collision, 60.0, 100.0, &config).score
+        );
+        assert!(
+            episode_score(&clean, 70.0, 100.0, &config).score
+                > episode_score(&clean, 60.0, 100.0, &config).score
+        );
+        assert!(
+            episode_score(&clean, 60.0, 100.0, &config).score
+                > episode_score(
+                    &finished_state(FinishReason::Stalled, 20.0),
+                    60.0,
+                    100.0,
+                    &config,
+                )
+                .score
+        );
+        assert!(
+            episode_score(&collision, 90.0, 100.0, &config).score
+                > episode_score(&collision, 10.0, 100.0, &config).score
+        );
+        assert!(
+            episode_score(
+                &finished_state(FinishReason::Completed, 20.0),
+                100.0,
+                100.0,
+                &config,
+            )
+            .score
+                > episode_score(&clean, 99.0, 100.0, &config).score
+        );
+    }
+
+    #[test]
+    fn normalized_progress_is_comparable_between_track_lengths() {
+        let config = EvaluationConfig::default();
+        let short = episode_score(
+            &finished_state(FinishReason::Stalled, 10.0),
+            50.0,
+            100.0,
+            &config,
+        );
+        let long = episode_score(
+            &finished_state(FinishReason::Stalled, 20.0),
+            100.0,
+            200.0,
+            &config,
+        );
+        assert_eq!(short.score, long.score);
+    }
+
+    #[test]
+    fn invalid_evaluation_parameters_are_rejected() {
+        let mut config = EvaluationConfig::default();
+        config.stall_timeout = 0.0;
+        assert!(config.validate().is_err());
+        config = EvaluationConfig::default();
+        config.training_track_selection = TrainingTrackSelection::RandomSubset(0);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn generation_uses_one_reproducible_track_subset_for_every_individual() {
+        let library = TrackLibrary::load_default().unwrap();
+        let a = TrainingState::with_config(3, &library, EvaluationConfig::default()).unwrap();
+        let b = TrainingState::with_config(3, &library, EvaluationConfig::default()).unwrap();
+        assert_eq!(a.selected_training_tracks(), b.selected_training_tracks());
+        assert_eq!(a.selected_training_tracks().len(), 3);
+    }
+
+    #[test]
+    fn training_fitness_is_mean_and_validation_cannot_change_it() {
+        let library = TrackLibrary::load_default().unwrap();
+        let config = EvaluationConfig {
+            training_track_selection: TrainingTrackSelection::RandomSubset(2),
+            ..EvaluationConfig::default()
+        };
+        let mut state = TrainingState::with_config(2, &library, config).unwrap();
+        assert!(matches!(
+            state
+                .record_training_results(&[result(1.0), result(3.0)])
+                .unwrap(),
+            TrackAdvance::Training(_)
+        ));
+        assert!(matches!(
+            state
+                .record_training_results(&[result(3.0), result(5.0)])
+                .unwrap(),
+            TrackAdvance::Validation(_)
+        ));
+        assert_eq!(state.population().individuals()[0].fitness(), Some(2.0));
+        assert_eq!(state.population().individuals()[1].fitness(), Some(4.0));
+        let fitness_before = state
+            .population()
+            .individuals()
+            .iter()
+            .map(|item| item.fitness())
+            .collect::<Vec<_>>();
+        state.record_validation_result(result(-100.0)).unwrap();
+        let fitness_after = state
+            .population()
+            .individuals()
+            .iter()
+            .map(|item| item.fitness())
+            .collect::<Vec<_>>();
+        assert_eq!(fitness_before, fitness_after);
+    }
+
+    #[test]
+    fn evolution_waits_for_all_training_tracks_and_validation() {
+        let library = TrackLibrary::load_default().unwrap();
+        let config = EvaluationConfig {
+            training_track_selection: TrainingTrackSelection::RandomSubset(2),
+            ..EvaluationConfig::default()
+        };
+        let mut state = TrainingState::with_config(2, &library, config).unwrap();
         state
-            .advance_evaluation(DEFAULT_EVALUATION_DURATION)
+            .record_training_results(&[result(1.0), result(2.0)])
             .unwrap();
-
-        state.reset_evaluation_time();
-
-        assert_eq!(state.evaluation_elapsed(), 0.0);
-        assert!(!state.evaluation_finished());
-    }
-
-    #[test]
-    fn changing_duration_resets_timer() {
-        let mut state = training_state();
-        state.advance_evaluation(5.0).unwrap();
-
-        state.set_evaluation_duration(10.0).unwrap();
-
-        assert_eq!(state.evaluation_duration(), 10.0);
-        assert_eq!(state.evaluation_elapsed(), 0.0);
-    }
-
-    #[test]
-    fn timer_rejects_invalid_values() {
-        let mut state = training_state();
-
-        assert!(state.advance_evaluation(-1.0).is_err());
-        assert!(state.advance_evaluation(f32::NAN).is_err());
-        assert!(state.set_evaluation_duration(0.0).is_err());
-        assert!(state.set_evaluation_duration(f32::INFINITY).is_err());
-        assert_eq!(state.evaluation_elapsed(), 0.0);
-        assert_eq!(state.evaluation_duration(), DEFAULT_EVALUATION_DURATION);
-    }
-
-    #[test]
-    fn constructor_uses_requested_population_size() {
-        let state = TrainingState::new(3).unwrap();
-
-        assert_eq!(state.population().len(), 3);
-    }
-
-    #[test]
-    fn evolution_records_generation_stats_and_champion() {
-        let mut state = training_state();
-        state.population_mut().individuals_mut()[0].set_fitness(10.0);
-        state.population_mut().individuals_mut()[1].set_fitness(30.0);
-        let expected_champion = state.population().individuals()[1]
-            .genome()
-            .genes()
-            .to_vec();
-
+        assert!(state.evolve_generation().is_err());
+        state
+            .record_training_results(&[result(2.0), result(3.0)])
+            .unwrap();
+        assert!(state.evolve_generation().is_err());
+        state.record_validation_result(result(0.5)).unwrap();
         let stats = state.evolve_generation().unwrap();
-
         assert_eq!(stats.generation, 0);
-        assert_eq!(stats.best_fitness, 30.0);
-        assert_eq!(stats.average_fitness, 20.0);
         assert_eq!(state.generation(), 1);
-        assert_eq!(state.history(), &[stats]);
-        assert_eq!(state.champion_genome(), Some(expected_champion.as_slice()));
+    }
+
+    #[test]
+    fn all_mode_selects_entire_training_suite() {
+        let library = TrackLibrary::load_default().unwrap();
+        let config = EvaluationConfig {
+            training_track_selection: TrainingTrackSelection::All,
+            ..EvaluationConfig::default()
+        };
+        let state = TrainingState::with_config(2, &library, config).unwrap();
+        assert_eq!(
+            state.selected_training_tracks().len(),
+            library.training_tracks().len()
+        );
     }
 }
