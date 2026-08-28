@@ -1,12 +1,12 @@
 #[derive(Clone, Copy)]
-pub enum Activation{
+pub enum Activation {
     Tanh,
     Relu,
     Linear,
 }
 
 impl Activation {
-    pub fn apply(&self, value: f32) -> f32{
+    pub fn apply(&self, value: f32) -> f32 {
         match self {
             Activation::Linear => value,
             Activation::Relu => value.max(0.0),

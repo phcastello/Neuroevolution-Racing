@@ -3,34 +3,39 @@ use rand::RngExt;
 use crate::genetic::{Config, genome::Genome};
 use rand_distr::{Distribution, Normal};
 
-pub fn uniform_crossover<R: rand::Rng>(rng: &mut R, genome_a: &Genome, genome_b: &Genome) -> Result<Genome, &'static str>{
-    if genome_a.len() != genome_b.len(){
-        return Err("Os genomas devem ter o mesmo tamanho")
+pub fn uniform_crossover<R: rand::Rng>(
+    rng: &mut R,
+    genome_a: &Genome,
+    genome_b: &Genome,
+) -> Result<Genome, &'static str> {
+    if genome_a.len() != genome_b.len() {
+        return Err("Os genomas devem ter o mesmo tamanho");
     }
-    
+
     let mut child_genome = Vec::with_capacity(genome_a.len());
-    for i in 0..genome_a.len(){
+    for i in 0..genome_a.len() {
         let factor = rng.random_range(0..=1);
-        if factor == 0{
+        if factor == 0 {
             child_genome.push(genome_a.genes()[i]);
-        }
-        else if factor == 1 {
+        } else if factor == 1 {
             child_genome.push(genome_b.genes()[i]);
         }
     }
     Ok(Genome::new(child_genome))
 }
 
-pub fn mutate<R: rand::Rng>(rng: &mut R, genome: &mut Genome, config: &Config) -> Result<(), &'static str>{
+pub fn mutate<R: rand::Rng>(
+    rng: &mut R,
+    genome: &mut Genome,
+    config: &Config,
+) -> Result<(), &'static str> {
     config.validate()?;
-    let normal = Normal::<f32>::new(
-        0.0,
-        config.mutation_sigma
-    ).map_err(|_| "mutation_sigma inválido")?;
-    
-    for gene in genome.genes_mut(){
+    let normal =
+        Normal::<f32>::new(0.0, config.mutation_sigma).map_err(|_| "mutation_sigma inválido")?;
+
+    for gene in genome.genes_mut() {
         let happens = rng.random::<f32>() < config.mutation_probability;
-        if happens{
+        if happens {
             *gene += normal.sample(rng);
         }
     }
@@ -39,43 +44,43 @@ pub fn mutate<R: rand::Rng>(rng: &mut R, genome: &mut Genome, config: &Config) -
 }
 
 #[cfg(test)]
-mod test{
+mod test {
     use rand::{SeedableRng, rngs::StdRng};
 
-    use crate::genetic::{Config, genome::Genome, operators::{mutate, uniform_crossover}};
+    use crate::genetic::{
+        Config,
+        genome::Genome,
+        operators::{mutate, uniform_crossover},
+    };
 
     #[test]
-    fn child_has_same_length_as_parents(){
+    fn child_has_same_length_as_parents() {
         let config = Config::default();
         let mut rng = StdRng::seed_from_u64(config.seed);
-        let genome_a = Genome::new(vec![1.0,1.0,1.0,1.0]);
-        let genome_b = Genome::new(vec![2.0,2.0,2.0,2.0]);
-        
+        let genome_a = Genome::new(vec![1.0, 1.0, 1.0, 1.0]);
+        let genome_b = Genome::new(vec![2.0, 2.0, 2.0, 2.0]);
+
         let child = uniform_crossover(&mut rng, &genome_a, &genome_b).unwrap();
         assert_eq!(child.len(), genome_a.len());
     }
 
     #[test]
-    fn child_genes_come_from_either_parent(){
+    fn child_genes_come_from_either_parent() {
         let config = Config::default();
         let mut rng = StdRng::seed_from_u64(config.seed);
-        let genome_a = Genome::new(vec![1.0,1.0,1.0,1.0]);
-        let genome_b = Genome::new(vec![2.0,2.0,2.0,2.0]);
-        
+        let genome_a = Genome::new(vec![1.0, 1.0, 1.0, 1.0]);
+        let genome_b = Genome::new(vec![2.0, 2.0, 2.0, 2.0]);
+
         let child = uniform_crossover(&mut rng, &genome_a, &genome_b).unwrap();
-        assert!(
-            child.genes()
-                .iter()
-                .all(|&gene| gene == 1.0 || gene == 2.0)
-        );
+        assert!(child.genes().iter().all(|&gene| gene == 1.0 || gene == 2.0));
     }
 
     #[test]
-    fn error_when_genomes_has_different_len(){
+    fn error_when_genomes_has_different_len() {
         let config = Config::default();
         let mut rng = StdRng::seed_from_u64(config.seed);
-        let genome_a = Genome::new(vec![1.0,1.0,1.0,1.0]);
-        let genome_b = Genome::new(vec![2.0,2.0,2.0]);
+        let genome_a = Genome::new(vec![1.0, 1.0, 1.0, 1.0]);
+        let genome_b = Genome::new(vec![2.0, 2.0, 2.0]);
 
         let child = uniform_crossover(&mut rng, &genome_a, &genome_b);
         assert!(child.is_err());

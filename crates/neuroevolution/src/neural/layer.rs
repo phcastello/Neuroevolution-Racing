@@ -1,4 +1,4 @@
-use crate::neural::activation::{Activation};
+use crate::neural::activation::Activation;
 
 /*
 convention: weights[output_neuron][input]
@@ -14,10 +14,10 @@ biases = [
 ]
 */
 
-pub struct DenseLayer{
+pub struct DenseLayer {
     weights: Vec<Vec<f32>>,
     biases: Vec<f32>,
-    activation: Activation
+    activation: Activation,
 }
 
 impl DenseLayer {
@@ -26,54 +26,57 @@ impl DenseLayer {
     um neurônio;
     a quantidade de valores em biases tem que ser igual a quantidade de linhas em weights
     */
-    pub fn new(weights: Vec<Vec<f32>>, biases: Vec<f32>, activation: Activation) -> Result<Self, &'static str>{
-        if biases.len() != weights.len(){
-            return Err("The number of biases must be equal to the number of neurons.")
+    pub fn new(
+        weights: Vec<Vec<f32>>,
+        biases: Vec<f32>,
+        activation: Activation,
+    ) -> Result<Self, &'static str> {
+        if biases.len() != weights.len() {
+            return Err("The number of biases must be equal to the number of neurons.");
         }
-        
-        let Some(first_neuron_weights) = weights.first() else{
-            return Err("A layer must have at least one neuron.")
+
+        let Some(first_neuron_weights) = weights.first() else {
+            return Err("A layer must have at least one neuron.");
         };
 
         if first_neuron_weights.is_empty() {
-            return Err("Each neuron must have at least one input weight.")
+            return Err("Each neuron must have at least one input weight.");
         }
-        
+
         if !weights
             .iter()
-            .all(|neuron| neuron.len() == first_neuron_weights.len()){
-                return Err("All neurons must have the same number of weights.")
+            .all(|neuron| neuron.len() == first_neuron_weights.len())
+        {
+            return Err("All neurons must have the same number of weights.");
         }
 
-
-        Ok(Self{
+        Ok(Self {
             weights,
             biases,
-            activation
+            activation,
         })
     }
 
-    pub fn output_size(&self) -> usize{
+    pub fn output_size(&self) -> usize {
         self.weights.len()
     }
 
-    pub fn input_size(&self) -> usize{
+    pub fn input_size(&self) -> usize {
         self.weights[0].len()
     }
 
-    pub fn forward(&self, inputs: &[f32]) -> Result<Vec<f32>, &'static str>{
-        if inputs.len() != self.input_size(){
-            return Err("The number of inputs must be equal to the number of input weights.")
+    pub fn forward(&self, inputs: &[f32]) -> Result<Vec<f32>, &'static str> {
+        if inputs.len() != self.input_size() {
+            return Err("The number of inputs must be equal to the number of input weights.");
         }
 
         let neurons_count = self.output_size(); // retorna o tamanho da saida
-        let neuron_weights_count  = self.input_size(); // retorna o tamanho da entrada
+        let neuron_weights_count = self.input_size(); // retorna o tamanho da entrada
         let mut output: Vec<f32> = Vec::with_capacity(neurons_count);
 
-
-        for neuron in 0..neurons_count{
+        for neuron in 0..neurons_count {
             let mut iteration_sum: f32 = 0.0;
-            for j in 0..neuron_weights_count{
+            for j in 0..neuron_weights_count {
                 iteration_sum += inputs[j] * self.weights[neuron][j];
             }
 
@@ -84,9 +87,8 @@ impl DenseLayer {
     }
 }
 
-
 #[cfg(test)]
-mod test{
+mod test {
     use crate::neural::{activation::Activation, layer::DenseLayer};
 
     #[test]
@@ -135,11 +137,8 @@ mod test{
     }
 
     #[test]
-    fn forward_works(){
-        let weights = vec![
-            vec![0.5,  1.0, -2.0],
-            vec![1.0, -0.5,  0.0]
-        ];
+    fn forward_works() {
+        let weights = vec![vec![0.5, 1.0, -2.0], vec![1.0, -0.5, 0.0]];
         let biases = vec![0.25, -0.5];
         let activation = Activation::Linear;
         let inputs = vec![2.0, -1.0, 0.5];
@@ -154,12 +153,7 @@ mod test{
 
     #[test]
     fn forward_returns_error_when_input_size_is_incorrect() {
-        let layer = DenseLayer::new(
-            vec![vec![0.5, 1.0]],
-            vec![0.25],
-            Activation::Linear,
-        )
-        .unwrap();
+        let layer = DenseLayer::new(vec![vec![0.5, 1.0]], vec![0.25], Activation::Linear).unwrap();
 
         let result = layer.forward(&[2.0]);
 

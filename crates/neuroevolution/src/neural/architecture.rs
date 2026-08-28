@@ -6,7 +6,10 @@ pub struct Architecture {
 }
 
 impl Architecture {
-    pub fn new(layer_sizes: Vec<usize>,activations: Vec<Activation>) -> Result<Self, &'static str> {
+    pub fn new(
+        layer_sizes: Vec<usize>,
+        activations: Vec<Activation>,
+    ) -> Result<Self, &'static str> {
         if layer_sizes.iter().any(|&layer_value| layer_value == 0) {
             return Err("The architecture must have at least one neuron in each layer.");
         }
@@ -14,7 +17,9 @@ impl Architecture {
             return Err("The architecture must have at least two layers (input and output).");
         }
         if activations.len() != layer_sizes.len() - 1 {
-            return Err("The number of activation functions must be equal to the number of layers minus one (input layer does not have an activation function).");
+            return Err(
+                "The number of activation functions must be equal to the number of layers minus one (input layer does not have an activation function).",
+            );
         }
 
         Ok(Self {

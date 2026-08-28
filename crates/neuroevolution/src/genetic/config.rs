@@ -19,7 +19,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            population_size: 100,
+            population_size: 500,
             genome_length: 5,
             elite_fraction: 0.05,
             tournament_size: 3,
@@ -76,11 +76,11 @@ impl Config {
 }
 
 #[cfg(test)]
-mod test{
+mod test {
     use crate::genetic::Config;
 
     #[test]
-    fn population_size_eq_zero_results_error(){
+    fn population_size_eq_zero_results_error() {
         let mut config = Config::default();
         config.population_size = 0;
 

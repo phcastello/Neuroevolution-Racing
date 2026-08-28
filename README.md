@@ -1,6 +1,6 @@
 # Neuroevolution Racing
 
-Neuroevolution Racing is a university AI project that will evolve the weights and biases of car-controlling Multilayer Perceptrons (MLPs) with a manually implemented Genetic Algorithm (GA). This first iteration is the visual simulation playground around that future work.
+Neuroevolution Racing is a university AI project that evolves the weights and biases of car-controlling Multilayer Perceptrons (MLPs) with a manually implemented Genetic Algorithm (GA). The application runs the population in a shared racing simulation and exposes live generation, fitness, telemetry, and current-leader network data in its dashboard.
 
 > The neural network and genetic algorithm are implemented independently from the visualization stack. Bevy, Avian2D and egui are used only for simulation, collision detection, rendering and visualization.
 
@@ -13,10 +13,10 @@ crates/app  ──────>  crates/neuroevolution
  Bevy app              pure Rust AI boundary
 ```
 
-- `crates/neuroevolution`: deliberately minimal pure-Rust library. It contains only the `neural` and `genetic` module boundaries and student TODOs. It does **not** depend on Bevy, Avian2D, egui, or an ML/GA library.
-- `crates/app`: fixed-timestep simulation, sampled centerline track, Avian2D collisions and spatial queries, rendering, temporary controller, continuous progress tracking, and egui dashboard.
+- `crates/neuroevolution`: pure-Rust implementation of dense MLP inference, genomes, populations, tournament selection, uniform crossover, Gaussian mutation, and elitism. It does **not** depend on Bevy, Avian2D, egui, or an ML/GA library.
+- `crates/app`: fixed-timestep simulation, sampled centerline tracks, Avian2D collisions and spatial queries, MLP-controlled cars, continuous progress evaluation, generation orchestration, rendering, and the egui dashboard.
 
-`CarController` receives an explicit six-value `CarObservation`. Its stable future-MLP input order is:
+`CarController` receives an explicit six-value `CarObservation`. Its stable MLP input order is:
 
 ```text
 [0] left +60° sensor     [3] right -30° sensor
@@ -24,7 +24,7 @@ crates/app  ──────>  crates/neuroevolution
 [2] front 0° sensor      [5] normalized speed
 ```
 
-The stable network output order is `[0] steering, [1] acceleration`; a small app-side adapter maps that order to the existing `CarControls::new(acceleration, steering)` API. The temporary controller receives centerline look-ahead through a separate navigation context, exists only to exercise the simulation, and performs no learning.
+The stable network output order is `[0] steering, [1] acceleration`; a small app-side adapter maps that order to the existing `CarControls::new(acceleration, steering)` API. Each population member owns an MLP reconstructed from its genome and receives only the six observation values above.
 
 ## Technology
 
@@ -52,6 +52,21 @@ The first native build can take several minutes. Use the right dashboard to chan
 
 The Linux build intentionally uses X11/XWayland. WSLg's native Wayland path can lose its Vulkan surface while a window is manually resized; Bevy 0.19.1 cannot recover when the driver consequently reports no presentation modes.
 
+## Training and genetic algorithm
+
+Training starts with a deterministic seeded population of 500 genomes. Each genome contains all 74 parameters of the `6 → 8 → 2` dense MLP: weights and biases for both layers. Every individual starts from the same position, heading, speed, observation, and controls, then drives for a 20-second fixed-timestep evaluation.
+
+Fitness is the greatest forward distance reached along the active track during that evaluation. When the timer finishes, the application assigns fitness to every individual, records the best and average values, preserves the configured elite fraction, selects parents by tournament, applies uniform crossover and Gaussian mutation, increments the generation, and respawns one car per new genome.
+
+The dashboard displays:
+
+- the current generation, population and live evaluation timer;
+- real best/average fitness history from completed generations;
+- the live first-place individual and its current fitness during an evaluation;
+- that leader's actual neural network, including every neuron activation, weight sign, and relative weight magnitude.
+
+The selected car is reassigned continuously to whichever individual has reached the greatest forward distance in the current generation. Network activations are captured by a generic MLP forward-trace API and exposed through controller telemetry, keeping egui and visualization details out of the neural implementation. Completed generations still contribute best and average samples to the fitness plot.
+
 ## Camera controls
 
 - Mouse wheel: smooth bounded zoom toward the world point under the cursor.
@@ -60,7 +75,7 @@ The Linux build intentionally uses X11/XWayland. WSLg's native Wayland path can 
 - **Fit Track**: preserve the current rotation and fit the active track (or Open Field) to the simulation area.
 - **Reset View**: restore zero rotation and fit the scene again.
 
-The application automatically fits the view at startup, after a track or Test Drive environment change, and after a significant window, resolution, or fullscreen size change. Camera rotation affects only the view: track coordinates, cars, sensors, collisions, and progress remain in unchanged world coordinates. Test Drive additionally offers **Free** and **Follow Car** behavior; follow mode centers the manual car while preserving interactive zoom and camera rotation.
+The application automatically fits the view at startup, after a track or Test Drive environment change, and after a significant window, resolution, or fullscreen size change. Camera rotation affects only the view: track coordinates, cars, sensors, collisions, and progress remain in unchanged world coordinates. The camera offers **Free** and **Follow Leader** behavior during population simulation, switching targets whenever first place changes. Test Drive uses the same mechanism as **Follow Car** for the manual vehicle. Both follow modes preserve interactive zoom and camera rotation.
 
 Camera input is suppressed while egui is using the corresponding pointer or keyboard input.
 
@@ -82,19 +97,18 @@ Steering requests an angular rate, but shared vehicle physics limits the achieva
 Both keyboard and sliders are only control sources. They write the same canonical component consumed by every vehicle:
 
 ```text
-TemporaryController ─┐
-ManualController ────┼──> CarControls { steering, acceleration }
-future MLP ──────────┘                    │
+MLP controller ──────┐
+Manual controller ───┴──> CarControls { steering, acceleration }
                                           v
                               shared fixed-step vehicle physics
 ```
 
-The human never modifies a transform or receives privileged movement mechanics. `CarControls` clamps both scalar channels to `[-1, +1]`; the one shared integration/collision system consumes it regardless of source. Therefore a future MLP that supplies the same two values from the same initial state and timestep receives identical vehicle-state evolution. The Test Drive dashboard displays the final component values actually reaching physics, the exact six-scalar `CarObservation`, raw speed/heading/position/progress, and the shared `SimulationConfig` values.
+The human never modifies a transform or receives privileged movement mechanics. `CarControls` clamps both scalar channels to `[-1, +1]`; the one shared integration/collision system consumes it regardless of source. Therefore an MLP that supplies the same two values from the same initial state and timestep receives identical vehicle-state evolution. The Test Drive dashboard displays the final component values actually reaching physics, the exact six-scalar `CarObservation`, raw speed/heading/position/progress, and the shared `SimulationConfig` values.
 
 ## Car sprite assets
 
 Cars render as child sprites centered on the physical vehicle transform. The
-ten-car population deterministically uses `car_01` through `car_05` and
+population deterministically cycles through `car_01` through `car_05` and
 `car_07` through `car_11`. The defective `car_06` was removed and `car_03`
 takes its former population slot; `car_12` remains Test Drive-only. Every
 visual is normalized to fill the same 28x15 physical footprint, collision
@@ -131,9 +145,9 @@ Implemented infrastructure:
 - generic Catmull–Rom geometry generation from authored control points;
 - a road ribbon and matching collision walls derived from the centerline and configurable width;
 - deterministic runtime track replacement that despawns old cars, progress components, road visuals, mesh assets, and wall colliders before rebuilding;
-- responsive rotation-aware camera fitting plus bounded cursor-centered zoom, Q/E rotation, middle-drag pan, reset, and Test Drive follow behavior;
+- responsive rotation-aware camera fitting plus bounded cursor-centered zoom, Q/E rotation, middle-drag pan, reset, manual-car follow, and live leader follow;
 - resizable window and queried monitor/video-mode fullscreen support, with graceful closest-mode/native fallbacks;
-- ten arcade-like kinematic cars driven by a deterministic temporary controller through the canonical `CarControls` boundary;
+- a configurable population of arcade-like kinematic cars driven by genome-backed MLP controllers through the canonical `CarControls` boundary;
 - eleven normalized transparent car sprite assets, with a deterministic ten-car training set and cosmetic Test Drive selection;
 - a one-car Test Drive mode with Track/Open Field environments, keyboard/analog actuator sources, reset, and live physics/observation telemetry;
 - five Avian2D raycast sensors per car, explicitly filtered to track walls;
@@ -141,12 +155,13 @@ Implemented infrastructure:
 - local centerline projection continuity and one-lap start/finish wrap handling;
 - optional debug drawing for the generated centerline, dense sampled points, larger authored control points, and selected-car projection;
 - fixed 60 Hz simulation behavior with pause and speed controls;
-- training/champion mode groundwork and a reserved race mode;
-- fitness history/plot component populated with explicitly labeled preview data;
-- isolated static `6 → 8 → 2` network visualization placeholder;
+- timed generation evaluation and automatic GA evolution in Training mode;
+- real generation counter and best/average fitness history;
+- live visualization of the current generation leader's `6 → 8 → 2` network using its actual weights and per-inference neuron activations;
+- Champion mode groundwork and a reserved Race mode;
 - unit-tested RON parsing, malformed definitions, role filtering, all bundled track files, generated geometry and borders, arc-length projection/progress, runtime replacement, camera fitting, video-mode selection, observation shape, and controller angle helpers.
 
-Intentionally **not implemented**: MLP layers, weights, feed-forward evaluation, training/backpropagation, genomes, selection, crossover, mutation, elitism, or any other GA/ML technique. Those academically relevant pieces remain marked for manual student implementation in `crates/neuroevolution`.
+Intentionally **not implemented**: gradient-based training/backpropagation, multi-track fitness aggregation, persistence/checkpoint loading, a completed Champion showcase, and Race mode. Learning is performed exclusively through the manually implemented genetic algorithm.
 
 ## Data-driven tracks
 
@@ -177,7 +192,7 @@ These are project-owned, simplified 2D coordinate approximations designed as env
 
 The runtime `Track` remains separate from `TrackDefinition`. For each adjacent quartet of closed-loop control points it evaluates the Catmull–Rom spline, samples the centerline, computes tangents and cumulative arc length, and offsets the tangents to form left/right borders. Projection and normalized progress operate only on this generated data and never need to know the active circuit id.
 
-Selecting another dashboard entry updates the active definition in place. The simulation removes the old cars, progress state, colliders, road mesh, and wall visuals; generates a fresh `Track`; respawns the temporary-controller cars at its start; and lets the changed track bounds trigger a camera refit. This clean reset is the boundary the future multi-track evaluator can reuse, but no evaluation loop or fitness aggregation exists yet.
+Selecting another dashboard entry updates the active definition in place. The simulation removes the old cars, progress state, colliders, road mesh, and wall visuals; generates a fresh `Track`; respawns the population with controllers rebuilt from the current genomes; and lets the changed track bounds trigger a camera refit. Training currently evaluates one active track at a time; multi-track fitness aggregation remains future work.
 
 ## Development checks
 

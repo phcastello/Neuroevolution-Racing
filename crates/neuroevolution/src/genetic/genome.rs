@@ -15,7 +15,7 @@ impl Genome {
         &self.genes
     }
 
-    pub fn genes_mut(&mut self) -> &mut [f32]{
+    pub fn genes_mut(&mut self) -> &mut [f32] {
         &mut self.genes
     }
 

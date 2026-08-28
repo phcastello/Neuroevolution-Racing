@@ -2,10 +2,12 @@ mod components;
 mod controller;
 mod systems;
 mod track;
+mod training;
 
 pub use components::{
     Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings, TrackDebug,
 };
+pub(crate) use controller::MlpController;
 pub use controller::{CarControls, CarObservation};
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
 pub use track::{DEFAULT_TRACK_ID, Track, TrackBounds, TrackLibrary};
@@ -13,10 +15,13 @@ pub use track::{DEFAULT_TRACK_ID, Track, TrackBounds, TrackLibrary};
 use bevy::{prelude::*, time::Fixed};
 use serde::{Deserialize, Serialize};
 use systems::{
-    SimulationSet, apply_track_selection, apply_vehicle_physics, handle_test_drive_input,
-    produce_manual_controls, produce_temporary_controls, rebuild_simulation, reset_manual_car,
-    sample_sensors, toggle_pause_from_keyboard, update_track_progress,
+    SimulationSet, apply_track_selection, apply_vehicle_physics, finish_generation_evaluation,
+    handle_test_drive_input, produce_manual_controls, produce_temporary_controls,
+    rebuild_simulation, reset_manual_car, sample_sensors, select_current_leader,
+    toggle_pause_from_keyboard, update_track_progress,
 };
+
+pub(crate) use training::{GenerationStats, TrainingState};
 
 #[derive(Resource, Clone, Debug)]
 pub struct TrackSelection {
@@ -55,7 +60,7 @@ pub struct SimulationConfig {
 impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            population_size: 10,
+            population_size: 500,
             sensor_max_distance: 750.0,
             acceleration_rate: 125.0,
             braking_rate: 175.0,
@@ -147,8 +152,13 @@ impl Plugin for SimulationPlugin {
             ),
             requested_id: None,
         };
+        let simulation_config = SimulationConfig::default();
 
-        app.init_resource::<SimulationConfig>()
+        let training_state = TrainingState::new(simulation_config.population_size)
+            .expect("failed to create training state");
+
+        app.insert_resource(simulation_config)
+            .insert_resource(training_state)
             .init_resource::<SimulationMode>()
             .init_resource::<PlaybackState>()
             .init_resource::<TestDriveSettings>()
@@ -164,6 +174,8 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::ControlSource,
                     SimulationSet::Physics,
                     SimulationSet::Progress,
+                    SimulationSet::Leader,
+                    SimulationSet::Evaluation,
                 )
                     .chain(),
             )
@@ -175,6 +187,8 @@ impl Plugin for SimulationPlugin {
                         .in_set(SimulationSet::ControlSource),
                     apply_vehicle_physics.in_set(SimulationSet::Physics),
                     update_track_progress.in_set(SimulationSet::Progress),
+                    select_current_leader.in_set(SimulationSet::Leader),
+                    finish_generation_evaluation.in_set(SimulationSet::Evaluation),
                 ),
             )
             .add_systems(

@@ -1,7 +1,7 @@
-mod mlp;
-mod layer;
 mod activation;
 mod architecture;
+mod layer;
+mod mlp;
 
 pub use activation::Activation;
 pub use architecture::Architecture;

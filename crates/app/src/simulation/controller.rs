@@ -1,4 +1,10 @@
 use bevy::prelude::*;
+use neuroevolution::neural::Mlp;
+
+/// Number of scalar values the app supplies to a controller network.
+pub const MLP_INPUT_SIZE: usize = 6;
+/// Number of scalar values the app expects from a controller network.
+pub const MLP_OUTPUT_SIZE: usize = 2;
 
 /// Six-scalar controller input boundary.
 ///
@@ -18,7 +24,7 @@ impl CarObservation {
 
     /// Returns the stable future-MLP input order without exposing Bevy to the
     /// pure AI crate.
-    pub fn as_inputs(self) -> [f32; 6] {
+    pub fn as_inputs(self) -> [f32; MLP_INPUT_SIZE] {
         let [left_60, left_30, front, right_30, right_60] = self.sensors;
         [
             left_60,
@@ -61,7 +67,7 @@ fn sanitize_control(value: f32) -> f32 {
 
 /// Adapts the stable future-network output order `[steering, acceleration]`
 /// to the app's existing `CarControls::new(acceleration, steering)` API.
-pub fn controls_from_network_outputs(outputs: [f32; 2]) -> CarControls {
+pub fn controls_from_network_outputs(outputs: [f32; MLP_OUTPUT_SIZE]) -> CarControls {
     CarControls::new(outputs[1], outputs[0])
 }
 
@@ -106,6 +112,69 @@ impl CarController for TemporaryController {
     }
 }
 
+#[derive(Component)]
+pub struct MlpController {
+    mlp: Mlp,
+    parameters: Vec<f32>,
+    layer_sizes: Vec<usize>,
+    activations: Vec<Vec<f32>>,
+}
+
+pub struct NetworkTelemetry<'a> {
+    pub layer_sizes: &'a [usize],
+    pub parameters: &'a [f32],
+    pub activations: &'a [Vec<f32>],
+}
+
+impl MlpController {
+    pub fn new(mlp: Mlp, parameters: &[f32]) -> Result<Self, &'static str> {
+        if mlp.input_size() != MLP_INPUT_SIZE {
+            return Err("The MLP input size must match the app controller input contract.");
+        }
+        if mlp.output_size() != MLP_OUTPUT_SIZE {
+            return Err("The MLP output size must match the app controller output contract.");
+        }
+        if parameters.len() != mlp.parameter_count() {
+            return Err("The telemetry parameter count must match the MLP.");
+        }
+
+        let layer_sizes = mlp.layer_sizes();
+        let activations = layer_sizes.iter().map(|&size| vec![0.0; size]).collect();
+
+        Ok(Self {
+            mlp,
+            parameters: parameters.to_vec(),
+            layer_sizes,
+            activations,
+        })
+    }
+
+    pub fn telemetry(&self) -> NetworkTelemetry<'_> {
+        NetworkTelemetry {
+            layer_sizes: &self.layer_sizes,
+            parameters: &self.parameters,
+            activations: &self.activations,
+        }
+    }
+
+    pub fn control_with_telemetry(&mut self, observation: &CarObservation) -> CarControls {
+        let inputs = observation.as_inputs();
+        self.activations = self.mlp.forward_with_trace(&inputs).unwrap();
+        let outputs = self.activations.last().unwrap();
+
+        controls_from_network_outputs([outputs[0], outputs[1]])
+    }
+}
+
+impl CarController for MlpController {
+    fn control(&mut self, observation: &CarObservation) -> CarControls {
+        let inputs = observation.as_inputs();
+        let outputs = self.mlp.forward(&inputs).unwrap();
+
+        controls_from_network_outputs([outputs[0], outputs[1]])
+    }
+}
+
 pub fn signed_angle_to(from_heading: f32, direction: Vec2) -> f32 {
     let target = direction.y.atan2(direction.x);
     wrap_angle(target - from_heading)
@@ -118,12 +187,20 @@ fn wrap_angle(angle: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neuroevolution::neural::{Activation, Architecture};
+
+    fn single_layer_mlp(input_size: usize, output_size: usize) -> Mlp {
+        let architecture =
+            Architecture::new(vec![input_size, output_size], vec![Activation::Linear]).unwrap();
+        Mlp::from_parameters(&architecture, &vec![0.0; architecture.parameter_count()]).unwrap()
+    }
 
     #[test]
     fn observation_contains_exactly_six_scalar_inputs() {
+        assert_eq!(MLP_INPUT_SIZE, 6);
         assert_eq!(
             std::mem::size_of::<CarObservation>(),
-            6 * std::mem::size_of::<f32>()
+            MLP_INPUT_SIZE * std::mem::size_of::<f32>()
         );
 
         let observation = CarObservation {
@@ -144,6 +221,7 @@ mod tests {
 
     #[test]
     fn network_outputs_map_steering_then_acceleration() {
+        assert_eq!(MLP_OUTPUT_SIZE, 2);
         let controls = controls_from_network_outputs([0.7, -0.3]);
         assert_eq!(controls.steering, 0.7);
         assert_eq!(controls.acceleration, -0.3);
@@ -170,5 +248,43 @@ mod tests {
         });
 
         assert_eq!(controls.acceleration, 1.0);
+    }
+
+    #[test]
+    fn mlp_controller_requires_the_app_network_contract() {
+        let valid = single_layer_mlp(MLP_INPUT_SIZE, MLP_OUTPUT_SIZE);
+        let valid_parameters = vec![0.0; valid.parameter_count()];
+        assert!(MlpController::new(valid, &valid_parameters).is_ok());
+        let wrong_input = single_layer_mlp(MLP_INPUT_SIZE - 1, MLP_OUTPUT_SIZE);
+        let wrong_input_parameters = vec![0.0; wrong_input.parameter_count()];
+        assert_eq!(
+            MlpController::new(wrong_input, &wrong_input_parameters).err(),
+            Some("The MLP input size must match the app controller input contract.")
+        );
+        let wrong_output = single_layer_mlp(MLP_INPUT_SIZE, MLP_OUTPUT_SIZE - 1);
+        let wrong_output_parameters = vec![0.0; wrong_output.parameter_count()];
+        assert_eq!(
+            MlpController::new(wrong_output, &wrong_output_parameters).err(),
+            Some("The MLP output size must match the app controller output contract.")
+        );
+    }
+
+    #[test]
+    fn mlp_controller_exposes_latest_forward_activations() {
+        let mlp = single_layer_mlp(MLP_INPUT_SIZE, MLP_OUTPUT_SIZE);
+        let parameters = vec![0.0; mlp.parameter_count()];
+        let mut controller = MlpController::new(mlp, &parameters).unwrap();
+        let observation = CarObservation {
+            sensors: [0.1, 0.2, 0.3, 0.4, 0.5],
+            normalized_speed: 0.6,
+        };
+
+        controller.control_with_telemetry(&observation);
+        let telemetry = controller.telemetry();
+
+        assert_eq!(telemetry.layer_sizes, &[MLP_INPUT_SIZE, MLP_OUTPUT_SIZE]);
+        assert_eq!(telemetry.parameters, parameters);
+        assert_eq!(telemetry.activations[0], observation.as_inputs());
+        assert_eq!(telemetry.activations[1], vec![0.0; MLP_OUTPUT_SIZE]);
     }
 }

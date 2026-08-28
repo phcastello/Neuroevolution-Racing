@@ -16,3 +16,4 @@ egui_plot.workspace = true
 neuroevolution = { path = "../neuroevolution" }
 serde.workspace = true
 ron.workspace = true
+rand = "0.10.2"

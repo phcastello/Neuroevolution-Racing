@@ -11,7 +11,7 @@ use bevy::{
 use bevy_egui::input::EguiWantsInput;
 
 use crate::simulation::{
-    CarObservation, ManualCar, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
+    CarObservation, SelectedCar, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
     TrackBounds,
 };
 
@@ -398,7 +398,7 @@ fn update_camera_view(
     track: Res<Track>,
     mode: Res<SimulationMode>,
     test_drive: Res<TestDriveSettings>,
-    manual_car: Query<(&Transform, &CarObservation), With<ManualCar>>,
+    followed_car: Query<(&Transform, &CarObservation), With<SelectedCar>>,
     mut state: ResMut<CameraViewState>,
 ) {
     let Ok(window) = window.single() else {
@@ -415,9 +415,6 @@ fn update_camera_view(
     state.last_scale_factor = scale_factor;
     state.last_scene = Some(scene);
 
-    if *mode != SimulationMode::TestDrive {
-        state.behavior = CameraBehavior::Free;
-    }
     let behavior_changed = state.behavior != state.last_behavior;
     let entered_follow = behavior_changed && state.behavior == CameraBehavior::FollowCar;
     let exited_follow = behavior_changed && state.behavior == CameraBehavior::Free;
@@ -471,8 +468,7 @@ fn update_camera_view(
     state.last_behavior = state.behavior;
 
     if state.behavior == CameraBehavior::FollowCar
-        && *mode == SimulationMode::TestDrive
-        && let Ok((car_transform, observation)) = manual_car.single()
+        && let Ok((car_transform, observation)) = followed_car.single()
     {
         let target_multiplier = speed_visual_multiplier(observation.normalized_speed);
         let blend = 1.0 - (-FOLLOW_SPEED_ZOOM_RESPONSE * time.delta_secs()).exp();

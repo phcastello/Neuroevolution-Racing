@@ -10,15 +10,13 @@ use crate::display::{
 };
 use crate::rendering::{CAR_SPRITE_LABELS, CarVisualSettings};
 use crate::simulation::{
-    Car, CarControls, CarObservation, CarProgress, KinematicCar, ManualControlMode, PlaybackState,
-    SelectedCar, SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track,
-    TrackDebug, TrackLibrary, TrackSelection, desired_yaw_rate, limited_yaw_rate,
-    max_grip_yaw_rate,
+    Car, CarControls, CarObservation, CarProgress, KinematicCar, ManualControlMode, MlpController,
+    PlaybackState, SelectedCar, SimulationConfig, SimulationMode, TestDriveEnvironment,
+    TestDriveSettings, Track, TrackDebug, TrackLibrary, TrackSelection, TrainingState,
+    desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate,
 };
 
-use super::{
-    FitnessHistory, fitness_plot::draw_fitness_plot, network_view::draw_network_placeholder,
-};
+use super::{fitness_plot::draw_fitness_plot, network_view::draw_network};
 
 const KMH_PER_UNIT_PER_SECOND: f32 = 0.578_52;
 
@@ -31,6 +29,8 @@ type SelectedCarTelemetry<'w, 's> = Query<
         &'static CarObservation,
         &'static Transform,
         Option<&'static CarProgress>,
+        Option<&'static MlpController>,
+        &'static Car,
     ),
     With<SelectedCar>,
 >;
@@ -45,7 +45,7 @@ pub struct DashboardData<'w, 's> {
     track_selection: ResMut<'w, TrackSelection>,
     track_debug: ResMut<'w, TrackDebug>,
     car_visuals: ResMut<'w, CarVisualSettings>,
-    history: Res<'w, FitnessHistory>,
+    training: Res<'w, TrainingState>,
     display: ResMut<'w, DisplaySettings>,
     camera: ResMut<'w, CameraViewState>,
     test_drive: ResMut<'w, TestDriveSettings>,
@@ -75,7 +75,7 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                 ui.heading("Neuroevolution Racing");
                 if ui.available_width() > 520.0 {
                     ui.separator();
-                    ui.label("simulation infrastructure • AI not implemented");
+                    ui.label("live neuroevolution • MLP + genetic algorithm");
                 }
             });
         });
@@ -121,13 +121,20 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         .num_columns(2)
                         .show(ui, |ui| {
                             ui.label("Generation");
-                            ui.monospace("--");
+                            ui.monospace(data.training.generation().to_string());
                             ui.end_row();
                             ui.label("Population");
-                            ui.monospace(data.cars.iter().count().to_string());
+                            ui.monospace(data.training.population().len().to_string());
                             ui.end_row();
                             ui.label("Alive");
-                            ui.monospace(format!("{} (temporary)", data.cars.iter().count()));
+                            ui.monospace(data.cars.iter().count().to_string());
+                            ui.end_row();
+                            ui.label("Evaluation");
+                            ui.monospace(format!(
+                                "{:.1}s / {:.1}s",
+                                data.training.evaluation_elapsed(),
+                                data.training.evaluation_duration()
+                            ));
                             ui.end_row();
                         });
 
@@ -345,17 +352,19 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             data.camera.request_reset();
                         }
                     });
-                    if *data.mode == SimulationMode::TestDrive {
-                        ui.horizontal(|ui| {
-                            ui.label("Behavior:");
-                            ui.radio_value(&mut data.camera.behavior, CameraBehavior::Free, "Free");
-                            ui.radio_value(
-                                &mut data.camera.behavior,
-                                CameraBehavior::FollowCar,
-                                "Follow Car",
-                            );
-                        });
-                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Behavior:");
+                        ui.radio_value(&mut data.camera.behavior, CameraBehavior::Free, "Free");
+                        ui.radio_value(
+                            &mut data.camera.behavior,
+                            CameraBehavior::FollowCar,
+                            if *data.mode == SimulationMode::TestDrive {
+                                "Follow Car"
+                            } else {
+                                "Follow Leader"
+                            },
+                        );
+                    });
                     ui.small("Wheel = zoom • Q/E = rotate • Middle/right drag = pan");
 
                     ui.separator();
@@ -364,9 +373,12 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     } else {
                         "Selected car"
                     });
-                    if let Some((car, controls, observation, transform, progress)) =
+                    if let Some((car, controls, observation, transform, progress, _, identity)) =
                         data.selected.iter().next()
                     {
+                        if *data.mode != SimulationMode::TestDrive {
+                            ui.label(format!("Current leader: car #{}", identity.id));
+                        }
                         ui.label(format!(
                             "Speed: {:+.1} u/s ({:+.1} km/h)",
                             car.speed,
@@ -466,18 +478,35 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     } else {
                         ui.separator();
                         ui.heading("Fitness");
-                        if data.history.is_mock {
-                            ui.colored_label(
-                                egui::Color32::YELLOW,
-                                "Preview data — no GA is running",
-                            );
+                        if data.training.history().is_empty() {
+                            ui.small("The first fitness sample appears when generation 0 finishes.");
                         }
-                        draw_fitness_plot(ui, &data.history);
+                        draw_fitness_plot(ui, data.training.history());
 
                         ui.separator();
-                        ui.heading("Neural Network");
-                        draw_network_placeholder(ui);
-                        ui.small("Static layout preview only — no neurons or weights exist yet.");
+                        ui.heading("Current Leader Neural Network");
+                        if let Some((_, _, _, _, Some(progress), Some(controller), identity)) =
+                            data.selected.iter().next()
+                        {
+                            let telemetry = controller.telemetry();
+                            ui.label(format!(
+                                "Generation {} • car #{} • live fitness {:.2}",
+                                data.training.generation(),
+                                identity.id,
+                                progress.best_track_distance
+                            ));
+                            draw_network(
+                                ui,
+                                telemetry.layer_sizes,
+                                telemetry.parameters,
+                                telemetry.activations,
+                            );
+                            ui.small(
+                                "Activations update after every controller inference; the view follows the live first-place car.",
+                            );
+                        } else {
+                            ui.small("Waiting for the current generation leader telemetry.");
+                        }
                     }
                 });
         });
