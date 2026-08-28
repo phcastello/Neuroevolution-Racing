@@ -80,7 +80,7 @@ impl Default for EvaluationConfig {
             progress_weight: 1.0,
             speed_weight: 0.20,
             collision_penalty: 0.08,
-            completion_bonus: 0.10,
+            completion_bonus: 0.25,
             progress_speed_normalization: 120.0,
             training_track_selection: match DEFAULT_TRAINING_TRACKS_PER_GENERATION {
                 Some(count) => TrainingTrackSelection::RandomSubset(count),
@@ -117,6 +117,12 @@ impl EvaluationConfig {
             if !value.is_finite() || value < 0.0 {
                 return Err(format!("{name} must be finite and non-negative"));
             }
+        }
+        if self.completion_bonus <= self.speed_weight {
+            return Err(
+                "completion_bonus must be greater than speed_weight so completion always wins"
+                    .into(),
+            );
         }
         if matches!(
             self.training_track_selection,
@@ -204,20 +210,24 @@ pub struct EpisodeResult {
     pub finish_reason: FinishReason,
 }
 
-/// Computes one track score. Track progress is normalized by lap length and useful
-/// speed uses only new best distance, never the car's raw/absolute velocity.
+/// Computes one track score. Progress starts at zero at the episode spawn and is
+/// normalized by the remaining lap. Useful speed uses only new best distance,
+/// never the car's raw/absolute velocity.
 pub fn episode_score(
     state: &EvaluationState,
     best_track_distance: f32,
     total_track_length: f32,
     config: &EvaluationConfig,
 ) -> EpisodeResult {
-    let normalized_progress = if total_track_length > f32::EPSILON {
-        (best_track_distance / total_track_length).clamp(0.0, 1.0)
+    let useful_distance = (best_track_distance - state.initial_progress).max(0.0);
+    let remaining_lap_distance = (total_track_length - state.initial_progress).max(0.0);
+    let normalized_progress = if remaining_lap_distance > f32::EPSILON {
+        (useful_distance / remaining_lap_distance).clamp(0.0, 1.0)
+    } else if best_track_distance >= total_track_length {
+        1.0
     } else {
         0.0
     };
-    let useful_distance = (best_track_distance - state.initial_progress).max(0.0);
     let useful_speed = if state.elapsed > f32::EPSILON {
         useful_distance / state.elapsed
     } else {
@@ -572,12 +582,20 @@ mod tests {
     use super::*;
 
     fn finished_state(reason: FinishReason, elapsed: f32) -> EvaluationState {
+        finished_state_from(reason, elapsed, 0.0)
+    }
+
+    fn finished_state_from(
+        reason: FinishReason,
+        elapsed: f32,
+        initial_progress: f32,
+    ) -> EvaluationState {
         EvaluationState {
             finish_reason: Some(reason),
             elapsed,
             time_without_progress: 0.0,
-            last_significant_progress: 0.0,
-            initial_progress: 0.0,
+            last_significant_progress: initial_progress,
+            initial_progress,
         }
     }
 
@@ -676,17 +694,68 @@ mod tests {
     }
 
     #[test]
+    fn normalized_progress_uses_remaining_lap_from_episode_start() {
+        let config = EvaluationConfig::default();
+        let start = episode_score(
+            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            20.0,
+            100.0,
+            &config,
+        );
+        let halfway = episode_score(
+            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            60.0,
+            100.0,
+            &config,
+        );
+        let finish = episode_score(
+            &finished_state_from(FinishReason::Completed, 10.0, 20.0),
+            100.0,
+            100.0,
+            &config,
+        );
+
+        assert_eq!(start.normalized_progress, 0.0);
+        assert!((halfway.normalized_progress - 0.5).abs() < 1.0e-6);
+        assert_eq!(finish.normalized_progress, 1.0);
+    }
+
+    #[test]
+    fn valid_config_guarantees_completed_score_exceeds_any_non_completed_score() {
+        let config = EvaluationConfig::default();
+        assert!(config.validate().is_ok());
+
+        let minimum_completed_bound = config.progress_weight + config.completion_bonus;
+        let maximum_non_completed_bound = config.progress_weight + config.speed_weight;
+        assert!(minimum_completed_bound > maximum_non_completed_bound);
+
+        let completed = episode_score(
+            &finished_state_from(FinishReason::Completed, f32::MAX, 20.0),
+            100.0,
+            100.0,
+            &config,
+        );
+        let nearly_complete_at_max_speed = episode_score(
+            &finished_state_from(FinishReason::Timeout, 0.001, 20.0),
+            99.999_99,
+            100.0,
+            &config,
+        );
+        assert!(completed.score > nearly_complete_at_max_speed.score);
+    }
+
+    #[test]
     fn normalized_progress_is_comparable_between_track_lengths() {
         let config = EvaluationConfig::default();
         let short = episode_score(
-            &finished_state(FinishReason::Stalled, 10.0),
-            50.0,
+            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            60.0,
             100.0,
             &config,
         );
         let long = episode_score(
-            &finished_state(FinishReason::Stalled, 20.0),
-            100.0,
+            &finished_state_from(FinishReason::Stalled, 20.0, 40.0),
+            120.0,
             200.0,
             &config,
         );
@@ -700,6 +769,9 @@ mod tests {
         assert!(config.validate().is_err());
         config = EvaluationConfig::default();
         config.training_track_selection = TrainingTrackSelection::RandomSubset(0);
+        assert!(config.validate().is_err());
+        config = EvaluationConfig::default();
+        config.completion_bonus = config.speed_weight;
         assert!(config.validate().is_err());
     }
 
