@@ -10,13 +10,17 @@ use crate::display::{
 };
 use crate::rendering::{CAR_SPRITE_LABELS, CarVisualSettings};
 use crate::simulation::{
-    Car, CarControls, CarObservation, CarProgress, EvaluationState, KinematicCar,
-    ManualControlMode, MlpController, PlaybackState, SelectedCar, SimulationConfig, SimulationMode,
-    TestDriveEnvironment, TestDriveSettings, Track, TrackDebug, TrackLibrary, TrackSelection,
-    TrainingPhase, TrainingState, desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate,
+    Car, CarControls, CarObservation, CarProgress, CheckpointStore, EvaluationState, KinematicCar,
+    LaserState, LoadedNetwork, ManualControlMode, MlpController, PlaybackState, SelectedCar,
+    SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track, TrackDebug,
+    TrackLibrary, TrackSelection, TrainingFastForward, TrainingPhase, TrainingState,
+    desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate,
 };
 
-use super::{fitness_plot::draw_fitness_plot, network_view::draw_network};
+use super::{
+    checkpoint_browser::draw_checkpoint_browser, fitness_plot::draw_fitness_plot,
+    network_view::draw_network,
+};
 
 const KMH_PER_UNIT_PER_SECOND: f32 = 0.578_52;
 
@@ -39,6 +43,7 @@ type SelectedCarTelemetry<'w, 's> = Query<
 #[derive(SystemParam)]
 pub struct DashboardData<'w, 's> {
     playback: ResMut<'w, PlaybackState>,
+    fast_forward: ResMut<'w, TrainingFastForward>,
     mode: ResMut<'w, SimulationMode>,
     config: Res<'w, SimulationConfig>,
     track: Res<'w, Track>,
@@ -47,6 +52,9 @@ pub struct DashboardData<'w, 's> {
     track_debug: ResMut<'w, TrackDebug>,
     car_visuals: ResMut<'w, CarVisualSettings>,
     training: Res<'w, TrainingState>,
+    laser: Res<'w, LaserState>,
+    checkpoints: ResMut<'w, CheckpointStore>,
+    loaded_network: ResMut<'w, LoadedNetwork>,
     display: ResMut<'w, DisplaySettings>,
     camera: ResMut<'w, CameraViewState>,
     test_drive: ResMut<'w, TestDriveSettings>,
@@ -88,6 +96,54 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
+                    if data.fast_forward.is_active() {
+                        let target = data.fast_forward.target_generation.unwrap();
+                        let current = data.training.generation();
+                        ui.heading("FAST-FORWARD");
+                        ui.strong("Turbo de treinamento / rendering mínimo");
+                        ui.separator();
+                        egui::Grid::new("fast_forward_status")
+                            .num_columns(2)
+                            .show(ui, |ui| {
+                                ui.label("Current generation");
+                                ui.monospace(current.to_string());
+                                ui.end_row();
+                                ui.label("Target generation");
+                                ui.monospace(target.to_string());
+                                ui.end_row();
+                                ui.label("Elapsed wall time");
+                                ui.monospace(format!(
+                                    "{:.1}s",
+                                    data.fast_forward.elapsed().as_secs_f64()
+                                ));
+                                ui.end_row();
+                                ui.label("Throughput");
+                                ui.monospace(format!(
+                                    "{:.2} generations/s",
+                                    data.fast_forward.generations_per_second(current)
+                                ));
+                                ui.end_row();
+                                ui.label("Fixed tick rate");
+                                ui.monospace(format!(
+                                    "{:.0} ticks/s",
+                                    data.fast_forward.fixed_ticks_per_second()
+                                ));
+                                ui.end_row();
+                            });
+                        ui.small("Every logical tick remains exactly 1/60 s; no generation, training track, validation, or autosave is skipped.");
+                        ui.add_space(8.0);
+                        if ui.button("Cancel fast-forward").clicked()
+                            && let Some(restore) = data.fast_forward.cancel()
+                        {
+                            data.playback.speed = restore.speed;
+                            data.playback.paused = false;
+                            data.virtual_time.set_relative_speed(restore.speed);
+                            data.virtual_time.set_max_delta(restore.max_delta);
+                            data.virtual_time.unpause();
+                        }
+                        return;
+                    }
+
                     ui.heading("Simulation");
                     let mut selected_mode = *data.mode;
                     ui.horizontal(|ui| {
@@ -116,6 +172,16 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     );
                     if selected_mode != *data.mode {
                         *data.mode = selected_mode;
+                    }
+                    if *data.mode == SimulationMode::Champion {
+                        if let Some(loaded) = &data.loaded_network.checkpoint {
+                            ui.small(format!(
+                                "Loaded checkpoint: {}",
+                                loaded.source_filename
+                            ));
+                        } else {
+                            ui.small("Champion source: current training session");
+                        }
                     }
                     ui.add_space(4.0);
                     egui::Grid::new("summary_grid")
@@ -290,11 +356,14 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
 
                     ui.add_space(8.0);
                     if ui
-                        .button(if data.playback.paused {
-                            "▶ Resume"
-                        } else {
-                            "⏸ Pause"
-                        })
+                        .add_enabled(
+                            !data.fast_forward.is_active(),
+                            egui::Button::new(if data.playback.paused {
+                                "▶ Resume"
+                            } else {
+                                "⏸ Pause"
+                            }),
+                        )
                         .clicked()
                     {
                         data.playback.paused = !data.playback.paused;
@@ -308,9 +377,12 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         ui.label("Speed:");
                         for speed in [1.0, 2.0, 10.0, 25.0] {
                             if ui
-                                .selectable_label(
-                                    data.playback.speed == speed,
-                                    format!("{speed:.0}×"),
+                                .add_enabled(
+                                    !data.fast_forward.is_active(),
+                                    egui::Button::selectable(
+                                        data.playback.speed == speed,
+                                        format!("{speed:.0}×"),
+                                    ),
                                 )
                                 .clicked()
                             {
@@ -319,6 +391,57 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             }
                         }
                     });
+                    if *data.mode == SimulationMode::Training {
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Target generation:");
+                            ui.add_enabled(
+                                !data.fast_forward.is_active(),
+                                egui::TextEdit::singleline(&mut data.fast_forward.target_input)
+                                    .desired_width(82.0)
+                                    .hint_text("200"),
+                            );
+                        });
+                        if data.fast_forward.is_active() {
+                            let target = data.fast_forward.target_generation.unwrap();
+                            ui.strong(format!("FAST-FORWARD → Gen {target}"));
+                            ui.monospace(format!("Current Gen: {}", data.training.generation()));
+                            if ui.button("Cancel fast-forward").clicked()
+                                && let Some(restore) = data.fast_forward.cancel()
+                            {
+                                data.playback.speed = restore.speed;
+                                data.playback.paused = false;
+                                data.virtual_time.set_relative_speed(restore.speed);
+                                data.virtual_time.set_max_delta(restore.max_delta);
+                                data.virtual_time.unpause();
+                            }
+                        } else if ui.button("Fast-forward").clicked() {
+                            match data.fast_forward.target_input.trim().parse::<usize>() {
+                                Ok(target)
+                                    if data.fast_forward.start(
+                                        target,
+                                        data.training.generation(),
+                                        data.playback.speed,
+                                        data.virtual_time.max_delta(),
+                                    ) =>
+                                {
+                                    data.playback.paused = false;
+                                    // The turbo driver owns exact FixedMain ticks. Pausing
+                                    // virtual-time prevents Bevy's regular frame-driven loop
+                                    // from adding a second, FPS-coupled backlog.
+                                    data.virtual_time.pause();
+                                }
+                                Ok(_) => {}
+                                Err(_) => {
+                                    data.fast_forward.status =
+                                        "Enter a non-negative generation number".into();
+                                }
+                            }
+                        }
+                        if !data.fast_forward.status.is_empty() {
+                            ui.small(&data.fast_forward.status);
+                        }
+                    }
                     ui.small("Space toggles pause. Simulation logic runs at a fixed 60 Hz.");
                     ui.checkbox(&mut data.track_debug.enabled, "Track debug");
                     ui.checkbox(&mut data.car_visuals.show_hitbox, "Show car hitbox");
@@ -518,6 +641,22 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         }
                         draw_fitness_plot(ui, data.training.history());
 
+                        let laser_config = data.training.evaluation_config().laser;
+                        ui.small(format!(
+                            "laser: grace {:.1}s • speed {:.1}/{:.1} u/s • progress {:.1}u",
+                            laser_config.grace_period,
+                            data.laser.speed,
+                            laser_config.maximum_speed,
+                            data.laser.progress,
+                        ));
+                        ui.small(format!(
+                            "fitness: progress={:.2}, useful speed={:.2}, completion bonus={:.2}, collision penalty={:.2}",
+                            data.training.evaluation_config().progress_weight,
+                            data.training.evaluation_config().speed_weight,
+                            data.training.evaluation_config().completion_bonus,
+                            data.training.evaluation_config().collision_penalty,
+                        ));
+
                         ui.separator();
                         ui.heading("Current Leader Neural Network");
                         if let Some((
@@ -564,6 +703,16 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                                 validation.finish_reason.label()
                             ));
                         }
+
+                        ui.separator();
+                        draw_checkpoint_browser(
+                            ui,
+                            &data.training,
+                            &data.config,
+                            &mut data.checkpoints,
+                            &mut data.loaded_network,
+                            &mut data.mode,
+                        );
                     }
                 });
         });

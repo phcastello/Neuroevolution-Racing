@@ -1,5 +1,7 @@
+mod checkpoint;
 mod components;
 mod controller;
+mod fast_forward;
 mod systems;
 mod track;
 mod training;
@@ -9,6 +11,7 @@ pub use components::{
 };
 pub(crate) use controller::MlpController;
 pub use controller::{CarControls, CarObservation};
+pub use fast_forward::{FAST_FORWARD_BATCH_BUDGET, TrainingFastForward};
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
 pub use track::{Track, TrackBounds, TrackLibrary};
 
@@ -17,11 +20,15 @@ use serde::{Deserialize, Serialize};
 use systems::{
     SimulationSet, apply_track_selection, apply_vehicle_physics, finish_generation_evaluation,
     handle_test_drive_input, produce_manual_controls, produce_temporary_controls,
-    rebuild_simulation, reset_manual_car, sample_sensors, select_current_leader,
-    toggle_pause_from_keyboard, update_track_progress,
+    rebuild_simulation, reset_manual_car, run_training_fast_forward_batch, sample_sensors,
+    select_current_leader, toggle_pause_from_keyboard, update_track_progress,
+    update_training_fast_forward,
 };
 
-pub(crate) use training::{EvaluationState, GenerationStats, TrainingPhase, TrainingState};
+pub(crate) use checkpoint::{CheckpointStore, LoadedNetwork};
+pub(crate) use training::{
+    EvaluationState, FinishReason, GenerationStats, LaserState, TrainingPhase, TrainingState,
+};
 
 #[derive(Resource, Clone, Debug)]
 pub struct TrackSelection {
@@ -60,7 +67,7 @@ impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
             population_size: 500,
-            sensor_max_distance: 750.0,
+            sensor_max_distance: 1000.0,
             acceleration_rate: 125.0,
             braking_rate: 175.0,
             coasting_deceleration: 12.0,
@@ -162,8 +169,13 @@ impl Plugin for SimulationPlugin {
         };
         app.insert_resource(simulation_config)
             .insert_resource(training_state)
+            .init_resource::<CheckpointStore>()
+            .init_resource::<LoadedNetwork>()
             .init_resource::<SimulationMode>()
             .init_resource::<PlaybackState>()
+            .init_resource::<TrainingFastForward>()
+            .init_resource::<systems::SimulationLifecycleState>()
+            .init_resource::<LaserState>()
             .init_resource::<TestDriveSettings>()
             .init_resource::<TrackDebug>()
             .insert_resource(library)
@@ -179,6 +191,8 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::Progress,
                     SimulationSet::Leader,
                     SimulationSet::Evaluation,
+                    SimulationSet::Lifecycle,
+                    SimulationSet::FastForward,
                 )
                     .chain(),
             )
@@ -190,9 +204,19 @@ impl Plugin for SimulationPlugin {
                         .in_set(SimulationSet::ControlSource),
                     apply_vehicle_physics.in_set(SimulationSet::Physics),
                     update_track_progress.in_set(SimulationSet::Progress),
-                    select_current_leader.in_set(SimulationSet::Leader),
+                    select_current_leader
+                        .run_if(|fast_forward: Res<TrainingFastForward>| !fast_forward.is_active())
+                        .in_set(SimulationSet::Leader),
                     finish_generation_evaluation.in_set(SimulationSet::Evaluation),
+                    rebuild_simulation.in_set(SimulationSet::Lifecycle),
+                    update_training_fast_forward.in_set(SimulationSet::FastForward),
                 ),
+            )
+            .add_systems(
+                RunFixedMainLoop,
+                run_training_fast_forward_batch
+                    .in_set(RunFixedMainLoopSystems::FixedMainLoop)
+                    .before(bevy::time::run_fixed_main_schedule),
             )
             .add_systems(
                 Update,

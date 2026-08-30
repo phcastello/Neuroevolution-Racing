@@ -48,17 +48,23 @@ sudo apt install libxkbcommon-x11-0
 cargo run -p neuroevolution-racing-app
 ```
 
-The first native build can take several minutes. Use the right dashboard to change tracks without restarting, choose the simulation or Test Drive mode, pause/resume, choose 1×, 2×, 10×, or 25× simulation speed, and switch between windowed, 1080p, 1440p, and native fullscreen display modes. The space bar toggles pause and F11 toggles native fullscreen/windowed mode.
+The first native build can take several minutes. Use the right dashboard to change tracks without restarting, choose the simulation or Test Drive mode, pause/resume, choose 1×, 2×, 10×, or 25× simulation speed, and switch between windowed, 1080p, 1440p, and native fullscreen display modes. Those four speeds are visual playback modes; 25× remains suitable for observation and timelapses. Training also has a **Target Generation** turbo whose purpose is maximum training throughput with minimal rendering. The space bar toggles pause and F11 toggles native fullscreen/windowed mode.
 
 The Linux build intentionally uses X11/XWayland. WSLg's native Wayland path can lose its Vulkan surface while a window is manually resized; Bevy 0.19.1 cannot recover when the driver consequently reports no presentation modes.
 
 ## Training and genetic algorithm
 
-Training starts with a deterministic seeded population of 500 genomes. Each genome contains all 74 parameters of the `6 → 8 → 2` dense MLP: weights and biases for both layers. Every individual starts from the same position, heading, speed, observation, and controls. Its independent episode ends on lap completion, a real translational wall collision, lack of significant track progress for 2.5 seconds, or a 60-second safety timeout.
+Training starts with a deterministic seeded population of 500 genomes. Each genome contains all 74 parameters of the `6 → 8 → 2` dense MLP: weights and biases for both layers. Every individual starts from the same position, heading, speed, observation, and controls. Its independent episode ends on lap completion, a real translational wall collision, elimination by the track laser, or a 180-second emergency failsafe timeout.
+
+The laser is a scalar progress barrier along the track centerline, not a Cartesian line sweeping the map and not a disguised target lap time. Both car and laser progress are zero relative to the episode's real spawn point. The laser remains there for a 3-second grace period, then accelerates at `30 u/s²` from rest until reaching `130 u/s`. A car is eliminated when its **current accumulated progress minus its initial progress** is at or behind the laser; its historical best progress is deliberately not used for termination. This lets a fast car build a lead on a straight and spend that lead while negotiating a slower corner, while a reversing car can still be caught. The visual magenta/red transverse stripe uses `initial_progress + laser_relative_progress`, including normal track wrap, so it shows the same scalar state used by evaluation. This mechanism replaces the old local `Stalled` rule; the high timeout remains only to reveal broken or impossible states and should be rare in healthy training.
 
 Each generation selects one reproducible three-track subset from the training suite and uses the same tracks for every individual. A track score combines progress since the episode's spawn point normalized by the remaining lap with normalized useful progress speed, subtracts a bounded collision penalty, and gives completed laps a bonus. Training fitness is the mean of those track scores. The evaluated generation's champion then runs once on a randomly selected held-out validation track; that validation score is recorded but never enters fitness or evolution. Only after validation does the application preserve elites, select parents by tournament, apply uniform crossover and Gaussian mutation, and increment the generation.
 
-The default episode formula is `1.0 × normalized_progress + 0.20 × normalized_useful_speed + 0.25 if completed - 0.08 if collided`. The configuration requires the completion bonus to exceed the entire speed term, so every completed episode scores above every possible non-completed episode. Useful speed is new best track distance per elapsed second, clamped after division by the configurable `120 u/s` normalization scale; raw absolute car speed is never rewarded.
+The default episode formula is `1.0 × normalized_progress + 0.40 × normalized_useful_speed + 0.45 if completed - 0.08 if collided`. Laser elimination has no artificial penalty: the incremental progress and useful-speed terms retain the distinction between early and late elimination. Useful speed is new best track distance per elapsed second; raw absolute car speed is never rewarded. It now uses the asymptotic normalization `v / (v + k)`, with `k = 120 u/s` by default. Thus `k` is the half-saturation speed (`v = k` gives `0.5`), there is no hard clamp at 120 u/s, and finite values such as 200 and 300 u/s remain selectively distinct. The speed term stays strictly below `0.40` for finite speed, so `completion_bonus = 0.45` continues to guarantee that every completed episode beats every possible non-completed episode.
+
+Target Generation does not assign or skip generation numbers. Every intermediate training episode, training track, held-out validation run, evolution step, RNG transition, log, and checkpoint/auto-save policy still executes. Turbo runs the same complete Bevy `FixedMain` schedule repeatedly in wall-clock-budgeted batches, and every logical iteration retains the exact `1/60 s` timestep. During those batches car/track sprites, gizmos, leader selection, network activation traces, the fitness plot, and detailed dashboard telemetry are suspended or hidden; a minimal status/cancel panel is yielded roughly five times per second. Reaching or cancelling the target restores rendering and the user's prior playback speed without resetting the current episode, population, track, or RNG. Training is not stopped at the target and continues into later generations.
+
+New network checkpoints use format V3 and explicitly record asymptotic useful-speed normalization plus `progress_speed_half_saturation`, as well as sensor range, laser grace/acceleration/maximum speed, the failsafe timeout, and other scoring/evaluation parameters. The loader continues accepting V1 and V2 checkpoints unchanged: V1 retains its historical `Stalled` metadata and V2 retains its historical hard-clamp experiment metadata. Their genomes and `6 → 8 → 2` architectures remain valid in Champion mode; existing files are never rewritten and no old sensor-range compatibility mode is introduced.
 
 The dashboard displays:
 
@@ -67,7 +73,7 @@ The dashboard displays:
 - the live first-place individual and its current normalized progress;
 - that leader's actual neural network, including every neuron activation, weight sign, and relative weight magnitude.
 
-The selected car is reassigned continuously to whichever individual has reached the greatest forward distance in the current generation. Network activations are captured by a generic MLP forward-trace API and exposed through controller telemetry, keeping egui and visualization details out of the neural implementation. Completed generations still contribute best and average samples to the fitness plot.
+During visual playback, the selected car is reassigned continuously to whichever individual has reached the greatest forward distance in the current generation. Its network activations are captured by a generic MLP forward-trace API and exposed through controller telemetry, keeping egui and visualization details out of the neural implementation. Turbo disables that presentation-only trace and leader scan; every car still performs the normal MLP forward pass needed for control. Completed generations still contribute best and average samples to the fitness history, while plotting is deferred until visual playback resumes.
 
 ## Camera controls
 
@@ -92,7 +98,7 @@ Keyboard controls are `W` = acceleration `+1`, `S` = acceleration `-1`, `A` = st
 
 Vehicle speed has no hard maximum. Propulsion efficiency decreases continuously as speed magnitude grows, so holding acceleration can keep increasing speed but produces progressively smaller gains. With neutral acceleration, a constant coasting loss gradually brings the car toward rest without reversing it. Opposing acceleration retains the full configured rate for responsive braking. The physical world scale is `1 unit = 16.07142 cm`, and the dashboard shows speed in `u/s` with an optional `km/h` conversion. `1 unit/s = 0.57852 km/h`. The observation uses `normalized_speed = abs(v) / (abs(v) + scale)` with a default scale of `250.0`; this asymptotic mapping stays in `[0, 1]` and does not clamp or otherwise alter the unbounded physical velocity.
 
-The five wall rays keep the fixed `+60°, +30°, 0°, -30°, -60°` angles and normalize hit distance so `0` means a wall at the origin and `1` means no wall within the default `750.0`-unit maximum range.
+The five wall rays keep the fixed `+60°, +30°, 0°, -30°, -60°` angles and normalize hit distance so `0` means a wall at the origin and `1` means no wall within the default `1000.0`-unit maximum range.
 
 Steering requests an angular rate, but shared vehicle physics limits the achievable rate using lateral acceleration: `a_lateral = |v| * |omega|`, so `omega_max = a_lateral_max / |v|`. Normal turn rate remains dominant at low speed; at high speed the grip limit increases the minimum turning radius and makes braking necessary for tight corners. This is still a simplified kinematic model: the car moves along its heading, with no tire slip, drifting, or full vehicle dynamics.
 
@@ -156,14 +162,14 @@ Implemented infrastructure:
 - continuous distance-along-track progress, normalized progress, and maximum reached distance;
 - local centerline projection continuity and one-lap start/finish wrap handling;
 - optional debug drawing for the generated centerline, dense sampled points, larger authored control points, and selected-car projection;
-- fixed 60 Hz simulation behavior with pause and speed controls;
-- independent episode termination, multi-track training fitness, held-out champion validation, and automatic GA evolution in Training mode;
+- fixed 60 Hz simulation behavior with visual 1×/2×/10×/25× playback and wall-clock-budgeted Target Generation turbo;
+- spawn-relative centerline laser termination, asymptotic useful-speed fitness, multi-track training, held-out champion validation, and automatic GA evolution in Training mode;
 - real generation counter and best/average fitness history;
 - live visualization of the current generation leader's `6 → 8 → 2` network using its actual weights and per-inference neuron activations;
-- Champion mode groundwork and a reserved Race mode;
+- versioned V1/V2/V3 RON checkpoints, auto-save, checkpoint browsing/loading, Champion mode groundwork, and a reserved Race mode;
 - unit-tested RON parsing, malformed definitions, role filtering, all bundled track files, generated geometry and borders, arc-length projection/progress, runtime replacement, camera fitting, video-mode selection, and observation shape.
 
-Intentionally **not implemented**: gradient-based training/backpropagation, persistence/checkpoint loading, a completed Champion showcase, and Race mode. Learning is performed exclusively through the manually implemented genetic algorithm.
+Intentionally **not implemented**: gradient-based training/backpropagation, a completed Champion showcase, and Race mode. Learning is performed exclusively through the manually implemented genetic algorithm.
 
 ## Data-driven tracks
 

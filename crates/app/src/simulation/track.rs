@@ -484,6 +484,10 @@ impl Track {
     }
 
     pub fn point_at_distance(&self, distance: f32) -> Vec2 {
+        self.pose_at_distance(distance).0
+    }
+
+    pub fn pose_at_distance(&self, distance: f32) -> (Vec2, Vec2) {
         let distance = distance.rem_euclid(self.total_length);
         let next_index = self
             .samples
@@ -495,7 +499,10 @@ impl Track {
         } else {
             0.0
         };
-        start.position.lerp(end.position, t.clamp(0.0, 1.0))
+        (
+            start.position.lerp(end.position, t.clamp(0.0, 1.0)),
+            (end.position - start.position).normalize_or(start.tangent),
+        )
     }
 
     fn best_projection(

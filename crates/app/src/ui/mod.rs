@@ -1,3 +1,4 @@
+mod checkpoint_browser;
 mod dashboard;
 mod fitness_plot;
 mod network_view;

@@ -16,7 +16,7 @@ const DEFAULT_TRAINING_TRACKS_PER_GENERATION: Option<usize> = Some(3);
 pub enum FinishReason {
     Completed,
     Collision,
-    Stalled,
+    EliminatedByLaser,
     Timeout,
 }
 
@@ -25,7 +25,7 @@ impl FinishReason {
         match self {
             Self::Completed => "completed",
             Self::Collision => "collision",
-            Self::Stalled => "stalled",
+            Self::EliminatedByLaser => "eliminated by laser",
             Self::Timeout => "timeout",
         }
     }
@@ -35,16 +35,16 @@ impl FinishReason {
 pub struct FinishReasonCounts {
     pub completed: usize,
     pub collision: usize,
-    pub stalled: usize,
+    pub laser_eliminated: usize,
     pub timeout: usize,
 }
 
 impl FinishReasonCounts {
-    fn record(&mut self, reason: FinishReason) {
+    pub fn record(&mut self, reason: FinishReason) {
         match reason {
             FinishReason::Completed => self.completed += 1,
             FinishReason::Collision => self.collision += 1,
-            FinishReason::Stalled => self.stalled += 1,
+            FinishReason::EliminatedByLaser => self.laser_eliminated += 1,
             FinishReason::Timeout => self.timeout += 1,
         }
     }
@@ -56,32 +56,131 @@ pub enum TrainingTrackSelection {
     RandomSubset(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LaserConfig {
+    pub grace_period: f32,
+    pub acceleration: f32,
+    pub maximum_speed: f32,
+}
+
+impl Default for LaserConfig {
+    fn default() -> Self {
+        Self {
+            grace_period: 3.0,
+            acceleration: 30.0,
+            maximum_speed: 130.0,
+        }
+    }
+}
+
+impl LaserConfig {
+    fn validate(self) -> Result<(), String> {
+        for (name, value) in [
+            ("laser grace_period", self.grace_period),
+            ("laser acceleration", self.acceleration),
+            ("laser maximum_speed", self.maximum_speed),
+        ] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(format!("{name} must be finite and non-negative"));
+            }
+        }
+        if self.acceleration <= 0.0 || self.maximum_speed <= 0.0 {
+            return Err("laser acceleration and maximum_speed must be greater than zero".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Resource, Clone, Copy, Debug, Default, PartialEq)]
+pub struct LaserState {
+    pub elapsed: f32,
+    /// Accumulated track progress at the episode spawn point.
+    pub origin_progress: f32,
+    /// Laser progress relative to `origin_progress`.
+    pub progress: f32,
+    pub speed: f32,
+}
+
+impl LaserState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn reset_at(&mut self, origin_progress: f32) {
+        *self = Self {
+            origin_progress: if origin_progress.is_finite() {
+                origin_progress.max(0.0)
+            } else {
+                0.0
+            },
+            ..Self::default()
+        };
+    }
+
+    pub fn track_progress(self) -> f32 {
+        self.origin_progress + self.progress
+    }
+
+    /// Advances from elapsed simulation time using the exact constant-acceleration
+    /// solution, then a constant-speed segment. This avoids integration drift.
+    pub fn advance(&mut self, delta_seconds: f32, track_length: f32, config: LaserConfig) {
+        self.elapsed += delta_seconds.max(0.0);
+        let laser_time = (self.elapsed - config.grace_period).max(0.0);
+        let acceleration_time = config.maximum_speed / config.acceleration;
+        if laser_time <= acceleration_time {
+            self.speed = config.acceleration * laser_time;
+            self.progress = 0.5 * config.acceleration * laser_time * laser_time;
+        } else {
+            self.speed = config.maximum_speed;
+            let acceleration_distance =
+                0.5 * config.acceleration * acceleration_time * acceleration_time;
+            self.progress =
+                acceleration_distance + config.maximum_speed * (laser_time - acceleration_time);
+        }
+        self.speed = self.speed.min(config.maximum_speed);
+        self.progress = self.progress.clamp(0.0, track_length.max(0.0));
+    }
+
+    pub fn is_active(self, config: LaserConfig) -> bool {
+        self.elapsed > config.grace_period
+    }
+
+    pub fn has_reached(
+        self,
+        current_track_progress: f32,
+        initial_progress: f32,
+        config: LaserConfig,
+    ) -> bool {
+        let car_relative_progress = current_track_progress - initial_progress;
+        self.is_active(config) && car_relative_progress <= self.progress
+    }
+}
+
 /// Parameters for episode termination and the deliberately small score formula.
 /// Progress is dominant, useful speed is a tie-breaker, and collision is a bounded penalty.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EvaluationConfig {
     pub maximum_episode_duration: f32,
-    pub stall_timeout: f32,
-    pub significant_progress_epsilon: f32,
+    pub laser: LaserConfig,
     pub progress_weight: f32,
     pub speed_weight: f32,
     pub collision_penalty: f32,
     pub completion_bonus: f32,
-    pub progress_speed_normalization: f32,
+    /// Useful speed at which the asymptotic speed term reaches 0.5.
+    pub progress_speed_half_saturation: f32,
     pub training_track_selection: TrainingTrackSelection,
 }
 
 impl Default for EvaluationConfig {
     fn default() -> Self {
         Self {
-            maximum_episode_duration: 60.0,
-            stall_timeout: 2.5,
-            significant_progress_epsilon: 6.0,
+            maximum_episode_duration: 180.0,
+            laser: LaserConfig::default(),
             progress_weight: 1.0,
-            speed_weight: 0.20,
+            speed_weight: 0.40,
             collision_penalty: 0.08,
-            completion_bonus: 0.25,
-            progress_speed_normalization: 120.0,
+            completion_bonus: 0.45,
+            progress_speed_half_saturation: 120.0,
             training_track_selection: match DEFAULT_TRAINING_TRACKS_PER_GENERATION {
                 Some(count) => TrainingTrackSelection::RandomSubset(count),
                 None => TrainingTrackSelection::All,
@@ -94,20 +193,16 @@ impl EvaluationConfig {
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("maximum_episode_duration", self.maximum_episode_duration),
-            ("stall_timeout", self.stall_timeout),
             (
-                "significant_progress_epsilon",
-                self.significant_progress_epsilon,
-            ),
-            (
-                "progress_speed_normalization",
-                self.progress_speed_normalization,
+                "progress_speed_half_saturation",
+                self.progress_speed_half_saturation,
             ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 return Err(format!("{name} must be finite and greater than zero"));
             }
         }
+        self.laser.validate()?;
         for (name, value) in [
             ("progress_weight", self.progress_weight),
             ("speed_weight", self.speed_weight),
@@ -138,8 +233,6 @@ impl EvaluationConfig {
 pub struct EvaluationState {
     pub finish_reason: Option<FinishReason>,
     pub elapsed: f32,
-    pub time_without_progress: f32,
-    pub last_significant_progress: f32,
     pub initial_progress: f32,
 }
 
@@ -148,8 +241,6 @@ impl EvaluationState {
         Self {
             finish_reason: None,
             elapsed: 0.0,
-            time_without_progress: 0.0,
-            last_significant_progress: initial_progress,
             initial_progress,
         }
     }
@@ -168,8 +259,10 @@ impl EvaluationState {
     pub fn update(
         &mut self,
         delta_seconds: f32,
+        current_track_distance: f32,
         best_track_distance: f32,
         total_track_length: f32,
+        laser: &LaserState,
         config: &EvaluationConfig,
     ) {
         if self.is_finished() {
@@ -184,17 +277,8 @@ impl EvaluationState {
             return;
         }
 
-        if best_track_distance - self.last_significant_progress
-            >= config.significant_progress_epsilon
-        {
-            self.last_significant_progress = best_track_distance;
-            self.time_without_progress = 0.0;
-        } else {
-            self.time_without_progress += delta_seconds.max(0.0);
-        }
-
-        if self.time_without_progress >= config.stall_timeout {
-            self.finish(FinishReason::Stalled);
+        if laser.has_reached(current_track_distance, self.initial_progress, config.laser) {
+            self.finish(FinishReason::EliminatedByLaser);
         } else if self.elapsed >= config.maximum_episode_duration {
             self.finish(FinishReason::Timeout);
         }
@@ -205,9 +289,30 @@ impl EvaluationState {
 pub struct EpisodeResult {
     pub score: f32,
     pub normalized_progress: f32,
+    /// Effective forward progress along the track, in simulation units/second.
+    pub useful_progress_speed: f32,
     pub normalized_progress_speed: f32,
     pub elapsed: f32,
     pub finish_reason: FinishReason,
+}
+
+/// Maps useful forward-progress speed to `[0, 1)` with `speed = k` at 0.5.
+/// Invalid inputs are neutral rather than contaminating population fitness.
+pub fn normalize_useful_progress_speed(useful_speed: f32, half_saturation: f32) -> f32 {
+    if !half_saturation.is_finite() || half_saturation <= 0.0 || useful_speed.is_nan() {
+        return 0.0;
+    }
+    if useful_speed == f32::INFINITY {
+        return 1.0;
+    }
+    if !useful_speed.is_finite() || useful_speed <= 0.0 {
+        return 0.0;
+    }
+
+    // Algebraically speed / (speed + k), written this way to avoid overflow.
+    // Keep every finite speed strictly below one even after f32 rounding.
+    const MAX_BELOW_ONE: f32 = f32::from_bits(1.0_f32.to_bits() - 1);
+    (1.0 / (1.0 + half_saturation / useful_speed)).min(MAX_BELOW_ONE)
 }
 
 /// Computes one track score. Progress starts at zero at the episode spawn and is
@@ -234,7 +339,7 @@ pub fn episode_score(
         0.0
     };
     let normalized_progress_speed =
-        (useful_speed / config.progress_speed_normalization).clamp(0.0, 1.0);
+        normalize_useful_progress_speed(useful_speed, config.progress_speed_half_saturation);
     let finish_reason = state
         .finish_reason
         .expect("episode score requires a finished evaluation");
@@ -256,6 +361,7 @@ pub fn episode_score(
     EpisodeResult {
         score,
         normalized_progress,
+        useful_progress_speed: useful_speed,
         normalized_progress_speed,
         elapsed: state.elapsed,
         finish_reason,
@@ -270,13 +376,43 @@ pub struct GenerationStats {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct TrackEvaluationStats {
+    pub track_id: String,
+    pub best_score: f32,
+    pub average_score: f32,
+    pub average_useful_progress_speed: f32,
+    pub completion_rate: f32,
+    pub finish_counts: FinishReasonCounts,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChampionTrainingStats {
+    pub training_fitness: f32,
+    pub population_average_fitness: f32,
+    pub average_useful_progress_speed: f32,
+    pub completion_rate: f32,
+    pub finish_counts: FinishReasonCounts,
+    pub training_tracks: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ValidationStats {
     pub generation: usize,
     pub track_id: String,
     pub score: f32,
     pub normalized_progress: f32,
+    pub useful_progress_speed: f32,
     pub elapsed: f32,
     pub finish_reason: FinishReason,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompletedChampion {
+    pub generation: usize,
+    pub genome: Vec<f32>,
+    pub training: ChampionTrainingStats,
+    pub track_stats: Vec<TrackEvaluationStats>,
+    pub validation: ValidationStats,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -311,6 +447,9 @@ pub struct TrainingState {
     validation_track_ids: Vec<String>,
     selected_training_tracks: Vec<String>,
     training_score_sums: Vec<f32>,
+    training_useful_speed_sums: Vec<f32>,
+    individual_finish_counts: Vec<FinishReasonCounts>,
+    current_track_stats: Vec<TrackEvaluationStats>,
     completed_training_tracks: usize,
     phase: TrainingPhase,
     history: Vec<GenerationStats>,
@@ -318,8 +457,8 @@ pub struct TrainingState {
     pending_stats: Option<GenerationStats>,
     champion_genome: Option<Vec<f32>>,
     champion_population_index: Option<usize>,
-    finish_counts: FinishReasonCounts,
-    last_finish_counts: FinishReasonCounts,
+    pending_champion_training: Option<ChampionTrainingStats>,
+    completed_champion: Option<CompletedChampion>,
 }
 
 impl TrainingState {
@@ -364,6 +503,9 @@ impl TrainingState {
             validation_track_ids,
             selected_training_tracks: Vec::new(),
             training_score_sums: vec![0.0; population_size],
+            training_useful_speed_sums: vec![0.0; population_size],
+            individual_finish_counts: vec![FinishReasonCounts::default(); population_size],
+            current_track_stats: Vec::new(),
             completed_training_tracks: 0,
             phase: TrainingPhase::Evolving,
             history: Vec::new(),
@@ -371,8 +513,8 @@ impl TrainingState {
             pending_stats: None,
             champion_genome: None,
             champion_population_index: None,
-            finish_counts: FinishReasonCounts::default(),
-            last_finish_counts: FinishReasonCounts::default(),
+            pending_champion_training: None,
+            completed_champion: None,
         };
         state.start_generation();
         Ok(state)
@@ -391,9 +533,13 @@ impl TrainingState {
                 .truncate(count.min(self.selected_training_tracks.len()));
         }
         self.training_score_sums.fill(0.0);
+        self.training_useful_speed_sums.fill(0.0);
+        self.individual_finish_counts
+            .fill(FinishReasonCounts::default());
+        self.current_track_stats.clear();
         self.completed_training_tracks = 0;
-        self.finish_counts = FinishReasonCounts::default();
         self.pending_stats = None;
+        self.pending_champion_training = None;
         self.champion_population_index = None;
         self.phase = TrainingPhase::TrainingTrack {
             track_id: self.selected_training_tracks[0].clone(),
@@ -406,7 +552,12 @@ impl TrainingState {
         &mut self,
         results: &[EpisodeResult],
     ) -> Result<TrackAdvance, String> {
-        let TrainingPhase::TrainingTrack { index, total, .. } = self.phase else {
+        let TrainingPhase::TrainingTrack {
+            track_id,
+            index,
+            total,
+        } = self.phase.clone()
+        else {
             return Err("training results can only be recorded during a training track".into());
         };
         if results.len() != self.population.len() {
@@ -416,17 +567,32 @@ impl TrainingState {
                 results.len()
             ));
         }
-        for (individual_index, (sum, result)) in
-            self.training_score_sums.iter_mut().zip(results).enumerate()
-        {
-            if !result.score.is_finite() {
+        let mut track_counts = FinishReasonCounts::default();
+        let mut track_score_sum = 0.0;
+        let mut track_useful_speed_sum = 0.0;
+        let mut track_best_score = f32::NEG_INFINITY;
+        for (individual_index, result) in results.iter().enumerate() {
+            if !result.score.is_finite() || !result.useful_progress_speed.is_finite() {
                 return Err(format!(
-                    "episode score for individual {individual_index} is not finite"
+                    "episode metrics for individual {individual_index} are not finite"
                 ));
             }
-            *sum += result.score;
-            self.finish_counts.record(result.finish_reason);
+            self.training_score_sums[individual_index] += result.score;
+            self.training_useful_speed_sums[individual_index] += result.useful_progress_speed;
+            self.individual_finish_counts[individual_index].record(result.finish_reason);
+            track_counts.record(result.finish_reason);
+            track_score_sum += result.score;
+            track_useful_speed_sum += result.useful_progress_speed;
+            track_best_score = track_best_score.max(result.score);
         }
+        self.current_track_stats.push(TrackEvaluationStats {
+            track_id,
+            best_score: track_best_score,
+            average_score: track_score_sum / results.len() as f32,
+            average_useful_progress_speed: track_useful_speed_sum / results.len() as f32,
+            completion_rate: track_counts.completed as f32 / results.len() as f32,
+            finish_counts: track_counts,
+        });
         self.completed_training_tracks += 1;
 
         if index + 1 < total {
@@ -472,6 +638,18 @@ impl TrainingState {
         });
         self.champion_genome = Some(champion.genome().genes().to_vec());
         self.champion_population_index = Some(champion_population_index);
+        let champion_counts = self.individual_finish_counts[champion_population_index];
+        self.pending_champion_training = Some(ChampionTrainingStats {
+            training_fitness: best_fitness,
+            population_average_fitness: average_fitness,
+            average_useful_progress_speed: self.training_useful_speed_sums
+                [champion_population_index]
+                / self.completed_training_tracks as f32,
+            completion_rate: champion_counts.completed as f32
+                / self.completed_training_tracks as f32,
+            finish_counts: champion_counts,
+            training_tracks: self.selected_training_tracks.clone(),
+        });
 
         let validation_index = self
             .evaluation_rng
@@ -495,8 +673,25 @@ impl TrainingState {
             track_id: track_id.clone(),
             score: result.score,
             normalized_progress: result.normalized_progress,
+            useful_progress_speed: result.useful_progress_speed,
             elapsed: result.elapsed,
             finish_reason: result.finish_reason,
+        });
+        self.completed_champion = Some(CompletedChampion {
+            generation: self.population.generation(),
+            genome: self
+                .champion_genome
+                .clone()
+                .ok_or_else(|| "champion genome must exist before validation".to_string())?,
+            training: self.pending_champion_training.clone().ok_or_else(|| {
+                "champion training metrics must exist before validation".to_string()
+            })?,
+            track_stats: self.current_track_stats.clone(),
+            validation: self
+                .validation_history
+                .last()
+                .cloned()
+                .ok_or_else(|| "validation metrics were not recorded".to_string())?,
         });
         self.phase = TrainingPhase::Evolving;
         Ok(TrackAdvance::ReadyToEvolve)
@@ -514,7 +709,6 @@ impl TrainingState {
             .evolve(&self.genetic_config, &mut self.evolution_rng)?;
         self.population = next_population;
         self.history.push(stats);
-        self.last_finish_counts = self.finish_counts;
         self.start_generation();
         Ok(stats)
     }
@@ -551,6 +745,10 @@ impl TrainingState {
         self.champion_population_index
     }
 
+    pub fn completed_champion(&self) -> Option<&CompletedChampion> {
+        self.completed_champion.as_ref()
+    }
+
     #[cfg(test)]
     pub fn selected_training_tracks(&self) -> &[String] {
         &self.selected_training_tracks
@@ -571,10 +769,6 @@ impl TrainingState {
     pub fn current_training_fitness(&self) -> Option<GenerationStats> {
         self.pending_stats
     }
-
-    pub fn last_finish_counts(&self) -> FinishReasonCounts {
-        self.last_finish_counts
-    }
 }
 
 #[cfg(test)]
@@ -593,8 +787,6 @@ mod tests {
         EvaluationState {
             finish_reason: Some(reason),
             elapsed,
-            time_without_progress: 0.0,
-            last_significant_progress: initial_progress,
             initial_progress,
         }
     }
@@ -603,61 +795,197 @@ mod tests {
         EpisodeResult {
             score,
             normalized_progress: score.clamp(0.0, 1.0),
+            useful_progress_speed: score.max(0.0) * 10.0,
             normalized_progress_speed: 0.0,
             elapsed: 1.0,
-            finish_reason: FinishReason::Stalled,
+            finish_reason: FinishReason::EliminatedByLaser,
         }
+    }
+
+    fn measured_result(
+        score: f32,
+        useful_progress_speed: f32,
+        finish_reason: FinishReason,
+    ) -> EpisodeResult {
+        EpisodeResult {
+            score,
+            normalized_progress: score.clamp(0.0, 1.0),
+            useful_progress_speed,
+            normalized_progress_speed: normalize_useful_progress_speed(
+                useful_progress_speed,
+                120.0,
+            ),
+            elapsed: 2.0,
+            finish_reason,
+        }
+    }
+
+    #[test]
+    fn evaluation_defaults_use_laser_and_high_failsafe_timeout() {
+        let config = EvaluationConfig::default();
+        assert_eq!(config.maximum_episode_duration, 180.0);
+        assert_eq!(config.laser.grace_period, 3.0);
+        assert_eq!(config.laser.acceleration, 30.0);
+        assert_eq!(config.laser.maximum_speed, 130.0);
+        assert_eq!(config.progress_weight, 1.0);
+        assert_eq!(config.speed_weight, 0.40);
+        assert_eq!(config.collision_penalty, 0.08);
+        assert_eq!(config.completion_bonus, 0.45);
+        assert_eq!(config.progress_speed_half_saturation, 120.0);
     }
 
     #[test]
     fn collision_finishes_episode_immediately() {
         let mut state = EvaluationState::new(0.0);
         state.finish(FinishReason::Collision);
-        state.update(1.0, 10.0, 100.0, &EvaluationConfig::default());
+        state.update(
+            1.0,
+            10.0,
+            10.0,
+            100.0,
+            &LaserState::default(),
+            &EvaluationConfig::default(),
+        );
         assert_eq!(state.finish_reason, Some(FinishReason::Collision));
         assert_eq!(state.elapsed, 0.0);
     }
 
     #[test]
-    fn stall_and_timeout_terminate_episodes() {
+    fn emergency_timeout_still_terminates_an_episode() {
         let mut config = EvaluationConfig::default();
-        config.stall_timeout = 2.0;
-        config.maximum_episode_duration = 10.0;
-        let mut stalled = EvaluationState::new(0.0);
-        stalled.update(2.0, 0.0, 100.0, &config);
-        assert_eq!(stalled.finish_reason, Some(FinishReason::Stalled));
-
-        config.stall_timeout = 20.0;
         config.maximum_episode_duration = 1.0;
         let mut timed_out = EvaluationState::new(0.0);
-        timed_out.update(1.0, 0.0, 100.0, &config);
+        timed_out.update(1.0, 10.0, 10.0, 100.0, &LaserState::default(), &config);
         assert_eq!(timed_out.finish_reason, Some(FinishReason::Timeout));
     }
 
     #[test]
-    fn significant_progress_resets_stall_even_at_low_instantaneous_speed() {
-        let mut config = EvaluationConfig::default();
-        config.stall_timeout = 2.0;
-        config.significant_progress_epsilon = 1.0;
-        let mut state = EvaluationState::new(0.0);
-        state.update(1.5, 0.5, 100.0, &config);
-        assert_eq!(state.time_without_progress, 1.5);
-        state.update(0.6, 1.1, 100.0, &config);
-        assert_eq!(state.time_without_progress, 0.0);
-        assert!(!state.is_finished());
+    fn laser_grace_acceleration_cap_and_analytic_progress_are_correct() {
+        let config = LaserConfig::default();
+        let mut laser = LaserState::default();
+        laser.advance(3.0, 10_000.0, config);
+        assert_eq!(laser.speed, 0.0);
+        assert_eq!(laser.progress, 0.0);
+
+        laser.advance(2.0, 10_000.0, config);
+        assert_eq!(laser.speed, 60.0);
+        assert!((laser.progress - 60.0).abs() < 1.0e-5);
+
+        laser.advance(10.0, 10_000.0, config);
+        assert_eq!(laser.speed, 130.0);
+        let acceleration_time = 130.0 / 30.0;
+        let expected =
+            0.5 * 30.0 * acceleration_time * acceleration_time + 130.0 * (12.0 - acceleration_time);
+        assert!((laser.progress - expected).abs() < 1.0e-3);
+    }
+
+    #[test]
+    fn laser_uses_current_progress_and_can_catch_a_reversing_car() {
+        let config = EvaluationConfig::default();
+        let laser = LaserState {
+            elapsed: 10.0,
+            origin_progress: 16.0,
+            progress: 70.0,
+            speed: 130.0,
+        };
+        let mut ahead = EvaluationState::new(16.0);
+        ahead.update(0.1, 96.0, 96.0, 116.0, &laser, &config);
+        assert!(!ahead.is_finished());
+
+        let mut reversing = EvaluationState::new(16.0);
+        reversing.update(0.1, 76.0, 106.0, 116.0, &laser, &config);
+        assert_eq!(
+            reversing.finish_reason,
+            Some(FinishReason::EliminatedByLaser)
+        );
     }
 
     #[test]
     fn reaching_accumulated_lap_length_completes_episode() {
         let mut state = EvaluationState::new(16.0);
-        state.update(0.1, 100.0, 100.0, &EvaluationConfig::default());
+        state.update(
+            0.1,
+            50.0,
+            100.0,
+            100.0,
+            &LaserState {
+                elapsed: 10.0,
+                origin_progress: 16.0,
+                progress: 90.0,
+                speed: 130.0,
+            },
+            &EvaluationConfig::default(),
+        );
         assert_eq!(state.finish_reason, Some(FinishReason::Completed));
+    }
+
+    #[test]
+    fn asymptotic_useful_speed_normalization_has_half_saturation_and_no_finite_ceiling() {
+        let k = 120.0;
+        assert_eq!(normalize_useful_progress_speed(0.0, k), 0.0);
+        assert!((normalize_useful_progress_speed(k, k) - 0.5).abs() < 1.0e-6);
+        assert!((normalize_useful_progress_speed(2.0 * k, k) - 2.0 / 3.0).abs() < 1.0e-6);
+
+        let values = [60.0, 120.0, 200.0, 300.0, 600.0, f32::MAX]
+            .map(|speed| normalize_useful_progress_speed(speed, k));
+        assert!(values.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(values.iter().all(|value| *value < 1.0));
+        assert_eq!(normalize_useful_progress_speed(f32::INFINITY, k), 1.0);
+        assert_eq!(normalize_useful_progress_speed(f32::NEG_INFINITY, k), 0.0);
+        assert_eq!(normalize_useful_progress_speed(f32::NAN, k), 0.0);
+        for invalid_k in [0.0, -1.0, f32::INFINITY, f32::NAN] {
+            assert_eq!(normalize_useful_progress_speed(120.0, invalid_k), 0.0);
+        }
+    }
+
+    #[test]
+    fn finite_useful_speeds_above_120_remain_selectively_distinct() {
+        let config = EvaluationConfig::default();
+        let at_200 = episode_score(
+            &finished_state(FinishReason::Completed, 0.5),
+            100.0,
+            100.0,
+            &config,
+        );
+        let at_300 = episode_score(
+            &finished_state(FinishReason::Completed, 1.0 / 3.0),
+            100.0,
+            100.0,
+            &config,
+        );
+
+        assert!((at_200.useful_progress_speed - 200.0).abs() < 1.0e-3);
+        assert!((at_300.useful_progress_speed - 300.0).abs() < 1.0e-3);
+        assert!(at_300.score > at_200.score);
+        assert!(at_300.score < 1.85);
+    }
+
+    #[test]
+    fn laser_progress_is_relative_to_spawn_and_grace_still_protects_the_car() {
+        let config = EvaluationConfig::default();
+        let mut state = EvaluationState::new(16.0);
+        let during_grace = LaserState {
+            elapsed: config.laser.grace_period,
+            origin_progress: 16.0,
+            progress: 0.0,
+            speed: 0.0,
+        };
+        state.update(0.0, 16.0, 16.0, 100.0, &during_grace, &config);
+        assert!(!state.is_finished());
+
+        let after_grace = LaserState {
+            elapsed: config.laser.grace_period + 0.1,
+            ..during_grace
+        };
+        state.update(0.0, 16.0, 16.0, 100.0, &after_grace, &config);
+        assert_eq!(state.finish_reason, Some(FinishReason::EliminatedByLaser));
+        assert_eq!(after_grace.track_progress(), 16.0);
     }
 
     #[test]
     fn score_rewards_progress_and_useful_speed_and_penalizes_collision() {
         let config = EvaluationConfig::default();
-        let clean = finished_state(FinishReason::Stalled, 10.0);
+        let clean = finished_state(FinishReason::EliminatedByLaser, 10.0);
         let collision = finished_state(FinishReason::Collision, 10.0);
         assert!(
             episode_score(&clean, 60.0, 100.0, &config).score
@@ -670,7 +998,7 @@ mod tests {
         assert!(
             episode_score(&clean, 60.0, 100.0, &config).score
                 > episode_score(
-                    &finished_state(FinishReason::Stalled, 20.0),
+                    &finished_state(FinishReason::EliminatedByLaser, 20.0),
                     60.0,
                     100.0,
                     &config,
@@ -697,13 +1025,13 @@ mod tests {
     fn normalized_progress_uses_remaining_lap_from_episode_start() {
         let config = EvaluationConfig::default();
         let start = episode_score(
-            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            &finished_state_from(FinishReason::EliminatedByLaser, 10.0, 20.0),
             20.0,
             100.0,
             &config,
         );
         let halfway = episode_score(
-            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            &finished_state_from(FinishReason::EliminatedByLaser, 10.0, 20.0),
             60.0,
             100.0,
             &config,
@@ -748,13 +1076,13 @@ mod tests {
     fn normalized_progress_is_comparable_between_track_lengths() {
         let config = EvaluationConfig::default();
         let short = episode_score(
-            &finished_state_from(FinishReason::Stalled, 10.0, 20.0),
+            &finished_state_from(FinishReason::EliminatedByLaser, 10.0, 20.0),
             60.0,
             100.0,
             &config,
         );
         let long = episode_score(
-            &finished_state_from(FinishReason::Stalled, 20.0, 40.0),
+            &finished_state_from(FinishReason::EliminatedByLaser, 20.0, 40.0),
             120.0,
             200.0,
             &config,
@@ -765,13 +1093,16 @@ mod tests {
     #[test]
     fn invalid_evaluation_parameters_are_rejected() {
         let mut config = EvaluationConfig::default();
-        config.stall_timeout = 0.0;
+        config.laser.acceleration = 0.0;
         assert!(config.validate().is_err());
         config = EvaluationConfig::default();
         config.training_track_selection = TrainingTrackSelection::RandomSubset(0);
         assert!(config.validate().is_err());
         config = EvaluationConfig::default();
         config.completion_bonus = config.speed_weight;
+        assert!(config.validate().is_err());
+        config = EvaluationConfig::default();
+        config.progress_speed_half_saturation = f32::NAN;
         assert!(config.validate().is_err());
     }
 
@@ -820,6 +1151,60 @@ mod tests {
             .map(|item| item.fitness())
             .collect::<Vec<_>>();
         assert_eq!(fitness_before, fitness_after);
+    }
+
+    #[test]
+    fn track_and_champion_metrics_are_aggregated_from_the_winning_individual() {
+        let library = TrackLibrary::load_default().unwrap();
+        let config = EvaluationConfig {
+            training_track_selection: TrainingTrackSelection::RandomSubset(2),
+            ..EvaluationConfig::default()
+        };
+        let mut state = TrainingState::with_config(2, &library, config).unwrap();
+        let first_track = state.current_track_id().unwrap().to_string();
+        state
+            .record_training_results(&[
+                measured_result(1.0, 10.0, FinishReason::Completed),
+                measured_result(3.0, 30.0, FinishReason::Collision),
+            ])
+            .unwrap();
+        let second_track = state.current_track_id().unwrap().to_string();
+        state
+            .record_training_results(&[
+                measured_result(5.0, 50.0, FinishReason::Timeout),
+                measured_result(4.0, 40.0, FinishReason::Completed),
+            ])
+            .unwrap();
+        state
+            .record_validation_result(measured_result(0.5, 25.0, FinishReason::EliminatedByLaser))
+            .unwrap();
+
+        let completed = state.completed_champion().unwrap();
+        assert_eq!(completed.track_stats.len(), 2);
+        assert_eq!(completed.track_stats[0].track_id, first_track);
+        assert_eq!(completed.track_stats[0].best_score, 3.0);
+        assert_eq!(completed.track_stats[0].average_score, 2.0);
+        assert_eq!(completed.track_stats[0].average_useful_progress_speed, 20.0);
+        assert_eq!(completed.track_stats[0].completion_rate, 0.5);
+        assert_eq!(completed.track_stats[0].finish_counts.completed, 1);
+        assert_eq!(completed.track_stats[0].finish_counts.collision, 1);
+        assert_eq!(completed.track_stats[1].track_id, second_track);
+        assert_eq!(completed.track_stats[1].average_score, 4.5);
+        assert_eq!(completed.track_stats[1].average_useful_progress_speed, 45.0);
+
+        assert_eq!(state.champion_population_index(), Some(1));
+        assert_eq!(completed.training.training_fitness, 3.5);
+        assert_eq!(completed.training.population_average_fitness, 3.25);
+        assert_eq!(completed.training.average_useful_progress_speed, 35.0);
+        assert_eq!(completed.training.completion_rate, 0.5);
+        assert_eq!(completed.training.finish_counts.completed, 1);
+        assert_eq!(completed.training.finish_counts.collision, 1);
+        assert_eq!(completed.training.finish_counts.laser_eliminated, 0);
+        assert_eq!(completed.training.finish_counts.timeout, 0);
+        assert_eq!(
+            completed.training.training_tracks,
+            vec![first_track, second_track]
+        );
     }
 
     #[test]

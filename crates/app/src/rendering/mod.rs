@@ -4,8 +4,9 @@ use bevy::{
 };
 
 use crate::simulation::{
-    CAR_LENGTH, CAR_WIDTH, Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings,
-    SimulationMode, TestDriveEnvironment, TestDriveSettings, Track, TrackDebug,
+    CAR_LENGTH, CAR_WIDTH, Car, CarProgress, EvaluationState, FinishReason, KinematicCar,
+    LaserState, ManualCar, SelectedCar, SensorReadings, SimulationMode, TestDriveEnvironment,
+    TestDriveSettings, Track, TrackDebug, TrainingFastForward, TrainingState,
 };
 
 const WALL_THICKNESS: f32 = 14.0;
@@ -17,6 +18,8 @@ const EDGE_MARKER_INSET: f32 = 14.0;
 const OPEN_FIELD_HALF_SIZE: f32 = 3000.0;
 const OPEN_FIELD_GRID_SPACING: f32 = 100.0;
 const OPEN_FIELD_GRID_LINE_COUNT: i32 = 30;
+const NORMAL_CAR_TINT: Color = Color::srgb(1.0, 1.0, 1.0);
+const COLLIDED_CAR_TINT: Color = Color::srgb(0.3, 0.3, 0.3);
 // Car 06 was removed from the asset set. Car 03 takes its former slot in the
 // ten-car training population, while Car 12 remains Test Drive-only.
 const TRAINING_SPRITE_INDICES: [usize; 10] = [0, 1, 3, 4, 2, 5, 6, 7, 8, 9];
@@ -54,15 +57,18 @@ impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CarVisualSettings>()
             .add_systems(Startup, load_car_sprite_assets)
+            .add_systems(Update, apply_turbo_visibility)
             .add_systems(
                 Update,
                 (
                     rebuild_track_visuals,
                     decorate_new_cars,
                     update_manual_car_sprite,
+                    update_car_collision_tint,
                     draw_debug_visuals,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(rendering_enabled),
             );
     }
 }
@@ -103,6 +109,9 @@ impl Default for CarVisualSettings {
 struct CarVisual;
 
 #[derive(Component)]
+struct CarVisualized;
+
+#[derive(Component)]
 struct ManualCarVisual;
 
 fn load_car_sprite_assets(mut commands: Commands, asset_server: Res<AssetServer>) {
@@ -134,6 +143,7 @@ struct TrackVisualBuildData<'w, 's> {
     mode: Res<'w, SimulationMode>,
     test_drive: Res<'w, TestDriveSettings>,
     last_environment: Local<'s, Option<(SimulationMode, TestDriveEnvironment)>>,
+    last_track_id: Local<'s, Option<String>>,
 }
 
 fn rebuild_track_visuals(data: TrackVisualBuildData) {
@@ -146,12 +156,16 @@ fn rebuild_track_visuals(data: TrackVisualBuildData) {
         mode,
         test_drive,
         mut last_environment,
+        mut last_track_id,
     } = data;
     let current_environment = (*mode, test_drive.environment);
-    if !track.is_changed() && *last_environment == Some(current_environment) {
+    if *last_environment == Some(current_environment)
+        && last_track_id.as_deref() == Some(track.definition.id.as_str())
+    {
         return;
     }
     *last_environment = Some(current_environment);
+    *last_track_id = Some(track.definition.id.clone());
     for (entity, mesh, material) in &old_visuals {
         if let Some(mesh) = mesh {
             meshes.remove(mesh.0.id());
@@ -307,10 +321,12 @@ fn decorate_new_cars(
     mut commands: Commands,
     assets: Res<CarSpriteAssets>,
     settings: Res<CarVisualSettings>,
-    cars: Query<(Entity, &Car, Option<&ManualCar>), Added<Car>>,
+    cars: Query<(Entity, &Car, Option<&ManualCar>), Without<CarVisualized>>,
 ) {
     for (entity, car, manual) in &cars {
-        commands.entity(entity).insert(Visibility::default());
+        commands
+            .entity(entity)
+            .insert((Visibility::default(), CarVisualized));
         let image = if manual.is_some() {
             assets.sprite(settings.test_drive_sprite)
         } else {
@@ -336,6 +352,34 @@ fn decorate_new_cars(
     }
 }
 
+fn rendering_enabled(fast_forward: Res<TrainingFastForward>) -> bool {
+    !fast_forward.is_active()
+}
+
+fn apply_turbo_visibility(
+    fast_forward: Res<TrainingFastForward>,
+    mut previous: Local<Option<bool>>,
+    mut cars: Query<&mut Visibility, (With<Car>, Without<TrackVisual>)>,
+    mut track_visuals: Query<&mut Visibility, (With<TrackVisual>, Without<Car>)>,
+) {
+    let turbo = fast_forward.is_active();
+    if *previous == Some(turbo) {
+        return;
+    }
+    *previous = Some(turbo);
+    let visibility = if turbo {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    };
+    for mut current in &mut cars {
+        *current = visibility;
+    }
+    for mut current in &mut track_visuals {
+        *current = visibility;
+    }
+}
+
 fn update_manual_car_sprite(
     settings: Res<CarVisualSettings>,
     assets: Res<CarSpriteAssets>,
@@ -347,6 +391,28 @@ fn update_manual_car_sprite(
     let image = assets.sprite(settings.test_drive_sprite);
     for mut sprite in &mut visuals {
         sprite.image = image.clone();
+    }
+}
+
+fn car_tint(finish_reason: Option<FinishReason>) -> Color {
+    if finish_reason == Some(FinishReason::Collision) {
+        COLLIDED_CAR_TINT
+    } else {
+        NORMAL_CAR_TINT
+    }
+}
+
+fn update_car_collision_tint(
+    cars: Query<(&EvaluationState, &Children), Changed<EvaluationState>>,
+    mut visuals: Query<&mut Sprite, With<CarVisual>>,
+) {
+    for (evaluation, children) in &cars {
+        let tint = car_tint(evaluation.finish_reason);
+        for child in children.iter() {
+            if let Ok(mut sprite) = visuals.get_mut(child) {
+                sprite.color = tint;
+            }
+        }
     }
 }
 
@@ -397,6 +463,8 @@ fn assert_normalized_rgba_png(bytes: &[u8]) {
 fn draw_debug_visuals(
     mut gizmos: Gizmos,
     track: Res<Track>,
+    training: Res<TrainingState>,
+    laser: Res<LaserState>,
     debug: Res<TrackDebug>,
     car_visuals: Res<CarVisualSettings>,
     mode: Res<SimulationMode>,
@@ -434,6 +502,10 @@ fn draw_debug_visuals(
         }
     }
 
+    if *mode == SimulationMode::Training {
+        draw_laser(&mut gizmos, &track, &laser, &training);
+    }
+
     for (transform, state, sensors, progress) in &selected {
         let origin = transform.translation.truncate();
         if car_visuals.show_sensors {
@@ -456,6 +528,30 @@ fn draw_debug_visuals(
             gizmos.circle_2d(progress.projected_point, 5.0, Color::srgb(1.0, 0.2, 0.9));
         }
     }
+}
+
+fn draw_laser(gizmos: &mut Gizmos, track: &Track, laser: &LaserState, training: &TrainingState) {
+    let (center, tangent) = laser_visual_pose(track, laser);
+    let transverse = tangent.perp();
+    let half_width = track.width * 0.68;
+    let color = if laser.elapsed <= training.evaluation_config().laser.grace_period {
+        Color::srgba(1.0, 0.15, 0.55, 0.55)
+    } else {
+        Color::srgb(1.0, 0.05, 0.25)
+    };
+    for longitudinal_offset in [-2.0, 0.0, 2.0] {
+        let offset = tangent * longitudinal_offset;
+        gizmos.line_2d(
+            center - transverse * half_width + offset,
+            center + transverse * half_width + offset,
+            color,
+        );
+    }
+    gizmos.circle_2d(center, 5.0, Color::srgb(1.0, 0.85, 0.15));
+}
+
+fn laser_visual_pose(track: &Track, laser: &LaserState) -> (Vec2, Vec2) {
+    track.pose_at_distance(laser.track_progress())
 }
 
 fn draw_open_field_grid(gizmos: &mut Gizmos) {
@@ -671,6 +767,34 @@ mod car_sprite_tests {
         assert_eq!(settings.test_drive_sprite, 11);
         assert!(settings.show_hitbox);
         assert_eq!(physical_dimensions, (CAR_LENGTH, CAR_WIDTH));
+    }
+
+    #[test]
+    fn only_collision_finish_reason_darkens_car_sprite() {
+        assert_eq!(car_tint(Some(FinishReason::Collision)), COLLIDED_CAR_TINT);
+        assert_eq!(
+            car_tint(Some(FinishReason::EliminatedByLaser)),
+            NORMAL_CAR_TINT
+        );
+        assert_eq!(car_tint(Some(FinishReason::Completed)), NORMAL_CAR_TINT);
+        assert_eq!(car_tint(Some(FinishReason::Timeout)), NORMAL_CAR_TINT);
+        assert_eq!(car_tint(None), NORMAL_CAR_TINT);
+    }
+
+    #[test]
+    fn laser_visual_pose_adds_episode_origin_and_relative_progress() {
+        let library = crate::simulation::TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let laser = LaserState {
+            origin_progress: 16.0,
+            progress: 40.0,
+            ..default()
+        };
+
+        let actual = laser_visual_pose(&track, &laser);
+        let expected = track.pose_at_distance(56.0);
+        assert!(actual.0.distance(expected.0) < 1.0e-5);
+        assert!(actual.1.distance(expected.1) < 1.0e-5);
     }
 
     #[test]

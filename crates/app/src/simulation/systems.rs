@@ -1,17 +1,23 @@
-use std::f32::consts::{FRAC_PI_3, FRAC_PI_6};
+use std::{
+    f32::consts::{FRAC_PI_3, FRAC_PI_6},
+    time::Instant,
+};
 
 use avian2d::prelude::*;
-use bevy::prelude::*;
+use bevy::{app::FixedMain, prelude::*};
 use bevy_egui::input::EguiWantsInput;
 use neuroevolution::neural::Mlp;
 
 use crate::simulation::training::{
-    EvaluationState, FinishReason, TrackAdvance, TrainingPhase, TrainingState, episode_score,
+    EvaluationState, FinishReason, LaserState, TrackAdvance, TrainingPhase, TrainingState,
+    episode_score,
 };
 
 use super::{
-    CAR_LENGTH, CAR_WIDTH, ManualControlMode, PlaybackState, SimulationConfig, SimulationMode,
-    TestDriveEnvironment, TestDriveSettings, TrackLibrary, TrackSelection,
+    CAR_LENGTH, CAR_WIDTH, FAST_FORWARD_BATCH_BUDGET, ManualControlMode, PlaybackState,
+    SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, TrackLibrary,
+    TrackSelection, TrainingFastForward,
+    checkpoint::{CheckpointStore, LoadedNetwork},
     components::{
         Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings, SimulationLayer,
         TemporaryControlled, TrackWall,
@@ -38,6 +44,8 @@ pub enum SimulationSet {
     Progress,
     Leader,
     Evaluation,
+    Lifecycle,
+    FastForward,
 }
 
 type ReplaceableTrackEntities<'w, 's> = Query<'w, 's, Entity, Or<(With<Car>, With<TrackWall>)>>;
@@ -67,10 +75,12 @@ type ManualCars<'w, 's> = Query<
     With<ManualCar>,
 >;
 
-#[derive(Default)]
+#[derive(Resource, Default)]
 pub(super) struct SimulationLifecycleState {
     mode: Option<SimulationMode>,
     environment: TestDriveEnvironment,
+    loaded_checkpoint: Option<String>,
+    track_id: Option<String>,
 }
 
 pub fn apply_track_selection(
@@ -104,19 +114,28 @@ pub fn rebuild_simulation(
     mut commands: Commands,
     track: Res<Track>,
     training: Res<TrainingState>,
+    loaded_network: Res<LoadedNetwork>,
     mode: Res<SimulationMode>,
     test_drive: Res<TestDriveSettings>,
+    mut laser: ResMut<LaserState>,
     old_entities: ReplaceableTrackEntities,
-    mut lifecycle: Local<SimulationLifecycleState>,
+    mut lifecycle: ResMut<SimulationLifecycleState>,
 ) {
-    if !track.is_changed()
-        && lifecycle.mode == Some(*mode)
+    let loaded_checkpoint = loaded_network
+        .checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.source_filename.clone());
+    if lifecycle.mode == Some(*mode)
         && lifecycle.environment == test_drive.environment
+        && lifecycle.loaded_checkpoint == loaded_checkpoint
+        && lifecycle.track_id.as_deref() == Some(track.definition.id.as_str())
     {
         return;
     }
     lifecycle.mode = Some(*mode);
     lifecycle.environment = test_drive.environment;
+    lifecycle.loaded_checkpoint = loaded_checkpoint;
+    lifecycle.track_id = Some(track.definition.id.clone());
     for entity in &old_entities {
         commands.entity(entity).despawn();
     }
@@ -126,9 +145,12 @@ pub fn rebuild_simulation(
         spawn_track_colliders(&mut commands, &track);
     }
     if *mode == SimulationMode::TestDrive {
+        laser.reset();
         spawn_manual_car(&mut commands, &track, test_drive.environment);
     } else {
-        spawn_temporary_cars(&mut commands, &track, &training, *mode);
+        let start = canonical_population_start(&track);
+        laser.reset_at(start.progress.best_track_distance);
+        spawn_temporary_cars(&mut commands, &start, &training, &loaded_network, *mode);
     }
 }
 
@@ -150,20 +172,20 @@ fn spawn_track_colliders(commands: &mut Commands, track: &Track) {
 
 fn spawn_temporary_cars(
     commands: &mut Commands,
-    track: &Track,
+    start: &CanonicalPopulationStart,
     training: &TrainingState,
+    loaded_network: &LoadedNetwork,
     mode: SimulationMode,
 ) {
-    let start = canonical_population_start(track);
     match mode {
         SimulationMode::Training => match training.phase() {
             TrainingPhase::TrainingTrack { .. } => {
                 for (id, individual) in training.population().individuals().iter().enumerate() {
                     spawn_evaluated_car(
                         commands,
-                        training,
-                        &start,
+                        start,
                         id,
+                        training.architecture(),
                         individual.genome().genes(),
                         id == 0,
                     );
@@ -174,23 +196,32 @@ fn spawn_temporary_cars(
                     training.champion_population_index(),
                     training.champion_genome(),
                 ) {
-                    spawn_evaluated_car(commands, training, &start, id, genome, true);
+                    spawn_evaluated_car(commands, start, id, training.architecture(), genome, true);
                 }
             }
             TrainingPhase::Evolving => {}
         },
         SimulationMode::Champion => {
-            if let Some(genome) = training.champion_genome() {
-                spawn_evaluated_car(commands, training, &start, 0, genome, true);
+            if let Some(loaded) = &loaded_network.checkpoint {
+                spawn_evaluated_car(
+                    commands,
+                    start,
+                    0,
+                    &loaded.architecture,
+                    &loaded.saved.genome,
+                    true,
+                );
+            } else if let Some(genome) = training.champion_genome() {
+                spawn_evaluated_car(commands, start, 0, training.architecture(), genome, true);
             }
         }
         SimulationMode::Race => {
             for (id, individual) in training.population().individuals().iter().enumerate() {
                 spawn_evaluated_car(
                     commands,
-                    training,
-                    &start,
+                    start,
                     id,
+                    training.architecture(),
                     individual.genome().genes(),
                     id == 0,
                 );
@@ -202,13 +233,13 @@ fn spawn_temporary_cars(
 
 fn spawn_evaluated_car(
     commands: &mut Commands,
-    training: &TrainingState,
     start: &CanonicalPopulationStart,
     id: usize,
+    architecture: &neuroevolution::neural::Architecture,
     genome: &[f32],
     selected: bool,
 ) {
-    let mlp = Mlp::from_parameters(training.architecture(), genome).unwrap();
+    let mlp = Mlp::from_parameters(architecture, genome).unwrap();
     let controller = MlpController::new(mlp, genome).unwrap();
     let mut entity = commands.spawn((
         Car { id },
@@ -308,50 +339,102 @@ fn manual_spawn_state(
 pub fn sample_sensors(
     spatial_query: SpatialQuery,
     config: Res<SimulationConfig>,
+    fast_forward: Res<TrainingFastForward>,
     mut cars: Query<
         (
             &Transform,
             &KinematicCar,
             &mut SensorReadings,
             &mut CarObservation,
+            Has<SelectedCar>,
             Option<&EvaluationState>,
         ),
         With<Car>,
     >,
 ) {
     let filter = SpatialQueryFilter::from_mask([SimulationLayer::TrackWall]);
-    for (transform, state, mut sensors, mut observation, evaluation) in &mut cars {
-        if evaluation.is_some_and(EvaluationState::is_finished) {
-            continue;
-        }
-        let origin = transform.translation.truncate();
-        for (index, relative_angle) in SENSOR_ANGLES.iter().enumerate() {
-            let direction = Vec2::from_angle(state.heading + relative_angle);
-            let direction = Dir2::new(direction).expect("sensor direction is non-zero");
-            let hit_distance = spatial_query
-                .cast_ray(origin, direction, config.sensor_max_distance, true, &filter)
-                .map_or(config.sensor_max_distance, |hit| hit.distance);
-            sensors.normalized[index] = (hit_distance / config.sensor_max_distance).clamp(0.0, 1.0);
-            sensors.endpoints[index] = origin + direction.as_vec2() * hit_distance;
-        }
-        observation.sensors = sensors.normalized;
-        observation.normalized_speed =
-            normalize_speed(state.speed, config.speed_normalization_scale);
+    for (transform, state, mut sensors, mut observation, selected, evaluation) in &mut cars {
+        sample_car_sensors(
+            &spatial_query,
+            &config,
+            &filter,
+            transform,
+            state,
+            &mut sensors,
+            &mut observation,
+            selected && !fast_forward.is_active(),
+            evaluation,
+        );
     }
 }
 
-pub fn produce_temporary_controls(mut cars: TemporaryCars) {
-    for (observation, mut controller, mut controls, selected, evaluation) in &mut cars {
-        if evaluation.is_finished() {
-            *controls = CarControls::NEUTRAL;
-            continue;
-        }
-        *controls = if selected {
-            controller.control_with_telemetry(observation)
-        } else {
-            controller.control(observation)
-        };
+#[allow(clippy::too_many_arguments)]
+fn sample_car_sensors(
+    spatial_query: &SpatialQuery,
+    config: &SimulationConfig,
+    filter: &SpatialQueryFilter,
+    transform: &Transform,
+    state: &KinematicCar,
+    sensors: &mut SensorReadings,
+    observation: &mut CarObservation,
+    capture_visual_endpoints: bool,
+    evaluation: Option<&EvaluationState>,
+) {
+    if evaluation.is_some_and(EvaluationState::is_finished) {
+        return;
     }
+    let origin = transform.translation.truncate();
+    for (index, relative_angle) in SENSOR_ANGLES.iter().enumerate() {
+        let direction = Vec2::from_angle(state.heading + relative_angle);
+        let direction = Dir2::new(direction).expect("sensor direction is non-zero");
+        let hit_distance = spatial_query
+            .cast_ray(origin, direction, config.sensor_max_distance, true, filter)
+            .map_or(config.sensor_max_distance, |hit| hit.distance);
+        sensors.normalized[index] =
+            normalize_sensor_distance(hit_distance, config.sensor_max_distance);
+        if capture_visual_endpoints {
+            sensors.endpoints[index] = origin + direction.as_vec2() * hit_distance;
+        }
+    }
+    observation.sensors = sensors.normalized;
+    observation.normalized_speed = normalize_speed(state.speed, config.speed_normalization_scale);
+}
+
+fn normalize_sensor_distance(distance: f32, maximum_distance: f32) -> f32 {
+    if !distance.is_finite() || !maximum_distance.is_finite() || maximum_distance <= 0.0 {
+        return 0.0;
+    }
+    (distance / maximum_distance).clamp(0.0, 1.0)
+}
+
+pub fn produce_temporary_controls(fast_forward: Res<TrainingFastForward>, mut cars: TemporaryCars) {
+    for (observation, mut controller, mut controls, selected, evaluation) in &mut cars {
+        update_temporary_control(
+            observation,
+            &mut controller,
+            &mut controls,
+            selected && !fast_forward.is_active(),
+            evaluation,
+        );
+    }
+}
+
+fn update_temporary_control(
+    observation: &CarObservation,
+    controller: &mut MlpController,
+    controls: &mut CarControls,
+    capture_telemetry: bool,
+    evaluation: &EvaluationState,
+) {
+    if evaluation.is_finished() {
+        *controls = CarControls::NEUTRAL;
+        return;
+    }
+    *controls = if capture_telemetry {
+        controller.control_with_telemetry(observation)
+    } else {
+        controller.control(observation)
+    };
 }
 
 pub fn manual_controls_from_keys(
@@ -567,42 +650,67 @@ pub fn apply_vehicle_physics(
     let wall_filter = SpatialQueryFilter::from_mask([SimulationLayer::TrackWall]);
 
     for (mut transform, mut state, mut controls, mut evaluation) in &mut cars {
-        if evaluation
-            .as_ref()
-            .is_some_and(|evaluation| evaluation.is_finished())
-        {
+        apply_car_physics_tick(
+            &spatial_query,
+            &config,
+            &car_shape,
+            &wall_filter,
+            dt,
+            &mut transform,
+            &mut state,
+            &mut controls,
+            evaluation.as_deref_mut(),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_car_physics_tick(
+    spatial_query: &SpatialQuery,
+    config: &SimulationConfig,
+    car_shape: &Collider,
+    wall_filter: &SpatialQueryFilter,
+    dt: f32,
+    transform: &mut Transform,
+    state: &mut KinematicCar,
+    controls: &mut CarControls,
+    mut evaluation: Option<&mut EvaluationState>,
+) {
+    if evaluation
+        .as_ref()
+        .is_some_and(|evaluation| evaluation.is_finished())
+    {
+        *controls = CarControls::NEUTRAL;
+        state.speed = 0.0;
+        return;
+    }
+    let current = VehicleState {
+        position: transform.translation.truncate(),
+        heading: state.heading,
+        speed: state.speed,
+    };
+    let integrated = integrate_vehicle(current, *controls, config, dt);
+    let resolved = resolve_vehicle_motion(current, integrated, |position, heading| {
+        !spatial_query
+            .shape_intersections(car_shape, position, heading, wall_filter)
+            .is_empty()
+    });
+
+    if resolved.translation_collided {
+        if let Some(evaluation) = evaluation.as_deref_mut() {
+            evaluation.finish(FinishReason::Collision);
             *controls = CarControls::NEUTRAL;
             state.speed = 0.0;
-            continue;
-        }
-        let current = VehicleState {
-            position: transform.translation.truncate(),
-            heading: state.heading,
-            speed: state.speed,
-        };
-        let integrated = integrate_vehicle(current, *controls, &config, dt);
-        let resolved = resolve_vehicle_motion(current, integrated, |position, heading| {
-            !spatial_query
-                .shape_intersections(&car_shape, position, heading, &wall_filter)
-                .is_empty()
-        });
-
-        if resolved.translation_collided {
-            if let Some(evaluation) = evaluation.as_deref_mut() {
-                evaluation.finish(FinishReason::Collision);
-                *controls = CarControls::NEUTRAL;
-                state.speed = 0.0;
-            } else {
-                state.speed = -integrated.speed.abs().min(18.0) * 0.35;
-            }
         } else {
-            state.speed = integrated.speed;
+            state.speed = -integrated.speed.abs().min(18.0) * 0.35;
         }
-        transform.translation.x = resolved.state.position.x;
-        transform.translation.y = resolved.state.position.y;
-        state.heading = resolved.state.heading;
-        transform.rotation = Quat::from_rotation_z(state.heading);
+    } else {
+        state.speed = integrated.speed;
     }
+    transform.translation.x = resolved.state.position.x;
+    transform.translation.y = resolved.state.position.y;
+    state.heading = resolved.state.heading;
+    transform.rotation = Quat::from_rotation_z(state.heading);
 }
 
 pub fn update_track_progress(
@@ -611,29 +719,38 @@ pub fn update_track_progress(
     mut cars: Query<(&Transform, &mut CarProgress, Option<&EvaluationState>), With<Car>>,
 ) {
     for (transform, mut progress, evaluation) in &mut cars {
-        if evaluation.is_some_and(EvaluationState::is_finished) {
-            continue;
-        }
-        let position = transform.translation.truncate();
-        let projection = track.project_near(
-            position,
-            progress.nearest_segment,
-            config.progress_search_radius,
-        );
-        let delta = wrapped_distance_delta(
-            progress.centerline_distance,
-            projection.track_distance,
-            track.total_length,
-        );
-
-        progress.track_distance = (progress.track_distance + delta).clamp(0.0, track.total_length);
-        progress.best_track_distance = progress.best_track_distance.max(progress.track_distance);
-        progress.normalized_progress =
-            normalized_progress(progress.track_distance, track.total_length);
-        progress.nearest_segment = projection.segment_index;
-        progress.projected_point = projection.point;
-        progress.centerline_distance = projection.track_distance;
+        update_car_track_progress(&track, &config, transform, &mut progress, evaluation);
     }
+}
+
+fn update_car_track_progress(
+    track: &Track,
+    config: &SimulationConfig,
+    transform: &Transform,
+    progress: &mut CarProgress,
+    evaluation: Option<&EvaluationState>,
+) {
+    if evaluation.is_some_and(EvaluationState::is_finished) {
+        return;
+    }
+    let position = transform.translation.truncate();
+    let projection = track.project_near(
+        position,
+        progress.nearest_segment,
+        config.progress_search_radius,
+    );
+    let delta = wrapped_distance_delta(
+        progress.centerline_distance,
+        projection.track_distance,
+        track.total_length,
+    );
+
+    progress.track_distance = (progress.track_distance + delta).clamp(0.0, track.total_length);
+    progress.best_track_distance = progress.best_track_distance.max(progress.track_distance);
+    progress.normalized_progress = normalized_progress(progress.track_distance, track.total_length);
+    progress.nearest_segment = projection.segment_index;
+    progress.projected_point = projection.point;
+    progress.centerline_distance = projection.track_distance;
 }
 
 pub fn select_current_leader(
@@ -677,30 +794,38 @@ pub fn select_current_leader(
 pub fn finish_generation_evaluation(
     time: Res<Time<Fixed>>,
     mut training: ResMut<TrainingState>,
+    mut laser: ResMut<LaserState>,
     mut cars: Query<(Entity, &Car, &CarProgress, &mut EvaluationState), With<TemporaryControlled>>,
     mut commands: Commands,
     mut track: ResMut<Track>,
     library: Res<TrackLibrary>,
     mut selection: ResMut<TrackSelection>,
     mode: Res<SimulationMode>,
+    simulation_config: Res<SimulationConfig>,
+    mut checkpoints: ResMut<CheckpointStore>,
 ) {
     if *mode != SimulationMode::Training {
         return;
     }
     let evaluation_config = training.evaluation_config().clone();
     let delta_seconds = time.delta_secs();
+    if cars.is_empty() {
+        return;
+    }
+    laser.advance(delta_seconds, track.total_length, evaluation_config.laser);
     for (_, _, progress, mut evaluation) in &mut cars {
         evaluation.update(
             delta_seconds,
+            progress.track_distance,
             progress.best_track_distance,
             track.total_length,
+            &laser,
             &evaluation_config,
         );
     }
-    if cars.is_empty()
-        || cars
-            .iter()
-            .any(|(_, _, _, evaluation)| !evaluation.is_finished())
+    if cars
+        .iter()
+        .any(|(_, _, _, evaluation)| !evaluation.is_finished())
     {
         return;
     }
@@ -743,27 +868,22 @@ pub fn finish_generation_evaluation(
     let next_track_id = match advance {
         TrackAdvance::Training(track_id) | TrackAdvance::Validation(track_id) => track_id,
         TrackAdvance::ReadyToEvolve => {
-            let validation = training
-                .latest_validation()
+            let report = training
+                .completed_champion()
                 .cloned()
                 .expect("validation was just recorded");
-            let stats = training
+            let checkpoint = match checkpoints.auto_save_if_due(&training, &simulation_config) {
+                Ok(path) => path,
+                Err(error) => {
+                    checkpoints.status = format!("Auto-save failed: {error}");
+                    eprintln!("{}", checkpoints.status);
+                    None
+                }
+            };
+            training
                 .evolve_generation()
                 .expect("failed to evolve population");
-            let counts = training.last_finish_counts();
-            println!(
-                "Generation {} | Training fitness: best={:.5} average={:.5} | Validation: track={} score={:.5} reason={} | Finish reasons: completed={} collision={} stalled={} timeout={}",
-                stats.generation,
-                stats.best_fitness,
-                stats.average_fitness,
-                validation.track_id,
-                validation.score,
-                validation.finish_reason.label(),
-                counts.completed,
-                counts.collision,
-                counts.stalled,
-                counts.timeout,
-            );
+            log_generation_report(&report, checkpoint.as_deref());
             training
                 .current_track_id()
                 .expect("new generation starts on a training track")
@@ -774,9 +894,48 @@ pub fn finish_generation_evaluation(
         .definition(&next_track_id)
         .unwrap_or_else(|| panic!("training requested missing track {next_track_id:?}"));
     *track = Track::from_definition(definition).expect("configured track should build");
+    laser.reset();
     selection.active_id = next_track_id;
     selection.requested_id = None;
     selection.status = format!("Training cycle loaded {}", definition.name);
+}
+
+fn log_generation_report(
+    report: &crate::simulation::training::CompletedChampion,
+    checkpoint: Option<&std::path::Path>,
+) {
+    println!("Generation {}", report.generation);
+    println!("Training tracks:");
+    for track in &report.track_stats {
+        println!(
+            "  {}: best={:.5} avg={:.5} | avg useful speed={:.2}u/s | completion={:.1}% | completed={} collision={} laser={} timeout={}",
+            track.track_id,
+            track.best_score,
+            track.average_score,
+            track.average_useful_progress_speed,
+            track.completion_rate * 100.0,
+            track.finish_counts.completed,
+            track.finish_counts.collision,
+            track.finish_counts.laser_eliminated,
+            track.finish_counts.timeout,
+        );
+    }
+    println!(
+        "Training fitness: best={:.5} average={:.5}",
+        report.training.training_fitness, report.training.population_average_fitness
+    );
+    println!(
+        "Validation: track={} score={:.5} progress={:.1}% useful speed={:.2}u/s elapsed={:.2}s reason={}",
+        report.validation.track_id,
+        report.validation.score,
+        report.validation.normalized_progress * 100.0,
+        report.validation.useful_progress_speed,
+        report.validation.elapsed,
+        report.validation.finish_reason.label(),
+    );
+    if let Some(path) = checkpoint {
+        println!("Checkpoint: saved {}", path.display());
+    }
 }
 
 pub fn handle_test_drive_input(
@@ -830,8 +989,12 @@ pub fn toggle_pause_from_keyboard(
     egui_input: Res<EguiWantsInput>,
     mut playback: ResMut<PlaybackState>,
     mut virtual_time: ResMut<Time<Virtual>>,
+    fast_forward: Res<TrainingFastForward>,
 ) {
-    if !egui_input.wants_any_keyboard_input() && keyboard.just_pressed(KeyCode::Space) {
+    if !fast_forward.is_active()
+        && !egui_input.wants_any_keyboard_input()
+        && keyboard.just_pressed(KeyCode::Space)
+    {
         playback.paused = !playback.paused;
         if playback.paused {
             virtual_time.pause();
@@ -839,6 +1002,63 @@ pub fn toggle_pause_from_keyboard(
             virtual_time.unpause();
         }
     }
+}
+
+pub fn update_training_fast_forward(
+    training: Res<TrainingState>,
+    mode: Res<SimulationMode>,
+    mut fast_forward: ResMut<TrainingFastForward>,
+    mut playback: ResMut<PlaybackState>,
+    mut virtual_time: ResMut<Time<Virtual>>,
+) {
+    let restore = if *mode == SimulationMode::Training {
+        fast_forward.finish_if_reached(training.generation())
+    } else {
+        fast_forward.cancel()
+    };
+    let Some(restore) = restore else {
+        return;
+    };
+    playback.speed = restore.speed;
+    playback.paused = false;
+    virtual_time.set_relative_speed(restore.speed);
+    virtual_time.set_max_delta(restore.max_delta);
+    virtual_time.unpause();
+}
+
+/// Runs the canonical `FixedMain` schedule repeatedly for a wall-clock budget.
+/// Each iteration advances `Time<Fixed>` by exactly one configured timestep;
+/// the schedule itself (including physics, evaluation, validation, autosave,
+/// evolution, and lifecycle rebuild) is unchanged.
+pub fn run_training_fast_forward_batch(world: &mut World) {
+    let active = world.resource::<TrainingFastForward>().is_active()
+        && *world.resource::<SimulationMode>() == SimulationMode::Training;
+    if !active {
+        return;
+    }
+
+    let started = Instant::now();
+    let timestep = world.resource::<Time<Fixed>>().timestep();
+    let _ = world.try_schedule_scope(FixedMain, |world, schedule| {
+        let mut ticks = 0_u32;
+        loop {
+            if !world.resource::<TrainingFastForward>().is_active() {
+                break;
+            }
+            if ticks.is_multiple_of(16) && started.elapsed() >= FAST_FORWARD_BATCH_BUDGET {
+                break;
+            }
+
+            world.resource_mut::<Time<Fixed>>().advance_by(timestep);
+            *world.resource_mut::<Time>() = world.resource::<Time<Fixed>>().as_generic();
+            world
+                .resource_mut::<TrainingFastForward>()
+                .record_fixed_tick();
+            schedule.run(world);
+            ticks += 1;
+        }
+    });
+    *world.resource_mut::<Time>() = world.resource::<Time<Virtual>>().as_generic();
 }
 
 #[cfg(test)]
@@ -853,6 +1073,89 @@ mod tests {
             crate::simulation::training::EvaluationConfig::default(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn five_sensors_use_the_1000_unit_default_range_and_clamp_normalization() {
+        let config = SimulationConfig::default();
+        assert_eq!(SENSOR_ANGLES.len(), 5);
+        assert_eq!(config.sensor_max_distance, 1000.0);
+        assert_eq!(normalize_sensor_distance(1000.0, 1000.0), 1.0);
+        assert_eq!(normalize_sensor_distance(1250.0, 1000.0), 1.0);
+        assert_eq!(normalize_sensor_distance(500.0, 1000.0), 0.5);
+        assert_eq!(SensorReadings::default().normalized.len(), 5);
+    }
+
+    #[test]
+    fn reaching_target_restores_speed_without_pausing_or_changing_fixed_timestep() {
+        use crate::simulation::training::{EpisodeResult, TrackAdvance};
+
+        let library = TrackLibrary::load_default().unwrap();
+        let mut config = crate::simulation::training::EvaluationConfig::default();
+        config.training_track_selection =
+            crate::simulation::training::TrainingTrackSelection::RandomSubset(1);
+        let mut training = TrainingState::with_config(1, &library, config).unwrap();
+        let result = EpisodeResult {
+            score: 0.5,
+            normalized_progress: 0.5,
+            useful_progress_speed: 60.0,
+            normalized_progress_speed: 0.5,
+            elapsed: 5.0,
+            finish_reason: FinishReason::EliminatedByLaser,
+        };
+        assert!(matches!(
+            training.record_training_results(&[result]).unwrap(),
+            TrackAdvance::Validation(_)
+        ));
+        training.record_validation_result(result).unwrap();
+        training.evolve_generation().unwrap();
+        assert_eq!(training.generation(), 1);
+
+        let previous_max_delta = std::time::Duration::from_millis(250);
+        let mut fast_forward = TrainingFastForward::default();
+        assert!(fast_forward.start(1, 0, 25.0, previous_max_delta));
+        let fixed_time = Time::<Fixed>::from_hz(60.0);
+        let fixed_timestep = fixed_time.timestep();
+        let mut virtual_time = Time::<Virtual>::default();
+        virtual_time.set_relative_speed(60.0);
+        virtual_time.set_max_delta(std::time::Duration::from_nanos(16_666_667));
+
+        let mut app = App::new();
+        app.insert_resource(training)
+            .insert_resource(SimulationMode::Training)
+            .insert_resource(PlaybackState {
+                paused: false,
+                speed: 25.0,
+            })
+            .insert_resource(fast_forward)
+            .insert_resource(fixed_time)
+            .insert_resource(virtual_time)
+            .add_systems(Update, update_training_fast_forward);
+        app.world_mut().run_schedule(Update);
+
+        assert!(!app.world().resource::<TrainingFastForward>().is_active());
+        assert!(!app.world().resource::<PlaybackState>().paused);
+        assert_eq!(app.world().resource::<PlaybackState>().speed, 25.0);
+        assert_eq!(
+            app.world().resource::<Time<Virtual>>().relative_speed(),
+            25.0
+        );
+        assert_eq!(
+            app.world().resource::<Time<Virtual>>().max_delta(),
+            previous_max_delta
+        );
+        assert_eq!(
+            app.world().resource::<Time<Fixed>>().timestep(),
+            fixed_timestep
+        );
+        assert_eq!(
+            app.world().resource::<Time<Fixed>>().overstep(),
+            std::time::Duration::ZERO
+        );
+        assert!(matches!(
+            app.world().resource::<TrainingState>().phase(),
+            TrainingPhase::TrainingTrack { .. }
+        ));
     }
 
     #[test]
@@ -892,12 +1195,15 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(track)
             .insert_resource(training_state(6))
+            .init_resource::<LoadedNetwork>()
             .insert_resource(SimulationConfig {
                 population_size: 6,
                 ..default()
             })
             .insert_resource(SimulationMode::Training)
             .insert_resource(TestDriveSettings::default())
+            .init_resource::<LaserState>()
+            .init_resource::<SimulationLifecycleState>()
             .add_systems(Update, rebuild_simulation);
         app.update();
 
@@ -911,8 +1217,11 @@ mod tests {
             &CarControls,
             &CarObservation,
             &CarProgress,
+            &EvaluationState,
         )>();
-        for (car, transform, state, controls, observation, progress) in cars.iter(app.world()) {
+        for (car, transform, state, controls, observation, progress, evaluation) in
+            cars.iter(app.world())
+        {
             ids.push(car.id);
             assert_eq!(transform.translation.truncate(), expected.position);
             assert_eq!(transform.rotation, Quat::from_rotation_z(expected.heading));
@@ -937,9 +1246,13 @@ mod tests {
                 expected.progress.centerline_distance
             );
             assert!((0.0..=track_length).contains(&progress.track_distance));
+            assert_eq!(progress.track_distance - evaluation.initial_progress, 0.0);
         }
         ids.sort_unstable();
         assert_eq!(ids, (0..6).collect::<Vec<_>>());
+        let laser = app.world().resource::<LaserState>();
+        assert_eq!(laser.progress, 0.0);
+        assert_eq!(laser.origin_progress, expected.progress.track_distance);
     }
 
     #[test]
@@ -951,7 +1264,7 @@ mod tests {
         {
             assert!((actual - expected).abs() < 1.0e-4);
         }
-        assert_eq!(SimulationConfig::default().sensor_max_distance, 750.0);
+        assert_eq!(SimulationConfig::default().sensor_max_distance, 1000.0);
     }
 
     #[test]
@@ -969,6 +1282,7 @@ mod tests {
         app.insert_resource(library)
             .insert_resource(initial)
             .insert_resource(training_state(3))
+            .init_resource::<LoadedNetwork>()
             .insert_resource(selection)
             .insert_resource(SimulationMode::Race)
             .insert_resource(TestDriveSettings::default())
@@ -976,6 +1290,8 @@ mod tests {
                 population_size: 3,
                 ..default()
             })
+            .init_resource::<LaserState>()
+            .init_resource::<SimulationLifecycleState>()
             .add_systems(Update, (apply_track_selection, rebuild_simulation).chain());
         app.update();
 
@@ -1023,6 +1339,117 @@ mod tests {
                 .count(),
             spa_samples * 2
         );
+        let episode_origin = app
+            .world_mut()
+            .query::<&EvaluationState>()
+            .iter(app.world())
+            .next()
+            .unwrap()
+            .initial_progress;
+        let laser = app.world().resource::<LaserState>();
+        assert_eq!(laser.origin_progress, episode_origin);
+        assert_eq!(laser.progress, 0.0);
+    }
+
+    #[derive(Resource, Debug, PartialEq)]
+    struct FakeFastForwardCycle {
+        ticks: usize,
+        generation: usize,
+        validations: usize,
+        autosaves: usize,
+        population: Vec<u32>,
+    }
+
+    fn advance_fake_fast_forward_cycle(
+        mut cycle: ResMut<FakeFastForwardCycle>,
+        mut fast_forward: ResMut<TrainingFastForward>,
+    ) {
+        cycle.ticks += 1;
+        if cycle.ticks.is_multiple_of(2) {
+            cycle.generation += 1;
+            cycle.validations += 1;
+            if cycle.generation.is_multiple_of(2) {
+                cycle.autosaves += 1;
+            }
+            fast_forward.finish_if_reached(cycle.generation);
+        }
+    }
+
+    fn cancel_fake_cycle_mid_episode(
+        mut cycle: ResMut<FakeFastForwardCycle>,
+        mut fast_forward: ResMut<TrainingFastForward>,
+    ) {
+        cycle.ticks += 1;
+        if cycle.ticks.is_multiple_of(2) {
+            cycle.generation += 1;
+            cycle.validations += 1;
+        }
+        if cycle.ticks == 3 {
+            fast_forward.cancel();
+        }
+    }
+
+    #[test]
+    fn turbo_batch_runs_exact_fixed_ticks_without_skipping_generation_lifecycle() {
+        let mut fast_forward = TrainingFastForward::default();
+        assert!(fast_forward.start(3, 0, 25.0, std::time::Duration::from_millis(250)));
+        let population = vec![11, 22, 33];
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Time::<Fixed>::from_hz(60.0))
+            .insert_resource(SimulationMode::Training)
+            .insert_resource(fast_forward)
+            .insert_resource(FakeFastForwardCycle {
+                ticks: 0,
+                generation: 0,
+                validations: 0,
+                autosaves: 0,
+                population: population.clone(),
+            })
+            .add_systems(FixedUpdate, advance_fake_fast_forward_cycle);
+        app.world_mut().resource_mut::<Time<Virtual>>().pause();
+
+        run_training_fast_forward_batch(app.world_mut());
+
+        let cycle = app.world().resource::<FakeFastForwardCycle>();
+        assert_eq!(cycle.generation, 3);
+        assert_eq!(cycle.ticks, 6);
+        assert_eq!(cycle.validations, 3);
+        assert_eq!(cycle.autosaves, 1);
+        assert_eq!(cycle.population, population);
+        assert!(!app.world().resource::<TrainingFastForward>().is_active());
+        assert_eq!(
+            app.world().resource::<Time<Fixed>>().timestep(),
+            std::time::Duration::from_secs_f64(1.0 / 60.0)
+        );
+    }
+
+    #[test]
+    fn cancelling_turbo_keeps_the_partial_episode_and_population_intact() {
+        let mut fast_forward = TrainingFastForward::default();
+        assert!(fast_forward.start(100, 0, 10.0, std::time::Duration::from_millis(250)));
+        let population = vec![7, 8, 9];
+        let mut app = App::new();
+        app.add_plugins(MinimalPlugins)
+            .insert_resource(Time::<Fixed>::from_hz(60.0))
+            .insert_resource(SimulationMode::Training)
+            .insert_resource(fast_forward)
+            .insert_resource(FakeFastForwardCycle {
+                ticks: 0,
+                generation: 0,
+                validations: 0,
+                autosaves: 0,
+                population: population.clone(),
+            })
+            .add_systems(FixedUpdate, cancel_fake_cycle_mid_episode);
+
+        run_training_fast_forward_batch(app.world_mut());
+
+        let cycle = app.world().resource::<FakeFastForwardCycle>();
+        assert_eq!(cycle.ticks, 3);
+        assert_eq!(cycle.generation, 1);
+        assert_eq!(cycle.population, population);
+        assert!(!app.world().resource::<TrainingFastForward>().is_active());
     }
 
     #[test]
@@ -1317,9 +1744,12 @@ mod tests {
         let mut app = App::new();
         app.insert_resource(track)
             .insert_resource(training_state(1))
+            .init_resource::<LoadedNetwork>()
             .insert_resource(SimulationConfig::default())
             .insert_resource(SimulationMode::TestDrive)
             .insert_resource(TestDriveSettings::default())
+            .init_resource::<LaserState>()
+            .init_resource::<SimulationLifecycleState>()
             .add_systems(Update, rebuild_simulation);
         app.update();
 
@@ -1377,15 +1807,11 @@ mod tests {
         let first_evaluation = EvaluationState {
             finish_reason: Some(FinishReason::Collision),
             elapsed: 1.0,
-            time_without_progress: 0.0,
-            last_significant_progress: 42.0,
             initial_progress: 0.0,
         };
         let second_evaluation = EvaluationState {
-            finish_reason: Some(FinishReason::Stalled),
+            finish_reason: Some(FinishReason::EliminatedByLaser),
             elapsed: 1.0,
-            time_without_progress: 1.0,
-            last_significant_progress: 73.0,
             initial_progress: 0.0,
         };
 
@@ -1395,6 +1821,14 @@ mod tests {
             .insert_resource(track)
             .insert_resource(selection)
             .insert_resource(SimulationMode::Training)
+            .insert_resource(SimulationConfig::default())
+            .insert_resource(LaserState {
+                elapsed: 12.0,
+                origin_progress: 0.0,
+                progress: 500.0,
+                speed: 130.0,
+            })
+            .init_resource::<CheckpointStore>()
             .insert_resource(Time::<Fixed>::from_seconds(0.5))
             .add_systems(FixedUpdate, finish_generation_evaluation);
         app.world_mut().spawn((
@@ -1428,5 +1862,63 @@ mod tests {
             training.phase(),
             TrainingPhase::TrainingTrack { index: 1, .. }
         ));
+        assert_eq!(*app.world().resource::<LaserState>(), LaserState::default());
+    }
+
+    #[test]
+    fn laser_resets_when_training_advances_to_validation() {
+        let library = TrackLibrary::load_default().unwrap();
+        let mut evaluation_config = crate::simulation::training::EvaluationConfig::default();
+        evaluation_config.training_track_selection =
+            crate::simulation::training::TrainingTrackSelection::RandomSubset(1);
+        let training = TrainingState::with_config(1, &library, evaluation_config).unwrap();
+        let initial_track_id = training.current_track_id().unwrap().to_string();
+        let track = Track::from_definition(library.definition(&initial_track_id).unwrap()).unwrap();
+        let track_length = track.total_length;
+        let selection = TrackSelection {
+            active_id: initial_track_id,
+            status: String::new(),
+            requested_id: None,
+        };
+
+        let mut app = App::new();
+        app.insert_resource(training)
+            .insert_resource(library)
+            .insert_resource(track)
+            .insert_resource(selection)
+            .insert_resource(SimulationMode::Training)
+            .insert_resource(SimulationConfig::default())
+            .insert_resource(LaserState {
+                elapsed: 8.0,
+                origin_progress: 0.0,
+                progress: 250.0,
+                speed: 130.0,
+            })
+            .init_resource::<CheckpointStore>()
+            .insert_resource(Time::<Fixed>::from_seconds(0.5))
+            .add_systems(FixedUpdate, finish_generation_evaluation);
+        let mut progress = CarProgress::new(0.0, track_length, 0, Vec2::ZERO);
+        progress.best_track_distance = 80.0;
+        app.world_mut().spawn((
+            Car { id: 0 },
+            progress,
+            EvaluationState {
+                finish_reason: Some(FinishReason::EliminatedByLaser),
+                elapsed: 2.0,
+                initial_progress: 0.0,
+            },
+            TemporaryControlled,
+        ));
+
+        app.world_mut()
+            .resource_mut::<Time<Fixed>>()
+            .advance_by(std::time::Duration::from_secs_f32(0.5));
+        app.world_mut().run_schedule(FixedUpdate);
+
+        assert!(matches!(
+            app.world().resource::<TrainingState>().phase(),
+            TrainingPhase::Validation { .. }
+        ));
+        assert_eq!(*app.world().resource::<LaserState>(), LaserState::default());
     }
 }
