@@ -14,9 +14,11 @@ pub use controller::{CarControls, CarObservation};
 pub use fast_forward::{FAST_FORWARD_BATCH_BUDGET, TrainingFastForward};
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
 pub use track::{Track, TrackBounds, TrackLibrary};
+pub use training::{SavedGeneticConfig, TrainingCheckpoint, racing_architecture};
 
 use bevy::{prelude::*, time::Fixed};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use systems::{
     SimulationSet, apply_track_selection, apply_vehicle_physics, finish_generation_evaluation,
     handle_test_drive_input, produce_manual_controls, produce_temporary_controls,
@@ -27,8 +29,12 @@ use systems::{
 
 pub(crate) use checkpoint::{CheckpointStore, LoadedNetwork};
 pub(crate) use training::{
-    EvaluationState, FinishReason, GenerationStats, LaserState, TrainingPhase, TrainingState,
+    CompletedChampion, EvaluationConfig, EvaluationState, FinishReason, FinishReasonCounts,
+    GenerationStats, LaserState, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_RNG_ID,
+    TrainingPhase, TrainingState,
 };
+#[cfg(test)]
+pub(crate) use training::{EpisodeResult, TrackAdvance};
 
 #[derive(Resource, Clone, Debug)]
 pub struct TrackSelection {
@@ -49,7 +55,7 @@ impl TrackSelection {
 pub const CAR_LENGTH: f32 = 28.0;
 pub const CAR_WIDTH: f32 = 15.0;
 
-#[derive(Resource, Clone, Debug, Serialize, Deserialize)]
+#[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationConfig {
     pub population_size: usize,
     pub sensor_max_distance: f32,
@@ -137,19 +143,70 @@ impl Default for PlaybackState {
     }
 }
 
-pub struct SimulationPlugin;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Interactive,
+    HeadlessWorker,
+}
+
+#[derive(Clone, Debug)]
+pub struct TrainingSetup {
+    pub population_size: usize,
+    pub architecture: Vec<usize>,
+    pub seed: u64,
+    pub evaluation_config: training::EvaluationConfig,
+    pub checkpoint_directory: PathBuf,
+    pub resume_checkpoint: Option<training::TrainingCheckpoint>,
+}
+
+pub struct SimulationPlugin {
+    runtime_mode: RuntimeMode,
+    setup: TrainingSetup,
+}
+
+impl SimulationPlugin {
+    pub fn interactive() -> Self {
+        let config = SimulationConfig::default();
+        Self {
+            runtime_mode: RuntimeMode::Interactive,
+            setup: TrainingSetup {
+                population_size: config.population_size,
+                architecture: vec![6, 8, 2],
+                seed: neuroevolution::genetic::Config::default().seed,
+                evaluation_config: training::EvaluationConfig::default(),
+                checkpoint_directory: checkpoint::DEFAULT_CHECKPOINT_DIRECTORY.into(),
+                resume_checkpoint: None,
+            },
+        }
+    }
+
+    pub fn headless(setup: TrainingSetup) -> Self {
+        Self {
+            runtime_mode: RuntimeMode::HeadlessWorker,
+            setup,
+        }
+    }
+}
 
 impl Plugin for SimulationPlugin {
     fn build(&self, app: &mut App) {
         let library = TrackLibrary::load_default()
             .unwrap_or_else(|error| panic!("failed to load track library: {error}"));
         let available_track_count = library.all_tracks().count();
-        let simulation_config = SimulationConfig::default();
-        let training_state = TrainingState::with_config(
-            simulation_config.population_size,
-            &library,
-            training::EvaluationConfig::default(),
-        )
+        let simulation_config = SimulationConfig {
+            population_size: self.setup.population_size,
+            ..SimulationConfig::default()
+        };
+        let training_state = match self.setup.resume_checkpoint.clone() {
+            Some(checkpoint) => TrainingState::from_training_checkpoint(checkpoint, &library),
+            None => TrainingState::with_architecture(
+                self.setup.population_size,
+                &library,
+                self.setup.evaluation_config.clone(),
+                self.setup.architecture.clone(),
+                self.setup.seed,
+            ),
+        }
         .expect("failed to create training state");
         let initial_track_id = training_state
             .current_track_id()
@@ -169,7 +226,9 @@ impl Plugin for SimulationPlugin {
         };
         app.insert_resource(simulation_config)
             .insert_resource(training_state)
-            .init_resource::<CheckpointStore>()
+            .insert_resource(CheckpointStore::new(
+                self.setup.checkpoint_directory.clone(),
+            ))
             .init_resource::<LoadedNetwork>()
             .init_resource::<SimulationMode>()
             .init_resource::<PlaybackState>()
@@ -177,7 +236,6 @@ impl Plugin for SimulationPlugin {
             .init_resource::<systems::SimulationLifecycleState>()
             .init_resource::<LaserState>()
             .init_resource::<TestDriveSettings>()
-            .init_resource::<TrackDebug>()
             .insert_resource(library)
             .insert_resource(track)
             .insert_resource(selection)
@@ -200,8 +258,7 @@ impl Plugin for SimulationPlugin {
                 FixedUpdate,
                 (
                     sample_sensors.in_set(SimulationSet::Sense),
-                    (produce_temporary_controls, produce_manual_controls)
-                        .in_set(SimulationSet::ControlSource),
+                    produce_temporary_controls.in_set(SimulationSet::ControlSource),
                     apply_vehicle_physics.in_set(SimulationSet::Physics),
                     update_track_progress.in_set(SimulationSet::Progress),
                     select_current_leader
@@ -217,8 +274,14 @@ impl Plugin for SimulationPlugin {
                 run_training_fast_forward_batch
                     .in_set(RunFixedMainLoopSystems::FixedMainLoop)
                     .before(bevy::time::run_fixed_main_schedule),
-            )
-            .add_systems(
+            );
+        if self.runtime_mode == RuntimeMode::Interactive {
+            app.init_resource::<TrackDebug>();
+            app.add_systems(
+                FixedUpdate,
+                produce_manual_controls.in_set(SimulationSet::ControlSource),
+            );
+            app.add_systems(
                 Update,
                 (
                     apply_track_selection,
@@ -229,5 +292,8 @@ impl Plugin for SimulationPlugin {
                 )
                     .chain(),
             );
+        } else {
+            app.add_systems(Update, rebuild_simulation);
+        }
     }
 }

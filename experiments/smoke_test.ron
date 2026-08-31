@@ -1,0 +1,13 @@
+(
+    target_generation: 1,
+    max_parallel_runs: 2,
+    resume_existing: true,
+    base_seed: 9001,
+    population_size: 4,
+    results_root: "target/smoke-results-fixed",
+    worker_threads: Some(1),
+    architectures: [
+        [6, 3, 2],
+        [6, 4, 2],
+    ],
+)

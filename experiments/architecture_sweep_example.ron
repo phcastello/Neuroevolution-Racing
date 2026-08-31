@@ -1,0 +1,16 @@
+(
+    target_generation: 500,
+    max_parallel_runs: 3,
+    resume_existing: true,
+    base_seed: 12345,
+    population_size: 500,
+    results_root: "results",
+    architectures: [
+        [6, 8, 2],
+        [6, 16, 2],
+        [6, 32, 2],
+        [6, 8, 8, 2],
+        [6, 16, 16, 2],
+        [6, 32, 32, 2],
+    ],
+)

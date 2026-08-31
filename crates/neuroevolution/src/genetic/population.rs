@@ -30,6 +30,20 @@ impl Population {
         })
     }
 
+    /// Minimal generic reconstruction boundary for app-side persistence.
+    pub fn from_individuals(
+        individuals: Vec<Individual>,
+        generation: usize,
+    ) -> Result<Self, &'static str> {
+        if individuals.is_empty() {
+            return Err("population must contain at least one individual");
+        }
+        Ok(Self {
+            individuals,
+            generation,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.individuals.len()
     }

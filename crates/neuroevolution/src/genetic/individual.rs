@@ -14,6 +14,14 @@ impl Individual {
         }
     }
 
+    /// Reconstructs an individual from an application-owned persistence DTO.
+    pub fn from_parts(genome: Genome, fitness: Option<f32>) -> Result<Self, &'static str> {
+        if fitness.is_some_and(|value| !value.is_finite()) {
+            return Err("fitness must be finite when present");
+        }
+        Ok(Self { genome, fitness })
+    }
+
     pub fn genome(&self) -> &Genome {
         &self.genome
     }

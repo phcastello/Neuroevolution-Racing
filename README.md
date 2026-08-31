@@ -1,5 +1,87 @@
 # Neuroevolution Racing
 
+## Interactive, batch, and headless worker modes
+
+Running the executable without a subcommand preserves the interactive application, including its window, dashboard, rendering, Champion mode, Test Drive, target-generation turbo mode, and checkpoint browser:
+
+```powershell
+cargo run -p neuroevolution-racing-app
+```
+
+Long experiments should use a release build. The batch launcher starts the same current executable as independent worker processes; it never starts `cargo run` per architecture:
+
+```powershell
+cargo build --release -p neuroevolution-racing-app
+target/release/neuroevolution-racing batch experiments/architecture_sweep_example.ron
+```
+
+A single worker can also be started directly:
+
+```powershell
+target/release/neuroevolution-racing worker `
+  --architecture 6,16,16,2 `
+  --target-generation 500 `
+  --seed 12345 `
+  --results-root results `
+  --worker-threads 2 `
+  --resume
+```
+
+The worker is genuinely presentation-free: it uses Bevy's minimal app/time/task-pool plugins, transforms, Avian physics/spatial queries, and the shared `SimulationPlugin`. It does not add `DefaultPlugins`, a window, winit, assets, rendering, sprites, meshes, gizmos, egui, a camera, the dashboard, or frame-time rendering diagnostics. The same five raycasts, MLP forwards, kinematic physics/collisions, progress, laser, fitness, validation, GA, and exact 1/60-second `FixedUpdate` systems run in both modes.
+
+### Experiment configuration
+
+The RON matrix varies only MLP architecture by default. Every architecture must have input 6, output 2, at least one non-empty hidden layer, and Tanh on every hidden/output layer.
+
+```ron
+(
+    target_generation: 500,
+    max_parallel_runs: 3,
+    resume_existing: true,
+    base_seed: 12345,
+    population_size: 500,
+    results_root: "results",
+    // Optional. If omitted: available_parallelism / max_parallel_runs, minimum 1.
+    worker_threads: Some(2),
+    architectures: [
+        [6, 8, 2],
+        [6, 16, 2],
+        [6, 8, 8, 2],
+    ],
+)
+```
+
+`max_parallel_runs` bounds live child processes. Each worker gets a stable seed derived from `base_seed` and the central architecture slug (`6_8_2`, `6_8_8_2`, and so on). Explicit `worker_threads` overrides the automatic per-process Bevy task-pool budget.
+
+`Architecture::parameter_count()` is the only source for GA genome length. Thus `6 -> 8 -> 2` remains 74 parameters, while every alternative automatically receives its own correct genome size; there is no worker-side constant of 74.
+
+### Results, checkpoints, and resume
+
+Each architecture owns a disjoint directory:
+
+```text
+results/
+  6_16_16_2/
+    run.ron
+    metrics.csv
+    worker.log
+    bests_by_gen/
+      generation_000010_<timestamp>.ron
+    training_checkpoint/
+      generation_000419.bin
+      generation_000420.bin
+```
+
+`run.ron` records architecture, parameter count, seed, population size, current target, creation time, GA/evaluation/simulation settings, sensor range, track suites, RNG identity, versions, and run status. A directory with a different seed or scientific configuration is rejected. Without `--resume`, an existing manifest is never overwritten. The target generation is operational rather than scientific, so a compatible run can resume from target 500 toward target 800.
+
+Champion files in `bests_by_gen/` remain human-readable V3 RON `SavedNetwork` files and can reconstruct any supported 6/.../2 MLP in Champion mode. Training snapshots are a separate bincode/serde `TrainingCheckpoint` format. At the clean generation boundary—after validation and evolution have prepared population N, before its first evaluation tick—the worker atomically writes `generation_N.tmp`, flushes and syncs it, validates it, renames it to `.bin`, and only then removes snapshots older than the newest two.
+
+The interactive checkpoint browser keeps the historical `checkpoints/` source and also discovers champion RON files under the default `results/<architecture>/bests_by_gen/` hierarchy.
+
+The training snapshot contains the complete population/genomes/fitness options, generation, architecture, GA and evaluation configuration, explicit seed, selected tracks for the prepared generation, and serialized evolution/evaluation `ChaCha12Rng` states. Resume scans newest to oldest, validates the manifest, architecture, genome lengths, population, finite values, configuration, tracks, and RNG identifier, and falls back to the penultimate snapshot if the newest is corrupt. If neither is valid, `--resume` fails instead of silently creating a new population.
+
+`metrics.csv` appends one row per completed generation with timing, fitness, champion speed/completion, validation result/reason, finish counts, fixed ticks, ticks/second, and simulated seconds. The launcher keeps worker stdout/stderr in that architecture's `worker.log` and prints only queued/running/done/failed status summaries.
+
 Neuroevolution Racing is a university AI project that evolves the weights and biases of car-controlling Multilayer Perceptrons (MLPs) with a manually implemented Genetic Algorithm (GA). The application runs the population in a shared racing simulation and exposes live generation, fitness, telemetry, and current-leader network data in its dashboard.
 
 > The neural network and genetic algorithm are implemented independently from the visualization stack. Bevy, Avian2D and egui are used only for simulation, collision detection, rendering and visualization.

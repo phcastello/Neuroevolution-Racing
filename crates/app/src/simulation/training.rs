@@ -4,10 +4,12 @@ use super::{
 };
 use bevy::prelude::{Component, Resource};
 use neuroevolution::{
-    genetic::{Config, Population},
+    genetic::{Config, Genome, Individual, Population},
     neural::{Activation, Architecture},
 };
-use rand::{RngExt, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng};
+use rand_chacha::ChaCha12Rng;
+use serde::{Deserialize, Serialize};
 
 const EVALUATION_RNG_SALT: u64 = 0x4556_414c_5541_5445;
 const DEFAULT_TRAINING_TRACKS_PER_GENERATION: Option<usize> = Some(3);
@@ -50,13 +52,13 @@ impl FinishReasonCounts {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrainingTrackSelection {
     All,
     RandomSubset(usize),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LaserConfig {
     pub grace_period: f32,
     pub acceleration: f32,
@@ -158,7 +160,7 @@ impl LaserState {
 
 /// Parameters for episode termination and the deliberately small score formula.
 /// Progress is dominant, useful speed is a tie-breaker, and collision is a bounded penalty.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EvaluationConfig {
     pub maximum_episode_duration: f32,
     pub laser: LaserConfig,
@@ -441,8 +443,8 @@ pub struct TrainingState {
     genetic_config: Config,
     evaluation_config: EvaluationConfig,
     population: Population,
-    evolution_rng: StdRng,
-    evaluation_rng: StdRng,
+    evolution_rng: ChaCha12Rng,
+    evaluation_rng: ChaCha12Rng,
     training_track_ids: Vec<String>,
     validation_track_ids: Vec<String>,
     selected_training_tracks: Vec<String>,
@@ -461,11 +463,101 @@ pub struct TrainingState {
     completed_champion: Option<CompletedChampion>,
 }
 
+pub const TRAINING_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+pub const TRAINING_RNG_ID: &str = "rand_chacha::ChaCha12Rng/0.10";
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedGeneticConfig {
+    pub population_size: usize,
+    pub genome_length: usize,
+    pub elite_fraction: f32,
+    pub tournament_size: usize,
+    pub crossover_probability: f32,
+    pub mutation_probability: f32,
+    pub mutation_sigma: f32,
+    pub initial_gene_min: f32,
+    pub initial_gene_max: f32,
+    pub seed: u64,
+}
+
+impl SavedGeneticConfig {
+    pub fn from_config(config: &Config) -> Self {
+        Self {
+            population_size: config.population_size,
+            genome_length: config.genome_length,
+            elite_fraction: config.elite_fraction,
+            tournament_size: config.tournament_size,
+            crossover_probability: config.crossover_probability,
+            mutation_probability: config.mutation_probability,
+            mutation_sigma: config.mutation_sigma,
+            initial_gene_min: config.initial_gene_min,
+            initial_gene_max: config.initial_gene_max,
+            seed: config.seed,
+        }
+    }
+
+    fn to_config(&self) -> Result<Config, String> {
+        let config = Config {
+            population_size: self.population_size,
+            genome_length: self.genome_length,
+            elite_fraction: self.elite_fraction,
+            tournament_size: self.tournament_size,
+            crossover_probability: self.crossover_probability,
+            mutation_probability: self.mutation_probability,
+            mutation_sigma: self.mutation_sigma,
+            initial_gene_min: self.initial_gene_min,
+            initial_gene_max: self.initial_gene_max,
+            seed: self.seed,
+        };
+        config.validate().map_err(str::to_string)?;
+        Ok(config)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedTrainingIndividual {
+    pub genome: Vec<f32>,
+    pub fitness: Option<f32>,
+}
+
+/// Clean-boundary snapshot: generation N is fully prepared but has not received its first tick.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TrainingCheckpoint {
+    pub format_version: u32,
+    pub architecture: Vec<usize>,
+    pub generation: usize,
+    pub individuals: Vec<SavedTrainingIndividual>,
+    pub genetic_config: SavedGeneticConfig,
+    pub evaluation_config: EvaluationConfig,
+    pub seed: u64,
+    pub rng_id: String,
+    pub evolution_rng: ChaCha12Rng,
+    pub evaluation_rng: ChaCha12Rng,
+    pub selected_training_tracks: Vec<String>,
+}
+
 impl TrainingState {
+    #[cfg(test)]
     pub fn with_config(
         population_size: usize,
         library: &TrackLibrary,
         evaluation_config: EvaluationConfig,
+    ) -> Result<Self, String> {
+        Self::with_architecture(
+            population_size,
+            library,
+            evaluation_config,
+            vec![MLP_INPUT_SIZE, 8, MLP_OUTPUT_SIZE],
+            Config::default().seed,
+        )
+    }
+
+    pub fn with_architecture(
+        population_size: usize,
+        library: &TrackLibrary,
+        evaluation_config: EvaluationConfig,
+        layer_sizes: Vec<usize>,
+        seed: u64,
     ) -> Result<Self, String> {
         evaluation_config.validate()?;
         let training_track_ids = library
@@ -480,18 +572,16 @@ impl TrainingState {
             return Err("training and validation track suites must not be empty".into());
         }
 
-        let architecture = Architecture::new(
-            vec![MLP_INPUT_SIZE, 8, MLP_OUTPUT_SIZE],
-            vec![Activation::Tanh, Activation::Tanh],
-        )?;
+        let architecture = racing_architecture(layer_sizes)?;
         let genetic_config = Config {
             population_size,
             genome_length: architecture.parameter_count(),
+            seed,
             ..Config::default()
         };
-        let mut evolution_rng = StdRng::seed_from_u64(genetic_config.seed);
+        let mut evolution_rng = ChaCha12Rng::seed_from_u64(genetic_config.seed);
         let population = Population::new(&genetic_config, &mut evolution_rng)?;
-        let evaluation_rng = StdRng::seed_from_u64(genetic_config.seed ^ EVALUATION_RNG_SALT);
+        let evaluation_rng = ChaCha12Rng::seed_from_u64(genetic_config.seed ^ EVALUATION_RNG_SALT);
         let mut state = Self {
             architecture,
             genetic_config,
@@ -518,6 +608,88 @@ impl TrainingState {
         };
         state.start_generation();
         Ok(state)
+    }
+
+    pub fn training_checkpoint(&self) -> TrainingCheckpoint {
+        TrainingCheckpoint {
+            format_version: TRAINING_CHECKPOINT_FORMAT_VERSION,
+            architecture: self.architecture.layer_sizes().to_vec(),
+            generation: self.population.generation(),
+            individuals: self
+                .population
+                .individuals()
+                .iter()
+                .map(|individual| SavedTrainingIndividual {
+                    genome: individual.genome().genes().to_vec(),
+                    fitness: individual.fitness(),
+                })
+                .collect(),
+            genetic_config: SavedGeneticConfig::from_config(&self.genetic_config),
+            evaluation_config: self.evaluation_config.clone(),
+            seed: self.genetic_config.seed,
+            rng_id: TRAINING_RNG_ID.into(),
+            evolution_rng: self.evolution_rng.clone(),
+            evaluation_rng: self.evaluation_rng.clone(),
+            selected_training_tracks: self.selected_training_tracks.clone(),
+        }
+    }
+
+    pub fn from_training_checkpoint(
+        checkpoint: TrainingCheckpoint,
+        library: &TrackLibrary,
+    ) -> Result<Self, String> {
+        checkpoint.validate(library)?;
+        let architecture = racing_architecture(checkpoint.architecture.clone())?;
+        let genetic_config = checkpoint.genetic_config.to_config()?;
+        let individuals = checkpoint
+            .individuals
+            .into_iter()
+            .map(|saved| {
+                Individual::from_parts(Genome::new(saved.genome), saved.fitness)
+                    .map_err(str::to_string)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let population = Population::from_individuals(individuals, checkpoint.generation)
+            .map_err(str::to_string)?;
+        let training_track_ids = library
+            .training_tracks()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let validation_track_ids = library
+            .validation_tracks()
+            .map(|track| track.id.clone())
+            .collect::<Vec<_>>();
+        let population_size = population.len();
+        let first_track = checkpoint.selected_training_tracks[0].clone();
+        let total_tracks = checkpoint.selected_training_tracks.len();
+        Ok(Self {
+            architecture,
+            genetic_config,
+            evaluation_config: checkpoint.evaluation_config,
+            population,
+            evolution_rng: checkpoint.evolution_rng,
+            evaluation_rng: checkpoint.evaluation_rng,
+            training_track_ids,
+            validation_track_ids,
+            selected_training_tracks: checkpoint.selected_training_tracks,
+            training_score_sums: vec![0.0; population_size],
+            training_useful_speed_sums: vec![0.0; population_size],
+            individual_finish_counts: vec![FinishReasonCounts::default(); population_size],
+            current_track_stats: Vec::new(),
+            completed_training_tracks: 0,
+            phase: TrainingPhase::TrainingTrack {
+                track_id: first_track,
+                index: 0,
+                total: total_tracks,
+            },
+            history: Vec::new(),
+            validation_history: Vec::new(),
+            pending_stats: None,
+            champion_genome: None,
+            champion_population_index: None,
+            pending_champion_training: None,
+            completed_champion: None,
+        })
     }
 
     fn start_generation(&mut self) {
@@ -768,6 +940,75 @@ impl TrainingState {
 
     pub fn current_training_fitness(&self) -> Option<GenerationStats> {
         self.pending_stats
+    }
+}
+
+pub fn racing_architecture(layer_sizes: Vec<usize>) -> Result<Architecture, String> {
+    if layer_sizes.len() < 3 {
+        return Err("architecture must contain at least one hidden layer".into());
+    }
+    if layer_sizes.first().copied() != Some(MLP_INPUT_SIZE) {
+        return Err(format!("architecture input must be {MLP_INPUT_SIZE}"));
+    }
+    if layer_sizes.last().copied() != Some(MLP_OUTPUT_SIZE) {
+        return Err(format!("architecture output must be {MLP_OUTPUT_SIZE}"));
+    }
+    if layer_sizes[1..layer_sizes.len() - 1]
+        .iter()
+        .any(|size| *size == 0)
+    {
+        return Err("hidden layer sizes must be greater than zero".into());
+    }
+    let activations = vec![Activation::Tanh; layer_sizes.len() - 1];
+    Architecture::new(layer_sizes, activations).map_err(str::to_string)
+}
+
+impl TrainingCheckpoint {
+    pub fn validate(&self, library: &TrackLibrary) -> Result<(), String> {
+        if self.format_version != TRAINING_CHECKPOINT_FORMAT_VERSION {
+            return Err(format!(
+                "unsupported training checkpoint version {}",
+                self.format_version
+            ));
+        }
+        if self.rng_id != TRAINING_RNG_ID {
+            return Err(format!("unsupported RNG {}", self.rng_id));
+        }
+        let architecture = racing_architecture(self.architecture.clone())?;
+        let config = self.genetic_config.to_config()?;
+        if self.seed != config.seed {
+            return Err("checkpoint seed differs from genetic config seed".into());
+        }
+        if config.genome_length != architecture.parameter_count() {
+            return Err("genome length differs from architecture parameter count".into());
+        }
+        if self.individuals.len() != config.population_size {
+            return Err("checkpoint population size differs from genetic config".into());
+        }
+        for (index, individual) in self.individuals.iter().enumerate() {
+            if individual.genome.len() != config.genome_length {
+                return Err(format!(
+                    "individual {index} has an incompatible genome length"
+                ));
+            }
+            if individual.genome.iter().any(|value| !value.is_finite())
+                || individual.fitness.is_some_and(|value| !value.is_finite())
+            {
+                return Err(format!("individual {index} contains a non-finite value"));
+            }
+        }
+        self.evaluation_config.validate()?;
+        if self.selected_training_tracks.is_empty() {
+            return Err("checkpoint has no selected training tracks".into());
+        }
+        if self.selected_training_tracks.iter().any(|id| {
+            library
+                .definition(id)
+                .is_none_or(|definition| definition.role != super::track::TrackRole::Training)
+        }) {
+            return Err("checkpoint contains an unknown non-training track".into());
+        }
+        Ok(())
     }
 }
 

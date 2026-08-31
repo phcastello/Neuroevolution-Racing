@@ -8,6 +8,8 @@ use bevy::{app::FixedMain, prelude::*};
 use bevy_egui::input::EguiWantsInput;
 use neuroevolution::neural::Mlp;
 
+use crate::experiment::WorkerRuntime;
+
 use crate::simulation::training::{
     EvaluationState, FinishReason, LaserState, TrackAdvance, TrainingPhase, TrainingState,
     episode_score,
@@ -803,9 +805,13 @@ pub fn finish_generation_evaluation(
     mode: Res<SimulationMode>,
     simulation_config: Res<SimulationConfig>,
     mut checkpoints: ResMut<CheckpointStore>,
+    mut worker: Option<ResMut<WorkerRuntime>>,
 ) {
     if *mode != SimulationMode::Training {
         return;
+    }
+    if let Some(worker) = worker.as_deref_mut() {
+        worker.record_fixed_tick();
     }
     let evaluation_config = training.evaluation_config().clone();
     let delta_seconds = time.delta_secs();
@@ -883,6 +889,21 @@ pub fn finish_generation_evaluation(
             training
                 .evolve_generation()
                 .expect("failed to evolve population");
+            if let Some(worker) = worker.as_deref_mut() {
+                let reached_target = worker
+                    .on_generation_boundary(
+                        &training,
+                        &report,
+                        &simulation_config,
+                        &library,
+                        &mut checkpoints,
+                        checkpoint.is_some(),
+                    )
+                    .unwrap_or_else(|error| panic!("worker persistence failed: {error}"));
+                if reached_target {
+                    commands.write_message(AppExit::Success);
+                }
+            }
             log_generation_report(&report, checkpoint.as_deref());
             training
                 .current_track_id()
@@ -1043,6 +1064,12 @@ pub fn run_training_fast_forward_batch(world: &mut World) {
         let mut ticks = 0_u32;
         loop {
             if !world.resource::<TrainingFastForward>().is_active() {
+                break;
+            }
+            if world
+                .get_resource::<WorkerRuntime>()
+                .is_some_and(WorkerRuntime::is_completed)
+            {
                 break;
             }
             if ticks.is_multiple_of(16) && started.elapsed() >= FAST_FORWARD_BATCH_BUDGET {
