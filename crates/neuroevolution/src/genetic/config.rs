@@ -1,3 +1,4 @@
+#[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub population_size: usize,
     pub genome_length: usize,
@@ -85,5 +86,18 @@ mod test {
         config.population_size = 0;
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn probabilities_outside_unit_interval_are_rejected() {
+        for invalid in [-0.01, 1.01, f32::NAN] {
+            let mut crossover = Config::default();
+            crossover.crossover_probability = invalid;
+            assert!(crossover.validate().is_err());
+
+            let mut mutation = Config::default();
+            mutation.mutation_probability = invalid;
+            assert!(mutation.validate().is_err());
+        }
     }
 }

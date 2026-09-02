@@ -496,7 +496,7 @@ impl SavedGeneticConfig {
         }
     }
 
-    fn to_config(&self) -> Result<Config, String> {
+    pub(crate) fn to_config(&self) -> Result<Config, String> {
         let config = Config {
             population_size: self.population_size,
             genome_length: self.genome_length,
@@ -552,6 +552,7 @@ impl TrainingState {
         )
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn with_architecture(
         population_size: usize,
         library: &TrackLibrary,
@@ -559,7 +560,31 @@ impl TrainingState {
         layer_sizes: Vec<usize>,
         seed: u64,
     ) -> Result<Self, String> {
+        let architecture = racing_architecture(layer_sizes)?;
+        let genetic_config = Config {
+            population_size,
+            genome_length: architecture.parameter_count(),
+            seed,
+            ..Config::default()
+        };
+        Self::with_genetic_config(library, evaluation_config, architecture, genetic_config)
+    }
+
+    pub fn with_genetic_config(
+        library: &TrackLibrary,
+        evaluation_config: EvaluationConfig,
+        architecture: Architecture,
+        genetic_config: Config,
+    ) -> Result<Self, String> {
         evaluation_config.validate()?;
+        genetic_config.validate().map_err(str::to_string)?;
+        if genetic_config.genome_length != architecture.parameter_count() {
+            return Err(format!(
+                "genome_length {} does not match architecture parameter count {}",
+                genetic_config.genome_length,
+                architecture.parameter_count()
+            ));
+        }
         let training_track_ids = library
             .training_tracks()
             .map(|track| track.id.clone())
@@ -572,15 +597,9 @@ impl TrainingState {
             return Err("training and validation track suites must not be empty".into());
         }
 
-        let architecture = racing_architecture(layer_sizes)?;
-        let genetic_config = Config {
-            population_size,
-            genome_length: architecture.parameter_count(),
-            seed,
-            ..Config::default()
-        };
         let mut evolution_rng = ChaCha12Rng::seed_from_u64(genetic_config.seed);
         let population = Population::new(&genetic_config, &mut evolution_rng)?;
+        let population_size = genetic_config.population_size;
         let evaluation_rng = ChaCha12Rng::seed_from_u64(genetic_config.seed ^ EVALUATION_RNG_SALT);
         let mut state = Self {
             architecture,

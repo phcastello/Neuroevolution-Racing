@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::simulation::{
     CheckpointStore, CompletedChampion, EvaluationConfig, SavedGeneticConfig, SimulationConfig,
-    TrackLibrary, TrainingCheckpoint, TrainingState, racing_architecture,
+    TrackLibrary, TrainingCheckpoint, TrainingState, load_saved_network, racing_architecture,
 };
 use neuroevolution::genetic::Config as GeneticConfig;
 
@@ -33,6 +33,8 @@ pub enum RunStatus {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunManifest {
     pub format_version: u32,
+    #[serde(default)]
+    pub name: String,
     pub architecture: Vec<usize>,
     pub parameter_count: usize,
     pub seed: u64,
@@ -54,30 +56,29 @@ pub struct RunManifest {
 
 impl RunManifest {
     pub fn new(
+        name: String,
         architecture: Vec<usize>,
-        seed: u64,
-        population_size: usize,
         target_generation: usize,
+        core_genetic_config: GeneticConfig,
         library: &TrackLibrary,
     ) -> Result<Self, String> {
         let architecture_model = racing_architecture(architecture.clone())?;
-        let core_genetic_config = GeneticConfig {
-            population_size,
-            genome_length: architecture_model.parameter_count(),
-            seed,
-            ..GeneticConfig::default()
-        };
+        core_genetic_config.validate().map_err(str::to_string)?;
+        if core_genetic_config.genome_length != architecture_model.parameter_count() {
+            return Err("genetic genome_length does not match the architecture".into());
+        }
         let genetic_config = SavedGeneticConfig::from_config(&core_genetic_config);
         let simulation_config = SimulationConfig {
-            population_size,
+            population_size: core_genetic_config.population_size,
             ..SimulationConfig::default()
         };
         Ok(Self {
             format_version: RUN_FORMAT_VERSION,
+            name,
             architecture,
             parameter_count: architecture_model.parameter_count(),
-            seed,
-            population_size,
+            seed: core_genetic_config.seed,
+            population_size: core_genetic_config.population_size,
             target_generation,
             created_at: unix_timestamp()?,
             genetic_config,
@@ -102,6 +103,7 @@ impl RunManifest {
 
     pub fn validate_compatible(&self, requested: &Self) -> Result<(), String> {
         let mismatch = self.format_version != requested.format_version
+            || self.name != requested.name
             || self.architecture != requested.architecture
             || self.parameter_count != requested.parameter_count
             || self.seed != requested.seed
@@ -128,14 +130,61 @@ pub struct ExperimentConfig {
     pub max_parallel_runs: usize,
     #[serde(default)]
     pub resume_existing: bool,
-    pub base_seed: u64,
+    #[serde(alias = "base_seed")]
+    pub seed: u64,
     #[serde(default = "default_population_size")]
     pub population_size: usize,
     #[serde(default = "default_results_root")]
     pub results_root: PathBuf,
     #[serde(default)]
     pub worker_threads: Option<usize>,
+    #[serde(default)]
     pub architectures: Vec<Vec<usize>>,
+    #[serde(default)]
+    pub runs: Vec<ExperimentRunConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExperimentRunConfig {
+    pub name: String,
+    pub architecture: Vec<usize>,
+    #[serde(default = "default_crossover_probability")]
+    pub crossover_probability: f32,
+    #[serde(default = "default_mutation_probability")]
+    pub mutation_probability: f32,
+    #[serde(default)]
+    pub seed: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedExperimentRun {
+    pub name: String,
+    pub architecture: Vec<usize>,
+    pub seed: u64,
+    pub population_size: usize,
+    pub target_generation: usize,
+    pub crossover_probability: f32,
+    pub mutation_probability: f32,
+}
+
+impl ResolvedExperimentRun {
+    pub fn directory(&self, results_root: &Path) -> PathBuf {
+        results_root.join(&self.name)
+    }
+
+    pub fn genetic_config(&self) -> Result<GeneticConfig, String> {
+        let architecture = racing_architecture(self.architecture.clone())?;
+        let config = GeneticConfig {
+            population_size: self.population_size,
+            genome_length: architecture.parameter_count(),
+            crossover_probability: self.crossover_probability,
+            mutation_probability: self.mutation_probability,
+            seed: self.seed,
+            ..GeneticConfig::default()
+        };
+        config.validate().map_err(str::to_string)?;
+        Ok(config)
+    }
 }
 
 fn default_population_size() -> usize {
@@ -144,6 +193,14 @@ fn default_population_size() -> usize {
 
 fn default_results_root() -> PathBuf {
     PathBuf::from("results")
+}
+
+fn default_crossover_probability() -> f32 {
+    GeneticConfig::default().crossover_probability
+}
+
+fn default_mutation_probability() -> f32 {
+    GeneticConfig::default().mutation_probability
 }
 
 impl ExperimentConfig {
@@ -166,21 +223,70 @@ impl ExperimentConfig {
         if self.worker_threads == Some(0) {
             return Err("worker_threads must be greater than zero".into());
         }
-        if self.architectures.is_empty() {
-            return Err("architectures must not be empty".into());
+        if self.architectures.is_empty() && self.runs.is_empty() {
+            return Err("either architectures or runs must not be empty".into());
         }
-        let mut slugs = std::collections::BTreeSet::new();
-        for architecture in &self.architectures {
-            racing_architecture(architecture.clone())?;
-            if !slugs.insert(architecture_slug(architecture)) {
-                return Err(format!(
-                    "duplicate architecture {}",
-                    architecture_slug(architecture)
-                ));
+        if !self.architectures.is_empty() && !self.runs.is_empty() {
+            return Err(
+                "architectures and runs are alternative batch formats; use only one".into(),
+            );
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for run in self.resolved_runs()? {
+            validate_run_name(&run.name)?;
+            run.genetic_config()?;
+            if !names.insert(run.name.clone()) {
+                return Err(format!("duplicate run name {}", run.name));
             }
         }
         Ok(())
     }
+
+    pub fn resolved_runs(&self) -> Result<Vec<ResolvedExperimentRun>, String> {
+        if !self.runs.is_empty() {
+            return Ok(self
+                .runs
+                .iter()
+                .map(|run| ResolvedExperimentRun {
+                    name: run.name.clone(),
+                    architecture: run.architecture.clone(),
+                    seed: run.seed.unwrap_or(self.seed),
+                    population_size: self.population_size,
+                    target_generation: self.target_generation,
+                    crossover_probability: run.crossover_probability,
+                    mutation_probability: run.mutation_probability,
+                })
+                .collect());
+        }
+        Ok(self
+            .architectures
+            .iter()
+            .map(|architecture| ResolvedExperimentRun {
+                name: architecture_slug(architecture),
+                architecture: architecture.clone(),
+                seed: architecture_seed(self.seed, architecture),
+                population_size: self.population_size,
+                target_generation: self.target_generation,
+                crossover_probability: default_crossover_probability(),
+                mutation_probability: default_mutation_probability(),
+            })
+            .collect())
+    }
+}
+
+fn validate_run_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!(
+            "invalid run name {name:?}; use only ASCII letters, digits, '-' and '_'"
+        ));
+    }
+    Ok(())
 }
 
 pub fn architecture_slug(architecture: &[usize]) -> String {
@@ -215,13 +321,15 @@ pub fn architecture_seed(base_seed: u64, architecture: &[usize]) -> u64 {
 }
 
 struct RunningWorker {
-    slug: String,
+    name: String,
     child: Child,
 }
 
 pub fn run_batch(config_path: &Path) -> Result<(), String> {
     let config = ExperimentConfig::load(config_path)?;
+    let runs = config.resolved_runs()?;
     let library = TrackLibrary::load_default().map_err(|error| error.to_string())?;
+    preflight_batch_runs(&config, &runs, &library)?;
     let executable = std::env::current_exe()
         .map_err(|error| format!("failed to locate current executable: {error}"))?;
     let derived_threads = std::thread::available_parallelism()
@@ -232,34 +340,26 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
         .max(1);
     let worker_threads = config.worker_threads.unwrap_or(derived_threads);
     let mut queued = VecDeque::new();
-    for architecture in config.architectures.clone() {
-        let slug = architecture_slug(&architecture);
-        println!("[QUEUED ] {slug}");
-        queued.push_back(architecture);
+    for run in runs.clone() {
+        println!("[QUEUED ] {}", run.name);
+        queued.push_back(run);
     }
     let mut running: Vec<RunningWorker> = Vec::new();
     let mut failures = 0usize;
     while !queued.is_empty() || !running.is_empty() {
-        while running.len() < config.max_parallel_runs && !queued.is_empty() {
-            let architecture = queued.pop_front().unwrap();
-            let slug = architecture_slug(&architecture);
-            let run_directory = config.results_root.join(&slug);
+        while can_start_worker(running.len(), config.max_parallel_runs) && !queued.is_empty() {
+            let run = queued.pop_front().unwrap();
+            let run_directory = run.directory(&config.results_root);
             let manifest_path = run_directory.join("run.ron");
+            let requested = RunManifest::new(
+                run.name.clone(),
+                run.architecture.clone(),
+                run.target_generation,
+                run.genetic_config()?,
+                &library,
+            )?;
             if manifest_path.exists() {
-                if !config.resume_existing {
-                    return Err(format!(
-                        "{} already contains an experiment and resume_existing is false",
-                        run_directory.display()
-                    ));
-                }
                 let existing = load_run_manifest(&manifest_path)?;
-                let requested = RunManifest::new(
-                    architecture.clone(),
-                    architecture_seed(config.base_seed, &architecture),
-                    config.population_size,
-                    config.target_generation,
-                    &library,
-                )?;
                 existing.validate_compatible(&requested)?;
             }
             fs::create_dir_all(&run_directory).map_err(|error| {
@@ -269,29 +369,35 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
                 .create(true)
                 .append(true)
                 .open(run_directory.join("worker.log"))
-                .map_err(|error| format!("failed to open worker log for {slug}: {error}"))?;
+                .map_err(|error| format!("failed to open worker log for {}: {error}", run.name))?;
             let stderr = log
                 .try_clone()
                 .map_err(|error| format!("failed to clone worker log: {error}"))?;
             let mut command = Command::new(&executable);
             command
                 .arg("worker")
+                .arg("--name")
+                .arg(&run.name)
                 .arg("--architecture")
                 .arg(
-                    architecture
+                    run.architecture
                         .iter()
                         .map(usize::to_string)
                         .collect::<Vec<_>>()
                         .join(","),
                 )
                 .arg("--target-generation")
-                .arg(config.target_generation.to_string())
+                .arg(run.target_generation.to_string())
                 .arg("--seed")
-                .arg(architecture_seed(config.base_seed, &architecture).to_string())
+                .arg(run.seed.to_string())
                 .arg("--results-root")
                 .arg(&config.results_root)
                 .arg("--population-size")
-                .arg(config.population_size.to_string())
+                .arg(run.population_size.to_string())
+                .arg("--crossover-probability")
+                .arg(run.crossover_probability.to_string())
+                .arg("--mutation-probability")
+                .arg(run.mutation_probability.to_string())
                 .arg("--worker-threads")
                 .arg(worker_threads.to_string())
                 .stdout(Stdio::from(log))
@@ -299,11 +405,26 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
             if config.resume_existing && manifest_path.exists() {
                 command.arg("--resume");
             }
-            let child = command
-                .spawn()
-                .map_err(|error| format!("failed to start worker {slug}: {error}"))?;
-            println!("[RUNNING] {slug:<18} pid={}", child.id());
-            running.push(RunningWorker { slug, child });
+            let child = match command.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    eprintln!("[FAILED ] {} spawn error={error}", run.name);
+                    if manifest_path.exists() {
+                        mark_run_failed(&run_directory);
+                    } else {
+                        let mut failed_manifest = requested;
+                        failed_manifest.status = RunStatus::Failed;
+                        write_run_manifest(&manifest_path, &failed_manifest)?;
+                    }
+                    failures += 1;
+                    continue;
+                }
+            };
+            println!("[RUNNING] {:<24} pid={}", run.name, child.id());
+            running.push(RunningWorker {
+                name: run.name,
+                child,
+            });
         }
 
         let mut index = 0;
@@ -311,7 +432,7 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
             match running[index].child.try_wait() {
                 Ok(Some(status)) => {
                     let finished = running.swap_remove(index);
-                    print_worker_exit(&finished.slug, status, &config.results_root);
+                    print_worker_exit(&finished.name, status, &config.results_root);
                     if !status.success() {
                         failures += 1;
                     }
@@ -319,7 +440,8 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
                 Ok(None) => index += 1,
                 Err(error) => {
                     let failed = running.swap_remove(index);
-                    eprintln!("[FAILED ] {} poll error={error}", failed.slug);
+                    eprintln!("[FAILED ] {} poll error={error}", failed.name);
+                    mark_run_failed(&config.results_root.join(&failed.name));
                     failures += 1;
                 }
             }
@@ -328,37 +450,170 @@ pub fn run_batch(config_path: &Path) -> Result<(), String> {
             thread::sleep(Duration::from_millis(200));
         }
     }
-    if failures == 0 {
-        Ok(())
-    } else {
-        Err(format!("{failures} worker(s) failed"))
+    let summary_result = write_batch_summary(&config.results_root, &runs);
+    match (failures, summary_result) {
+        (0, Ok(())) => Ok(()),
+        (0, Err(error)) => Err(error),
+        (count, Ok(())) => Err(format!("{count} worker(s) failed")),
+        (count, Err(error)) => Err(format!(
+            "{count} worker(s) failed and summary generation failed: {error}"
+        )),
     }
 }
 
-fn print_worker_exit(slug: &str, status: ExitStatus, results_root: &Path) {
+fn preflight_batch_runs(
+    config: &ExperimentConfig,
+    runs: &[ResolvedExperimentRun],
+    library: &TrackLibrary,
+) -> Result<(), String> {
+    for run in runs {
+        let run_directory = run.directory(&config.results_root);
+        let manifest_path = run_directory.join("run.ron");
+        if !manifest_path.exists() {
+            continue;
+        }
+        if !config.resume_existing {
+            return Err(format!(
+                "{} already contains an experiment and resume_existing is false",
+                run_directory.display()
+            ));
+        }
+        let existing = load_run_manifest(&manifest_path)?;
+        let requested = RunManifest::new(
+            run.name.clone(),
+            run.architecture.clone(),
+            run.target_generation,
+            run.genetic_config()?,
+            library,
+        )?;
+        existing.validate_compatible(&requested)?;
+    }
+    Ok(())
+}
+
+fn can_start_worker(running: usize, max_parallel_runs: usize) -> bool {
+    running < max_parallel_runs
+}
+
+fn print_worker_exit(name: &str, status: ExitStatus, results_root: &Path) {
     if status.success() {
-        let generation = load_run_manifest(&results_root.join(slug).join("run.ron"))
+        let generation = load_run_manifest(&results_root.join(name).join("run.ron"))
             .ok()
             .and_then(|manifest| manifest.completed_generation)
             .map_or_else(|| "?".into(), |value| value.to_string());
-        println!("[DONE   ] {slug:<18} generation={generation}");
+        println!("[DONE   ] {name:<24} generation={generation}");
     } else {
-        let manifest_path = results_root.join(slug).join("run.ron");
+        let manifest_path = results_root.join(name).join("run.ron");
         if let Ok(mut manifest) = load_run_manifest(&manifest_path) {
             manifest.status = RunStatus::Failed;
             let _ = write_run_manifest(&manifest_path, &manifest);
         }
-        println!("[FAILED ] {slug:<18} exit={status}");
+        println!("[FAILED ] {name:<24} exit={status}");
     }
+}
+
+fn write_batch_summary(results_root: &Path, runs: &[ResolvedExperimentRun]) -> Result<(), String> {
+    fs::create_dir_all(results_root)
+        .map_err(|error| format!("failed to create {}: {error}", results_root.display()))?;
+    let summary_path = results_root.join("summary.csv");
+    let mut output = String::from(
+        "execution,name,seed,architecture,crossover_probability,mutation_probability,population_size,generations,best_final_fitness,status\n",
+    );
+    for (index, run) in runs.iter().enumerate() {
+        let run_directory = run.directory(results_root);
+        let manifest = load_run_manifest(&run_directory.join("run.ron"));
+        let (fitness, status) = match manifest {
+            Ok(manifest) if manifest.status == RunStatus::Completed => {
+                let result = manifest
+                    .completed_generation
+                    .and_then(|generation| generation.checked_sub(1))
+                    .ok_or_else(|| "completed run has no final evaluated generation".to_string())
+                    .and_then(|generation| final_generation_fitness(&run_directory, generation));
+                match result {
+                    Ok(fitness) => (Some(fitness), "completed"),
+                    Err(_) => (None, "invalid_result"),
+                }
+            }
+            Ok(manifest) => (None, run_status_label(&manifest.status)),
+            Err(_) => (None, "not_started"),
+        };
+        let architecture = run
+            .architecture
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join("-");
+        let fitness = fitness.map_or_else(String::new, |value| format!("{value:.9}"));
+        output.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{}\n",
+            index + 1,
+            csv_field(&run.name),
+            run.seed,
+            architecture,
+            run.crossover_probability,
+            run.mutation_probability,
+            run.population_size,
+            run.target_generation,
+            fitness,
+            status,
+        ));
+    }
+    fs::write(&summary_path, output)
+        .map_err(|error| format!("failed to write {}: {error}", summary_path.display()))
+}
+
+fn run_status_label(status: &RunStatus) -> &'static str {
+    match status {
+        RunStatus::Pending => "pending",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+fn final_generation_fitness(run_directory: &Path, generation: usize) -> Result<f32, String> {
+    let checkpoint_directory = run_directory.join("bests_by_gen");
+    let entries = fs::read_dir(&checkpoint_directory).map_err(|error| {
+        format!(
+            "failed to read final checkpoints in {}: {error}",
+            checkpoint_directory.display()
+        )
+    })?;
+    let mut matching = Vec::new();
+    for path in entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "ron"))
+    {
+        if let Ok(saved) = load_saved_network(&path)
+            && saved.generation == generation
+        {
+            matching.push((
+                saved.saved_at_unix_seconds,
+                saved.training_metadata.champion_training_fitness,
+            ));
+        }
+    }
+    matching
+        .into_iter()
+        .max_by_key(|(saved_at, _)| *saved_at)
+        .map(|(_, fitness)| fitness)
+        .ok_or_else(|| {
+            format!("no valid champion checkpoint for final evaluated generation {generation}")
+        })
 }
 
 #[derive(Clone, Debug)]
 pub struct WorkerOptions {
+    pub name: String,
     pub architecture: Vec<usize>,
     pub target_generation: usize,
     pub seed: u64,
     pub results_root: PathBuf,
     pub population_size: usize,
+    pub crossover_probability: f32,
+    pub mutation_probability: f32,
     pub worker_threads: usize,
     pub resume: bool,
 }
@@ -381,15 +636,24 @@ pub fn prepare_worker(
                 .into(),
         );
     }
-    racing_architecture(options.architecture.clone())?;
-    let slug = architecture_slug(&options.architecture);
-    let run_directory = options.results_root.join(&slug);
+    let architecture = racing_architecture(options.architecture.clone())?;
+    validate_run_name(&options.name)?;
+    let genetic_config = GeneticConfig {
+        population_size: options.population_size,
+        genome_length: architecture.parameter_count(),
+        crossover_probability: options.crossover_probability,
+        mutation_probability: options.mutation_probability,
+        seed: options.seed,
+        ..GeneticConfig::default()
+    };
+    genetic_config.validate().map_err(str::to_string)?;
+    let run_directory = options.results_root.join(&options.name);
     let manifest_path = run_directory.join("run.ron");
     let requested = RunManifest::new(
+        options.name.clone(),
         options.architecture.clone(),
-        options.seed,
-        options.population_size,
         options.target_generation,
+        genetic_config,
         library,
     )?;
     let (mut manifest, resume_checkpoint, resume_messages) = if options.resume {
@@ -489,10 +753,16 @@ impl WorkerRuntime {
         );
         writeln!(
             log,
-            "worker start architecture={} seed={} target={} status={:?}",
+            "worker start name={} architecture={} seed={} target={} crossover={} mutation={} status={:?}",
+            prepared.manifest.name,
             architecture_slug(&prepared.manifest.architecture),
             prepared.manifest.seed,
             prepared.manifest.target_generation,
+            prepared
+                .manifest
+                .genetic_config
+                .crossover_probability,
+            prepared.manifest.genetic_config.mutation_probability,
             prepared.manifest.status
         )
         .map_err(|error| error.to_string())?;
@@ -800,7 +1070,17 @@ fn validate_checkpoint_manifest(
 pub fn load_run_manifest(path: &Path) -> Result<RunManifest, String> {
     let contents = fs::read_to_string(path)
         .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
-    ron::from_str(&contents).map_err(|error| format!("failed to parse {}: {error}", path.display()))
+    let mut manifest: RunManifest = ron::from_str(&contents)
+        .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+    if manifest.name.is_empty() {
+        manifest.name = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_string();
+    }
+    Ok(manifest)
 }
 
 pub fn write_run_manifest(path: &Path, manifest: &RunManifest) -> Result<(), String> {
@@ -832,7 +1112,9 @@ fn unix_timestamp() -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::{EpisodeResult, FinishReason, TrackAdvance, TrainingPhase};
+    use crate::simulation::{
+        EpisodeResult, FinishReason, TrackAdvance, TrainingPhase, test_saved_network,
+    };
     use rand::{RngExt, SeedableRng};
     use rand_chacha::ChaCha12Rng;
 
@@ -844,6 +1126,41 @@ mod tests {
         ))
     }
 
+    fn test_run(name: &str, crossover: f32, mutation: f32) -> ResolvedExperimentRun {
+        ResolvedExperimentRun {
+            name: name.into(),
+            architecture: vec![6, 8, 2],
+            seed: 12345,
+            population_size: 3,
+            target_generation: 1,
+            crossover_probability: crossover,
+            mutation_probability: mutation,
+        }
+    }
+
+    fn test_manifest(
+        name: &str,
+        seed: u64,
+        population_size: usize,
+        target_generation: usize,
+        crossover: f32,
+        mutation: f32,
+        library: &TrackLibrary,
+    ) -> RunManifest {
+        let mut run = test_run(name, crossover, mutation);
+        run.seed = seed;
+        run.population_size = population_size;
+        run.target_generation = target_generation;
+        RunManifest::new(
+            run.name.clone(),
+            run.architecture.clone(),
+            run.target_generation,
+            run.genetic_config().unwrap(),
+            library,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn slugs_and_directories_are_architecture_specific() {
         assert_eq!(architecture_slug(&[6, 8, 2]), "6_8_2");
@@ -852,6 +1169,154 @@ mod tests {
             Path::new("results").join(architecture_slug(&[6, 8, 2])),
             Path::new("results").join(architecture_slug(&[6, 16, 2]))
         );
+    }
+
+    #[test]
+    fn named_runs_allow_the_same_architecture_and_resolve_distinct_directories() {
+        let config = ExperimentConfig {
+            target_generation: 100,
+            max_parallel_runs: 2,
+            resume_existing: true,
+            seed: 12345,
+            population_size: 500,
+            results_root: "results".into(),
+            worker_threads: Some(1),
+            architectures: Vec::new(),
+            runs: vec![
+                ExperimentRunConfig {
+                    name: "baseline".into(),
+                    architecture: vec![6, 8, 2],
+                    crossover_probability: 0.8,
+                    mutation_probability: 0.1,
+                    seed: None,
+                },
+                ExperimentRunConfig {
+                    name: "mutation_high".into(),
+                    architecture: vec![6, 8, 2],
+                    crossover_probability: 0.8,
+                    mutation_probability: 0.2,
+                    seed: None,
+                },
+            ],
+        };
+        config.validate().unwrap();
+        let runs = config.resolved_runs().unwrap();
+        assert_eq!(runs[0].seed, runs[1].seed);
+        assert_eq!(runs[0].architecture, runs[1].architecture);
+        assert_ne!(
+            runs[0].directory(&config.results_root),
+            runs[1].directory(&config.results_root)
+        );
+    }
+
+    #[test]
+    fn duplicate_run_names_are_rejected() {
+        let mut config = ExperimentConfig {
+            target_generation: 1,
+            max_parallel_runs: 1,
+            resume_existing: false,
+            seed: 1,
+            population_size: 2,
+            results_root: "results".into(),
+            worker_threads: None,
+            architectures: Vec::new(),
+            runs: vec![
+                ExperimentRunConfig {
+                    name: "same".into(),
+                    architecture: vec![6, 3, 2],
+                    crossover_probability: 0.8,
+                    mutation_probability: 0.1,
+                    seed: None,
+                },
+                ExperimentRunConfig {
+                    name: "same".into(),
+                    architecture: vec![6, 4, 2],
+                    crossover_probability: 0.8,
+                    mutation_probability: 0.1,
+                    seed: None,
+                },
+            ],
+        };
+        assert!(config.validate().is_err());
+        config.runs[1].name = "different".into();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn experiment_probabilities_outside_unit_interval_are_rejected_centrally() {
+        for (crossover, mutation) in [(-0.1, 0.1), (1.1, 0.1), (0.8, -0.1), (0.8, 1.1)] {
+            let run = test_run("invalid", crossover, mutation);
+            assert!(run.genetic_config().is_err());
+        }
+    }
+
+    #[test]
+    fn comparison_ron_declares_five_named_runs_with_one_shared_seed() {
+        let contents = include_str!("../../../experiments/ag_parameter_comparison.ron");
+        let config: ExperimentConfig = ron::from_str(contents).unwrap();
+        config.validate().unwrap();
+        let runs = config.resolved_runs().unwrap();
+        assert_eq!(runs.len(), 5);
+        assert!(runs.iter().all(|run| run.seed == 12345));
+        assert!(runs.iter().all(|run| run.architecture == vec![6, 8, 2]));
+    }
+
+    #[test]
+    fn legacy_architecture_sweep_format_still_loads_and_derives_seeds() {
+        let config: ExperimentConfig = ron::from_str(
+            r#"(
+                target_generation: 10,
+                max_parallel_runs: 2,
+                base_seed: 12345,
+                population_size: 4,
+                architectures: [[6, 3, 2], [6, 4, 2]],
+            )"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let runs = config.resolved_runs().unwrap();
+        assert_eq!(runs[0].name, "6_3_2");
+        assert_eq!(runs[1].name, "6_4_2");
+        assert_ne!(runs[0].seed, runs[1].seed);
+        assert_eq!(runs[0].crossover_probability, 0.8);
+        assert_eq!(runs[0].mutation_probability, 0.1);
+    }
+
+    #[test]
+    fn configured_probabilities_reach_manifest_and_training_genetic_config() {
+        let library = TrackLibrary::load_default().unwrap();
+        let run = test_run("rates", 0.6, 0.2);
+        let genetic = run.genetic_config().unwrap();
+        let manifest = RunManifest::new(
+            run.name.clone(),
+            run.architecture.clone(),
+            run.target_generation,
+            genetic.clone(),
+            &library,
+        )
+        .unwrap();
+        assert_eq!(manifest.name, "rates");
+        assert_eq!(manifest.genetic_config.crossover_probability, 0.6);
+        assert_eq!(manifest.genetic_config.mutation_probability, 0.2);
+
+        let state = TrainingState::with_genetic_config(
+            &library,
+            EvaluationConfig::default(),
+            racing_architecture(run.architecture).unwrap(),
+            genetic,
+        )
+        .unwrap();
+        let saved = state.training_checkpoint().genetic_config;
+        assert_eq!(saved.crossover_probability, 0.6);
+        assert_eq!(saved.mutation_probability, 0.2);
+    }
+
+    #[test]
+    fn batch_slot_guard_never_exceeds_configured_parallelism() {
+        assert!(can_start_worker(0, 3));
+        assert!(can_start_worker(2, 3));
+        assert!(!can_start_worker(3, 3));
+        assert!(!can_start_worker(4, 3));
     }
 
     #[test]
@@ -909,7 +1374,7 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths[0].ends_with("generation_000003.bin"));
         assert!(paths[1].ends_with("generation_000002.bin"));
-        let manifest = RunManifest::new(vec![6, 8, 2], 99, 3, 10, &library).unwrap();
+        let manifest = test_manifest("6_8_2", 99, 3, 10, 0.8, 0.1, &library);
         let (newest, _) =
             load_latest_training_checkpoint(&checkpoint_directory, &manifest, &library).unwrap();
         assert_eq!(newest.generation, 3);
@@ -1057,11 +1522,15 @@ mod tests {
     #[test]
     fn incompatible_manifest_is_rejected_but_target_may_increase() {
         let library = TrackLibrary::load_default().unwrap();
-        let original = RunManifest::new(vec![6, 8, 2], 1, 3, 500, &library).unwrap();
-        let larger_target = RunManifest::new(vec![6, 8, 2], 1, 3, 800, &library).unwrap();
+        let original = test_manifest("run", 1, 3, 500, 0.8, 0.1, &library);
+        let larger_target = test_manifest("run", 1, 3, 800, 0.8, 0.1, &library);
         assert!(original.validate_compatible(&larger_target).is_ok());
-        let wrong_seed = RunManifest::new(vec![6, 8, 2], 2, 3, 800, &library).unwrap();
+        let wrong_seed = test_manifest("run", 2, 3, 800, 0.8, 0.1, &library);
         assert!(original.validate_compatible(&wrong_seed).is_err());
+        let wrong_crossover = test_manifest("run", 1, 3, 800, 0.6, 0.1, &library);
+        assert!(original.validate_compatible(&wrong_crossover).is_err());
+        let wrong_mutation = test_manifest("run", 1, 3, 800, 0.8, 0.2, &library);
+        assert!(original.validate_compatible(&wrong_mutation).is_err());
     }
 
     #[test]
@@ -1071,20 +1540,87 @@ mod tests {
         let architecture = vec![6, 8, 2];
         let run_directory = directory.join(architecture_slug(&architecture));
         let manifest_path = run_directory.join("run.ron");
-        let original = RunManifest::new(architecture.clone(), 11, 3, 5, &library).unwrap();
+        let original = test_manifest("6_8_2", 11, 3, 5, 0.8, 0.1, &library);
         write_run_manifest(&manifest_path, &original).unwrap();
         let before = fs::read(&manifest_path).unwrap();
         let options = WorkerOptions {
+            name: "6_8_2".into(),
             architecture,
             target_generation: 10,
             seed: 12,
             results_root: directory.clone(),
             population_size: 3,
+            crossover_probability: 0.8,
+            mutation_probability: 0.1,
             worker_threads: 1,
             resume: true,
         };
         assert!(prepare_worker(&options, &library).is_err());
         assert_eq!(fs::read(&manifest_path).unwrap(), before);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn summary_uses_each_runs_real_final_generation_and_failure_has_no_fitness() {
+        let directory = temp_directory("summary");
+        let library = TrackLibrary::load_default().unwrap();
+        let runs = vec![
+            test_run("first", 0.8, 0.1),
+            test_run("second", 0.6, 0.1),
+            test_run("failed", 0.8, 0.2),
+        ];
+        for (run, fitness) in runs[..2].iter().zip([1.25_f32, 2.5_f32]) {
+            let run_directory = run.directory(&directory);
+            let mut manifest = test_manifest(
+                &run.name,
+                run.seed,
+                run.population_size,
+                run.target_generation,
+                run.crossover_probability,
+                run.mutation_probability,
+                &library,
+            );
+            manifest.status = RunStatus::Completed;
+            manifest.completed_generation = Some(1);
+            write_run_manifest(&run_directory.join("run.ron"), &manifest).unwrap();
+            let mut saved = test_saved_network(run.architecture.clone(), 0);
+            saved.training_metadata.champion_training_fitness = fitness;
+            let checkpoint_directory = run_directory.join("bests_by_gen");
+            fs::create_dir_all(&checkpoint_directory).unwrap();
+            fs::write(
+                checkpoint_directory.join("generation_000000_test.ron"),
+                ron::ser::to_string_pretty(&saved, PrettyConfig::default()).unwrap(),
+            )
+            .unwrap();
+        }
+        let failed = &runs[2];
+        let mut manifest = test_manifest(
+            &failed.name,
+            failed.seed,
+            failed.population_size,
+            failed.target_generation,
+            failed.crossover_probability,
+            failed.mutation_probability,
+            &library,
+        );
+        manifest.status = RunStatus::Failed;
+        let failed_directory = failed.directory(&directory);
+        write_run_manifest(&failed_directory.join("run.ron"), &manifest).unwrap();
+        let checkpoint_directory = failed_directory.join("bests_by_gen");
+        fs::create_dir_all(&checkpoint_directory).unwrap();
+        let mut misleading = test_saved_network(failed.architecture.clone(), 0);
+        misleading.training_metadata.champion_training_fitness = 999.0;
+        fs::write(
+            checkpoint_directory.join("misleading.ron"),
+            ron::ser::to_string_pretty(&misleading, PrettyConfig::default()).unwrap(),
+        )
+        .unwrap();
+
+        write_batch_summary(&directory, &runs).unwrap();
+        let summary = fs::read_to_string(directory.join("summary.csv")).unwrap();
+        assert!(summary.contains("1,first,12345,6-8-2,0.8,0.1,3,1,1.250000000,completed"));
+        assert!(summary.contains("2,second,12345,6-8-2,0.6,0.1,3,1,2.500000000,completed"));
+        assert!(summary.contains("3,failed,12345,6-8-2,0.8,0.2,3,1,,failed"));
         fs::remove_dir_all(directory).unwrap();
     }
 }

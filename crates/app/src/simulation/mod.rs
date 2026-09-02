@@ -27,7 +27,9 @@ use systems::{
     update_training_fast_forward,
 };
 
-pub(crate) use checkpoint::{CheckpointStore, LoadedNetwork};
+#[cfg(test)]
+pub(crate) use checkpoint::test_saved_network;
+pub(crate) use checkpoint::{CheckpointStore, LoadedNetwork, load_saved_network};
 pub(crate) use training::{
     CompletedChampion, EvaluationConfig, EvaluationState, FinishReason, FinishReasonCounts,
     GenerationStats, LaserState, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_RNG_ID,
@@ -151,9 +153,8 @@ pub enum RuntimeMode {
 
 #[derive(Clone, Debug)]
 pub struct TrainingSetup {
-    pub population_size: usize,
     pub architecture: Vec<usize>,
-    pub seed: u64,
+    pub genetic_config: neuroevolution::genetic::Config,
     pub evaluation_config: training::EvaluationConfig,
     pub checkpoint_directory: PathBuf,
     pub resume_checkpoint: Option<training::TrainingCheckpoint>,
@@ -170,9 +171,14 @@ impl SimulationPlugin {
         Self {
             runtime_mode: RuntimeMode::Interactive,
             setup: TrainingSetup {
-                population_size: config.population_size,
                 architecture: vec![6, 8, 2],
-                seed: neuroevolution::genetic::Config::default().seed,
+                genetic_config: neuroevolution::genetic::Config {
+                    population_size: config.population_size,
+                    genome_length: racing_architecture(vec![6, 8, 2])
+                        .expect("default racing architecture must be valid")
+                        .parameter_count(),
+                    ..neuroevolution::genetic::Config::default()
+                },
                 evaluation_config: training::EvaluationConfig::default(),
                 checkpoint_directory: checkpoint::DEFAULT_CHECKPOINT_DIRECTORY.into(),
                 resume_checkpoint: None,
@@ -194,17 +200,17 @@ impl Plugin for SimulationPlugin {
             .unwrap_or_else(|error| panic!("failed to load track library: {error}"));
         let available_track_count = library.all_tracks().count();
         let simulation_config = SimulationConfig {
-            population_size: self.setup.population_size,
+            population_size: self.setup.genetic_config.population_size,
             ..SimulationConfig::default()
         };
         let training_state = match self.setup.resume_checkpoint.clone() {
             Some(checkpoint) => TrainingState::from_training_checkpoint(checkpoint, &library),
-            None => TrainingState::with_architecture(
-                self.setup.population_size,
+            None => TrainingState::with_genetic_config(
                 &library,
                 self.setup.evaluation_config.clone(),
-                self.setup.architecture.clone(),
-                self.setup.seed,
+                racing_architecture(self.setup.architecture.clone())
+                    .expect("training setup architecture must be valid"),
+                self.setup.genetic_config.clone(),
             ),
         }
         .expect("failed to create training state");

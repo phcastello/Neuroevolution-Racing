@@ -51,7 +51,22 @@ The RON matrix varies only MLP architecture by default. Every architecture must 
 )
 ```
 
-`max_parallel_runs` bounds live child processes. Each worker gets a stable seed derived from `base_seed` and the central architecture slug (`6_8_2`, `6_8_8_2`, and so on). Explicit `worker_threads` overrides the automatic per-process Bevy task-pool budget.
+`max_parallel_runs` bounds live child processes. In the legacy `architectures` format, each worker gets a stable seed derived from `base_seed` and the central architecture slug (`6_8_2`, `6_8_8_2`, and so on). Explicit `worker_threads` overrides the automatic per-process Bevy task-pool budget.
+
+### GA parameter comparison
+
+`experiments/ag_parameter_comparison.ron` declares five named runs of the same `6 -> 8 -> 2` architecture. They all use seed `12345`, population `500`, and target `100` generations; only crossover and mutation probabilities vary. Run the complete comparison with:
+
+```powershell
+cargo build --release -p neuroevolution-racing-app
+target/release/neuroevolution-racing batch experiments/ag_parameter_comparison.ron
+```
+
+Named `runs` use the top-level `seed` unchanged unless a run explicitly supplies its optional `seed`. This is different from the backward-compatible `architectures` shorthand, which keeps deriving one seed per architecture. Omitted crossover and mutation probabilities retain the GA defaults (`0.80` and `0.10`). Run names are stable identifiers and directory names; duplicate names and unsafe path-like names are rejected.
+
+The comparison produces `results_ag_parameter_comparison/01_baseline/` through `05_mutation_020/`. Every folder contains its own `run.ron`, `worker.log`, `metrics.csv`, `bests_by_gen/`, and `training_checkpoint/`. The manifest records the run name, actual seed, architecture, population, full genetic configuration (including crossover, mutation, sigma, elitism, and tournament size), and status. Resume rejects any change to the scientific configuration, including either probability.
+
+After all workers finish, `results_ag_parameter_comparison/summary.csv` contains one row per declared run. `best_final_fitness` is read from the saved champion whose generation is the final evaluated generation (`completed_generation - 1`); it is not the historical maximum. Failed or incomplete runs have an empty fitness and a non-`completed` status. The same value is available in that final champion RON file as `training_metadata.champion_training_fitness`, and in the last data row of `metrics.csv` as `best_training_fitness`.
 
 `Architecture::parameter_count()` is the only source for GA genome length. Thus `6 -> 8 -> 2` remains 74 parameters, while every alternative automatically receives its own correct genome size; there is no worker-side constant of 74.
 

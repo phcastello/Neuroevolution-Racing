@@ -31,10 +31,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandLine {
-    /// Launches one isolated worker process per architecture.
+    /// Launches one isolated worker process per configured experiment run.
     Batch { config: PathBuf },
-    /// Runs one architecture with no window, UI, camera, or rendering plugins.
+    /// Runs one named experiment with no window, UI, camera, or rendering plugins.
     Worker {
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         architecture: String,
         #[arg(long)]
@@ -45,6 +47,10 @@ enum CommandLine {
         results_root: PathBuf,
         #[arg(long, default_value_t = 500)]
         population_size: usize,
+        #[arg(long, default_value_t = 0.80)]
+        crossover_probability: f32,
+        #[arg(long, default_value_t = 0.10)]
+        mutation_probability: f32,
         #[arg(long, default_value_t = 1)]
         worker_threads: usize,
         #[arg(long)]
@@ -61,20 +67,27 @@ fn main() -> ExitCode {
         }
         Some(CommandLine::Batch { config }) => run_batch(&config),
         Some(CommandLine::Worker {
+            name,
             architecture,
             target_generation,
             seed,
             results_root,
             population_size,
+            crossover_probability,
+            mutation_probability,
             worker_threads,
             resume,
         }) => experiment::parse_architecture(&architecture).and_then(|architecture| {
+            let name = name.unwrap_or_else(|| experiment::architecture_slug(&architecture));
             run_worker(WorkerOptions {
+                name,
                 architecture,
                 target_generation,
                 seed,
                 results_root,
                 population_size,
+                crossover_probability,
+                mutation_probability,
                 worker_threads,
                 resume,
             })
@@ -148,9 +161,8 @@ fn run_worker(options: WorkerOptions) -> Result<(), String> {
             return Err(fast_forward.status);
         }
         let setup = TrainingSetup {
-            population_size: options.population_size,
             architecture: options.architecture.clone(),
-            seed: options.seed,
+            genetic_config: prepared.manifest.genetic_config.to_config()?,
             evaluation_config: prepared.manifest.evaluation_config.clone(),
             checkpoint_directory: prepared.run_directory.join("bests_by_gen"),
             resume_checkpoint: prepared.resume_checkpoint.clone(),

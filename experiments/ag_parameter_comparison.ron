@@ -1,0 +1,40 @@
+(
+    target_generation: 200,
+    max_parallel_runs: 5,
+    resume_existing: true,
+    seed: 12345,
+    population_size: 500,
+    results_root: "results_ag_parameter_comparison",
+    runs: [
+        (
+            name: "01_baseline",
+            architecture: [6, 8, 2],
+            crossover_probability: 0.80,
+            mutation_probability: 0.10,
+        ),
+        (
+            name: "02_crossover_060",
+            architecture: [6, 8, 2],
+            crossover_probability: 0.60,
+            mutation_probability: 0.10,
+        ),
+        (
+            name: "03_crossover_100",
+            architecture: [6, 8, 2],
+            crossover_probability: 1.00,
+            mutation_probability: 0.10,
+        ),
+        (
+            name: "04_mutation_005",
+            architecture: [6, 8, 2],
+            crossover_probability: 0.80,
+            mutation_probability: 0.05,
+        ),
+        (
+            name: "05_mutation_020",
+            architecture: [6, 8, 2],
+            crossover_probability: 0.80,
+            mutation_probability: 0.20,
+        ),
+    ],
+)
