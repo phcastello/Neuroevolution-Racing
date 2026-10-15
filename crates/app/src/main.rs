@@ -1,6 +1,7 @@
 mod display;
 mod experiment;
 mod rendering;
+mod rl;
 mod simulation;
 mod ui;
 
@@ -31,6 +32,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum CommandLine {
+    /// PPO collection, evaluation, benchmarks and manual-backprop learning area.
+    Rl {
+        #[command(subcommand)]
+        command: rl::RlCommand,
+    },
     /// Launches one isolated worker process per configured experiment run.
     Batch { config: PathBuf },
     /// Runs one named experiment with no window, UI, camera, or rendering plugins.
@@ -66,6 +72,7 @@ fn main() -> ExitCode {
             Ok(())
         }
         Some(CommandLine::Batch { config }) => run_batch(&config),
+        Some(CommandLine::Rl { command }) => rl::run(command),
         Some(CommandLine::Worker {
             name,
             architecture,

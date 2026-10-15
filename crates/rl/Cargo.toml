@@ -1,0 +1,26 @@
+[package]
+name = "racing-rl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+gpu = ["dep:burn-wgpu", "dep:wgpu", "dep:pollster", "dep:naga"]
+
+[dependencies]
+burn-tensor = { version = "=0.20.1", default-features = false, features = ["std"] }
+# std on burn-ndarray 0.20.1 enables burn-autodiff. Intentionally omitted.
+burn-ndarray = { version = "=0.20.1", default-features = false }
+burn-wgpu = { version = "=0.20.1", default-features = false, features = ["std", "webgpu"], optional = true }
+wgpu = { version = "=26.0.1", default-features = false, features = ["std", "vulkan", "dx12", "wgsl"], optional = true }
+pollster = { version = "=0.4.0", optional = true }
+# Bevy and WGPU 26 share codespan-reporting. Match its termcolor feature on Naga 26
+# to avoid the upstream String:WriteColor feature-unification build failure.
+naga = { version = "=26.0.0", default-features = false, features = ["termcolor"], optional = true }
+serde.workspace = true
+ron.workspace = true
+rand = "0.10.2"
+rand_distr = "0.6.0"
+rand_chacha.workspace = true
+thiserror = "2"

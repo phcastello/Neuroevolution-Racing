@@ -192,7 +192,7 @@ pub fn rebuild_simulation(
     }
 }
 
-fn spawn_track_colliders(commands: &mut Commands, track: &Track) {
+pub(super) fn spawn_track_colliders(commands: &mut Commands, track: &Track) {
     for (start, end) in
         closed_segments(&track.left_border).chain(closed_segments(&track.right_border))
     {
@@ -581,20 +581,20 @@ pub fn produce_manual_controls(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct VehicleState {
-    position: Vec2,
-    heading: f32,
-    speed: f32,
+pub(crate) struct VehicleState {
+    pub(crate) position: Vec2,
+    pub(crate) heading: f32,
+    pub(crate) speed: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct ResolvedVehicleMotion {
-    state: VehicleState,
-    rotation_collided: bool,
-    translation_collided: bool,
+pub(super) struct ResolvedVehicleMotion {
+    pub(super) state: VehicleState,
+    pub(super) rotation_collided: bool,
+    pub(super) translation_collided: bool,
 }
 
-fn normalize_speed(speed: f32, normalization_scale: f32) -> f32 {
+pub(super) fn normalize_speed(speed: f32, normalization_scale: f32) -> f32 {
     if speed.is_nan() {
         return 0.0;
     }
@@ -651,7 +651,7 @@ pub(crate) fn limited_yaw_rate(speed: f32, steering: f32, config: &SimulationCon
     desired.clamp(-grip_limit, grip_limit)
 }
 
-fn integrate_vehicle(
+pub(super) fn integrate_vehicle(
     state: VehicleState,
     controls: CarControls,
     config: &SimulationConfig,
@@ -689,7 +689,7 @@ fn integrate_vehicle(
 
 /// Resolves rotation and translation independently so that rejecting a movement
 /// can never leave the car rotated into a wall.
-fn resolve_vehicle_motion(
+pub(super) fn resolve_vehicle_motion(
     current: VehicleState,
     integrated: VehicleState,
     mut intersects_wall: impl FnMut(Vec2, f32) -> bool,

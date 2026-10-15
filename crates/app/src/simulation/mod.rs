@@ -3,6 +3,7 @@ mod components;
 mod controller;
 mod fast_forward;
 mod race;
+pub(crate) mod rl_environment;
 mod systems;
 mod track;
 mod training;
