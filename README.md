@@ -12,7 +12,7 @@ Long experiments should use a release build. The batch launcher starts the same 
 
 ```powershell
 cargo build --release -p neuroevolution-racing-app
-target/release/neuroevolution-racing batch experiments/architecture_sweep_example.ron
+target/release/neuroevolution-racing batch experiments/architecture_sweep_1.ron
 ```
 
 A single worker can also be started directly:

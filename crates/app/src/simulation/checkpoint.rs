@@ -576,6 +576,7 @@ impl From<&SavedNetwork> for CheckpointSummary {
 #[derive(Clone, Debug)]
 pub struct CheckpointEntry {
     pub path: PathBuf,
+    pub folder: PathBuf,
     pub filename: String,
     pub summary: Option<CheckpointSummary>,
     pub error: Option<String>,
@@ -630,13 +631,14 @@ impl CheckpointStore {
 
     pub fn refresh(&mut self) {
         self.entries.clear();
-        let mut paths = Vec::new();
+        let mut candidates = Vec::new();
         match fs::read_dir(&self.directory) {
-            Ok(directory) => paths.extend(
+            Ok(directory) => candidates.extend(
                 directory
                     .filter_map(Result::ok)
                     .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|extension| extension == "ron")),
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "ron"))
+                    .map(|path| (self.directory.clone(), path)),
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -652,25 +654,30 @@ impl CheckpointStore {
                     .filter_map(Result::ok)
                     .map(|entry| entry.path().join("bests_by_gen"))
                 {
-                    if let Ok(entries) = fs::read_dir(bests) {
-                        paths.extend(
+                    if let Ok(entries) = fs::read_dir(&bests) {
+                        candidates.extend(
                             entries
                                 .filter_map(Result::ok)
                                 .map(|entry| entry.path())
                                 .filter(|path| {
                                     path.extension().is_some_and(|extension| extension == "ron")
-                                }),
+                                })
+                                .map(|path| (bests.clone(), path)),
                         );
                     }
                 }
             }
         }
-        if paths.is_empty() {
+        if candidates.is_empty() {
             self.status = "No checkpoints saved yet".into();
             return;
         }
-        paths.sort_by(|left, right| right.file_name().cmp(&left.file_name()));
-        for path in paths {
+        candidates.sort_by(|(left_folder, left_path), (right_folder, right_path)| {
+            left_folder
+                .cmp(right_folder)
+                .then_with(|| right_path.file_name().cmp(&left_path.file_name()))
+        });
+        for (folder, path) in candidates {
             let filename = path
                 .file_name()
                 .and_then(|name| name.to_str())
@@ -679,19 +686,30 @@ impl CheckpointStore {
             match load_saved_network(&path) {
                 Ok(saved) => self.entries.push(CheckpointEntry {
                     path,
+                    folder,
                     filename,
                     summary: Some(CheckpointSummary::from(&saved)),
                     error: None,
                 }),
                 Err(error) => self.entries.push(CheckpointEntry {
                     path,
+                    folder,
                     filename,
                     summary: None,
                     error: Some(error.to_string()),
                 }),
             }
         }
-        self.status = format!("{} checkpoint(s) found", self.entries.len());
+        let folder_count = self
+            .entries
+            .iter()
+            .map(|entry| &entry.folder)
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        self.status = format!(
+            "{} checkpoint(s) found in {folder_count} folder(s)",
+            self.entries.len()
+        );
     }
 
     pub fn save_current_champion(
@@ -737,12 +755,24 @@ impl CheckpointStore {
         MlpController::new(mlp, &saved.genome)
             .map_err(|error| CheckpointError::invalid(format!("controller: {error}")))?;
         let loaded = LoadedCheckpoint {
-            source_filename: entry.filename.clone(),
+            source_filename: entry.path.display().to_string(),
             architecture,
             saved,
         };
         self.status = format!("Loaded {} for Champion mode", loaded.source_filename);
         Ok(loaded)
+    }
+
+    pub fn load_for_race(&self, index: usize) -> Result<(PathBuf, SavedNetwork), CheckpointError> {
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| CheckpointError::invalid("checkpoint selection no longer exists"))?;
+        let saved = load_saved_network(&entry.path)?;
+        let (_, mlp) = saved.reconstruct()?;
+        MlpController::new(mlp, &saved.genome)
+            .map_err(|error| CheckpointError::invalid(format!("controller: {error}")))?;
+        Ok((entry.path.clone(), saved))
     }
 
     fn write_unique(&self, saved: &SavedNetwork) -> Result<PathBuf, CheckpointError> {
@@ -808,6 +838,38 @@ pub struct LoadedCheckpoint {
 #[derive(Resource, Default)]
 pub struct LoadedNetwork {
     pub checkpoint: Option<LoadedCheckpoint>,
+}
+
+#[cfg(test)]
+pub(crate) fn test_saved_network(layer_sizes: Vec<usize>, generation: usize) -> SavedNetwork {
+    let architecture = crate::simulation::training::racing_architecture(layer_sizes).unwrap();
+    SavedNetwork {
+        format_version: CHECKPOINT_FORMAT_VERSION,
+        saved_at_unix_seconds: 1,
+        generation,
+        architecture: SavedArchitecture::from_architecture(&architecture),
+        genome: vec![0.0; architecture.parameter_count()],
+        training_metadata: SavedTrainingMetadata {
+            champion_training_fitness: 1.0,
+            population_average_fitness: 0.5,
+            average_useful_progress_speed: 70.0,
+            completion_rate: 0.5,
+            finish_counts: SavedFinishReasonCounts::default(),
+            training_tracks: vec!["interlagos".into()],
+        },
+        validation_metadata: SavedValidationMetadata {
+            track_id: "spa".into(),
+            score: 0.8,
+            normalized_progress: 0.7,
+            useful_progress_speed: 65.0,
+            elapsed: 20.0,
+            finish_reason: SavedFinishReason::Collision,
+        },
+        evaluation_parameters: SavedEvaluationParameters::from_config(
+            &EvaluationConfig::default(),
+            &SimulationConfig::default(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -1026,6 +1088,7 @@ mod tests {
         fs::write(directory.join("broken.ron"), "this is not RON").unwrap();
         let store = CheckpointStore::new(directory.clone());
         assert_eq!(store.entries.len(), 1);
+        assert_eq!(store.entries[0].folder, directory);
         assert!(store.entries[0].summary.is_none());
         assert!(
             store.entries[0]
@@ -1151,6 +1214,10 @@ mod tests {
             .save_current_champion(&training, &SimulationConfig::default())
             .unwrap();
         let loaded = store.load(0).unwrap();
+        assert_eq!(
+            loaded.source_filename,
+            store.entries[0].path.display().to_string()
+        );
         let mlp = Mlp::from_parameters(&loaded.architecture, &loaded.saved.genome).unwrap();
         let controller = MlpController::new(mlp, &loaded.saved.genome);
 

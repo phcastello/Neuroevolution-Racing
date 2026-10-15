@@ -2,6 +2,7 @@ mod checkpoint;
 mod components;
 mod controller;
 mod fast_forward;
+mod race;
 mod systems;
 mod track;
 mod training;
@@ -12,11 +13,17 @@ pub use components::{
 pub(crate) use controller::MlpController;
 pub use controller::{CarControls, CarObservation};
 pub use fast_forward::{FAST_FORWARD_BATCH_BUDGET, TrainingFastForward};
+pub use race::{
+    RaceMetrics, RaceMetricsSummary, RaceParticipant, RacePhase, RaceRoster, RaceRosterAdd,
+    RaceSession, RaceStanding, RaceStatus, RaceTrail, RaceVisual, export_race_results,
+    latest_checkpoint_indices, sort_race_standings,
+};
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
 pub use track::{Track, TrackBounds, TrackLibrary};
 pub use training::{SavedGeneticConfig, TrainingCheckpoint, racing_architecture};
 
 use bevy::{prelude::*, time::Fixed};
+use race::{apply_race_selection, update_race_session};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use systems::{
@@ -29,7 +36,9 @@ use systems::{
 
 #[cfg(test)]
 pub(crate) use checkpoint::test_saved_network;
-pub(crate) use checkpoint::{CheckpointStore, LoadedNetwork, load_saved_network};
+pub(crate) use checkpoint::{
+    CheckpointEntry, CheckpointStore, LoadedNetwork, SavedNetwork, load_saved_network,
+};
 pub(crate) use training::{
     CompletedChampion, EvaluationConfig, EvaluationState, FinishReason, FinishReasonCounts,
     GenerationStats, LaserState, TRAINING_CHECKPOINT_FORMAT_VERSION, TRAINING_RNG_ID,
@@ -239,6 +248,8 @@ impl Plugin for SimulationPlugin {
             .init_resource::<SimulationMode>()
             .init_resource::<PlaybackState>()
             .init_resource::<TrainingFastForward>()
+            .init_resource::<RaceRoster>()
+            .init_resource::<RaceSession>()
             .init_resource::<systems::SimulationLifecycleState>()
             .init_resource::<LaserState>()
             .init_resource::<TestDriveSettings>()
@@ -271,6 +282,7 @@ impl Plugin for SimulationPlugin {
                         .run_if(|fast_forward: Res<TrainingFastForward>| !fast_forward.is_active())
                         .in_set(SimulationSet::Leader),
                     finish_generation_evaluation.in_set(SimulationSet::Evaluation),
+                    update_race_session.in_set(SimulationSet::Evaluation),
                     rebuild_simulation.in_set(SimulationSet::Lifecycle),
                     update_training_fast_forward.in_set(SimulationSet::FastForward),
                 ),
@@ -292,6 +304,7 @@ impl Plugin for SimulationPlugin {
                 (
                     apply_track_selection,
                     rebuild_simulation,
+                    apply_race_selection,
                     handle_test_drive_input,
                     reset_manual_car,
                     toggle_pause_from_keyboard,

@@ -5,8 +5,9 @@ use bevy::{
 
 use crate::simulation::{
     CAR_LENGTH, CAR_WIDTH, Car, CarProgress, EvaluationState, FinishReason, KinematicCar,
-    LaserState, ManualCar, SelectedCar, SensorReadings, SimulationMode, TestDriveEnvironment,
-    TestDriveSettings, Track, TrackDebug, TrainingFastForward, TrainingState,
+    LaserState, ManualCar, RaceSession, RaceTrail, RaceVisual, SelectedCar, SensorReadings,
+    SimulationMode, TestDriveEnvironment, TestDriveSettings, Track, TrackDebug,
+    TrainingFastForward, TrainingState,
 };
 
 const WALL_THICKNESS: f32 = 14.0;
@@ -321,19 +322,22 @@ fn decorate_new_cars(
     mut commands: Commands,
     assets: Res<CarSpriteAssets>,
     settings: Res<CarVisualSettings>,
-    cars: Query<(Entity, &Car, Option<&ManualCar>), Without<CarVisualized>>,
+    cars: Query<(Entity, &Car, Option<&ManualCar>, Option<&RaceVisual>), Without<CarVisualized>>,
 ) {
-    for (entity, car, manual) in &cars {
+    for (entity, car, manual, race_visual) in &cars {
         commands
             .entity(entity)
             .insert((Visibility::default(), CarVisualized));
         let image = if manual.is_some() {
             assets.sprite(settings.test_drive_sprite)
+        } else if let Some(visual) = race_visual {
+            assets.sprite(visual.sprite_index % CAR_SPRITE_PATHS.len())
         } else {
             assets.training_sprite(car.id)
         };
         let sprite = Sprite {
             image,
+            color: race_visual.map_or(NORMAL_CAR_TINT, |visual| visual.color.as_srgba(0.92)),
             custom_size: Some(Vec2::new(CAR_LENGTH, CAR_WIDTH)),
             ..default()
         };
@@ -403,11 +407,18 @@ fn car_tint(finish_reason: Option<FinishReason>) -> Color {
 }
 
 fn update_car_collision_tint(
-    cars: Query<(&EvaluationState, &Children), Changed<EvaluationState>>,
+    cars: Query<(&EvaluationState, &Children, Option<&RaceVisual>), Changed<EvaluationState>>,
     mut visuals: Query<&mut Sprite, With<CarVisual>>,
 ) {
-    for (evaluation, children) in &cars {
-        let tint = car_tint(evaluation.finish_reason);
+    for (evaluation, children, race_visual) in &cars {
+        let tint = race_visual.map_or_else(
+            || car_tint(evaluation.finish_reason),
+            |visual| {
+                visual
+                    .color
+                    .as_srgba(if evaluation.is_finished() { 0.58 } else { 0.92 })
+            },
+        );
         for child in children.iter() {
             if let Ok(mut sprite) = visuals.get_mut(child) {
                 sprite.color = tint;
@@ -469,6 +480,8 @@ fn draw_debug_visuals(
     car_visuals: Res<CarVisualSettings>,
     mode: Res<SimulationMode>,
     test_drive: Res<TestDriveSettings>,
+    race: Res<RaceSession>,
+    trails: Query<(&RaceTrail, &RaceVisual)>,
     selected: Query<
         (
             &Transform,
@@ -504,6 +517,14 @@ fn draw_debug_visuals(
 
     if *mode == SimulationMode::Training {
         draw_laser(&mut gizmos, &track, &laser, &training);
+    }
+
+    if *mode == SimulationMode::Race && race.show_trails {
+        for (trail, visual) in &trails {
+            if trail.points.len() >= 2 {
+                gizmos.linestrip_2d(trail.points.iter().copied(), visual.color.as_srgba(0.82));
+            }
+        }
     }
 
     for (transform, state, sensors, progress) in &selected {
