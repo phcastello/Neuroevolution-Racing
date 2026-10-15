@@ -1,5 +1,11 @@
 # Neuroevolution Racing
 
+PPO-Clip infrastructure (CPU/WGPU, manual backprop learning area):
+[execution guide](docs/rl/COMO_EXECUTAR.md), [architecture](docs/rl/ARQUITETURA.md),
+[five manual hooks](docs/rl/BACKPROP_PARA_IMPLEMENTAR.md).
+Start with `cargo run -p neuroevolution-racing-app -- rl collect --config configs/rl/smoke.ron`.
+Training intentionally reports `MissingManualImplementation` until those hooks are filled.
+
 ## Interactive, batch, and headless worker modes
 
 Running the executable without a subcommand preserves the interactive application, including its window, dashboard, rendering, Champion mode, Test Drive, target-generation turbo mode, and checkpoint browser:
