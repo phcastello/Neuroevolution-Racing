@@ -132,9 +132,7 @@ impl MlpController {
 
 impl CarController for MlpController {
     fn control(&mut self, observation: &CarObservation) -> CarControls {
-        let inputs = observation.as_inputs();
-        let outputs = self.mlp.forward(&inputs).unwrap();
-
+        let outputs = self.mlp.forward(&observation.as_inputs()).unwrap();
         controls_from_network_outputs([outputs[0], outputs[1]])
     }
 }
@@ -222,5 +220,23 @@ mod tests {
         assert_eq!(telemetry.parameters, parameters);
         assert_eq!(telemetry.activations[0], observation.as_inputs());
         assert_eq!(telemetry.activations[1], vec![0.0; MLP_OUTPUT_SIZE]);
+    }
+
+    #[test]
+    fn regular_control_does_not_collect_detailed_telemetry() {
+        let mlp = single_layer_mlp(MLP_INPUT_SIZE, MLP_OUTPUT_SIZE);
+        let parameters = vec![0.0; mlp.parameter_count()];
+        let mut controller = MlpController::new(mlp, &parameters).unwrap();
+        let observation = CarObservation {
+            sensors: [0.15, 0.25, 0.35, 0.45, 0.55],
+            normalized_speed: 0.65,
+        };
+
+        controller.control(&observation);
+
+        assert_eq!(
+            controller.telemetry().activations[0],
+            vec![0.0; MLP_INPUT_SIZE]
+        );
     }
 }

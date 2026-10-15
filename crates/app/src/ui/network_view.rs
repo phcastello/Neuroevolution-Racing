@@ -1,17 +1,39 @@
 use bevy_egui::egui;
 
+const MIN_CANVAS_HEIGHT: f32 = 230.0;
+const CANVAS_PADDING_X: f32 = 28.0;
+const CANVAS_PADDING_Y: f32 = 28.0;
+const LAYER_SPACING: f32 = 100.0;
+const NODE_SPACING: f32 = 24.0;
+const NODE_RADIUS: f32 = 10.0;
+
+fn expected_parameter_count(layers: &[usize]) -> Option<usize> {
+    layers.windows(2).try_fold(0_usize, |total, pair| {
+        pair[0]
+            .checked_mul(pair[1])?
+            .checked_add(pair[1])?
+            .checked_add(total)
+    })
+}
+
+fn canvas_size(layers: &[usize], available_width: f32) -> egui::Vec2 {
+    let largest_layer = layers.iter().copied().max().unwrap_or(1) as f32;
+    let layer_gaps = layers.len().saturating_sub(1) as f32;
+    egui::vec2(
+        available_width.max(layer_gaps * LAYER_SPACING + 2.0 * CANVAS_PADDING_X),
+        MIN_CANVAS_HEIGHT.max(largest_layer * NODE_SPACING + 2.0 * CANVAS_PADDING_Y),
+    )
+}
+
 pub fn draw_network(
     ui: &mut egui::Ui,
     layers: &[usize],
     parameters: &[f32],
     activations: &[Vec<f32>],
 ) {
-    let expected_parameters = layers
-        .windows(2)
-        .map(|pair| pair[0] * pair[1] + pair[1])
-        .sum::<usize>();
     if layers.len() < 2
-        || parameters.len() != expected_parameters
+        || layers.contains(&0)
+        || expected_parameter_count(layers) != Some(parameters.len())
         || activations.len() != layers.len()
         || activations
             .iter()
@@ -25,10 +47,36 @@ pub fn draw_network(
         return;
     }
 
-    ui.small("Edges: green + / red − weight • Nodes: live activation");
-    let desired = egui::vec2(ui.available_width(), 230.0);
+    ui.small("Edges: green + / red \u{2212} weight \u{2022} Nodes: live activation");
+    ui.monospace(
+        layers
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(" \u{2192} "),
+    );
+
+    let available_width = ui.available_width();
+    egui::ScrollArea::horizontal()
+        .id_salt(("neural_network_canvas", layers))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            draw_network_canvas(ui, layers, parameters, activations, available_width);
+        });
+}
+
+fn draw_network_canvas(
+    ui: &mut egui::Ui,
+    layers: &[usize],
+    parameters: &[f32],
+    activations: &[Vec<f32>],
+    available_width: f32,
+) {
+    let desired = canvas_size(layers, available_width);
     let (response, painter) = ui.allocate_painter(desired, egui::Sense::hover());
-    let rect = response.rect.shrink2(egui::vec2(18.0, 14.0));
+    let rect = response
+        .rect
+        .shrink2(egui::vec2(CANVAS_PADDING_X, CANVAS_PADDING_Y));
     let last_layer = layers.len() - 1;
     let positions: Vec<Vec<egui::Pos2>> = layers
         .iter()
@@ -102,8 +150,8 @@ pub fn draw_network(
             } else {
                 egui::Color32::LIGHT_RED
             };
-            painter.circle_filled(position, 10.0, fill);
-            painter.circle_stroke(position, 10.0, egui::Stroke::new(1.3, outline));
+            painter.circle_filled(position, NODE_RADIUS, fill);
+            painter.circle_stroke(position, NODE_RADIUS, egui::Stroke::new(1.3, outline));
             painter.text(
                 position,
                 egui::Align2::CENTER_CENTER,
@@ -128,4 +176,37 @@ pub fn draw_network(
         egui::FontId::proportional(11.0),
         egui::Color32::LIGHT_GREEN,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canvas_grows_vertically_to_keep_large_layers_legible() {
+        let size = canvas_size(&[6, 32, 32, 2], 360.0);
+
+        assert_eq!(size.x, 360.0);
+        assert_eq!(size.y, 32.0 * NODE_SPACING + 2.0 * CANVAS_PADDING_Y);
+        assert!(size.y > MIN_CANVAS_HEIGHT);
+    }
+
+    #[test]
+    fn canvas_grows_horizontally_for_deep_architectures() {
+        let layers = [6, 8, 8, 8, 8, 8, 2];
+        let size = canvas_size(&layers, 360.0);
+
+        assert_eq!(
+            size.x,
+            (layers.len() - 1) as f32 * LAYER_SPACING + 2.0 * CANVAS_PADDING_X
+        );
+        assert!(size.x > 360.0);
+    }
+
+    #[test]
+    fn parameter_count_supports_any_valid_dense_architecture() {
+        assert_eq!(expected_parameter_count(&[6, 8, 2]), Some(74));
+        assert_eq!(expected_parameter_count(&[6, 16, 32, 2]), Some(722));
+        assert_eq!(expected_parameter_count(&[6, usize::MAX, 2]), None);
+    }
 }

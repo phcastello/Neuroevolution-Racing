@@ -2,6 +2,7 @@ mod checkpoint_browser;
 mod dashboard;
 mod fitness_plot;
 mod network_view;
+mod race_panel;
 
 use bevy::prelude::*;
 use bevy_egui::EguiPrimaryContextPass;

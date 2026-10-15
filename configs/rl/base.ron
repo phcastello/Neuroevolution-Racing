@@ -1,0 +1,17 @@
+// Engineering starting point; no claim of optimal hyperparameters.
+(
+    version: 1,
+    device: Cpu, // Gpu(adapter: 0) requires --features rl-gpu; no CPU fallback.
+    observation: (version: 1, kind: Extended(ray_angles_degrees: [90.0, 81.0, 72.0, 63.0, 54.0, 45.0, 36.0, 27.0, 18.0, 9.0, 0.0, -9.0, -18.0, -27.0, -36.0, -45.0, -54.0, -63.0, -72.0, -81.0, -90.0]), sensor_range: 1000.0, speed_scale: 250.0, angular_speed_scale: 2.15),
+    reward: (version: 1, progress_weight: 0.01, completion_bonus: 10.0, collision_penalty: 1.0),
+    log_std_mode: GlobalPerActionDimension,
+    hidden: [64, 64], initial_log_std: (-0.5, -0.5), log_std_bounds: (-5.0, 2.0),
+    num_envs: 8, rollout_length: 128, minibatch_size: 64, update_epochs: 4, total_rollouts: 100,
+    gamma: 0.99, lambda: 0.95, learning_rate: 0.0003, clip_epsilon: 0.2,
+    value_coef: 0.5, latent_entropy_coef: 0.0, target_kl: 0.03, max_gradient_norm: 0.5,
+    optimizer: Adam(beta1: 0.9, beta2: 0.999, epsilon: 0.00000001),
+    network_seed: 11, environment_seed: 22, action_seed: 33, shuffle_seed: 44, evaluation_seed: 55,
+    physical_dt: 0.016666668, action_repeat: 1, timeout_ticks: 10800, memory_limit_mib: 2048,
+    training_tracks: [], evaluation_tracks: [],
+    results_root: "results_ppo", benchmark_envs: [1, 8, 32, 128, 256], benchmark_iterations: 100, benchmark_warmup: 10,
+)

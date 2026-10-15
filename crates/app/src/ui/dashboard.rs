@@ -11,7 +11,8 @@ use crate::display::{
 use crate::rendering::{CAR_SPRITE_LABELS, CarVisualSettings};
 use crate::simulation::{
     Car, CarControls, CarObservation, CarProgress, CheckpointStore, EvaluationState, KinematicCar,
-    LaserState, LoadedNetwork, ManualControlMode, MlpController, PlaybackState, SelectedCar,
+    LaserState, LoadedNetwork, ManualControlMode, MlpController, PlaybackState, RaceMetrics,
+    RaceMetricsSummary, RaceParticipant, RaceRoster, RaceSession, RaceStanding, SelectedCar,
     SimulationConfig, SimulationMode, TestDriveEnvironment, TestDriveSettings, Track, TrackDebug,
     TrackLibrary, TrackSelection, TrainingFastForward, TrainingPhase, TrainingState,
     desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate,
@@ -19,7 +20,7 @@ use crate::simulation::{
 
 use super::{
     checkpoint_browser::draw_checkpoint_browser, fitness_plot::draw_fitness_plot,
-    network_view::draw_network,
+    network_view::draw_network, race_panel::draw_race_panel,
 };
 
 const KMH_PER_UNIT_PER_SECOND: f32 = 0.578_52;
@@ -36,6 +37,7 @@ type SelectedCarTelemetry<'w, 's> = Query<
         Option<&'static MlpController>,
         &'static Car,
         Option<&'static EvaluationState>,
+        Option<&'static RaceParticipant>,
     ),
     With<SelectedCar>,
 >;
@@ -55,12 +57,15 @@ pub struct DashboardData<'w, 's> {
     laser: Res<'w, LaserState>,
     checkpoints: ResMut<'w, CheckpointStore>,
     loaded_network: ResMut<'w, LoadedNetwork>,
+    race_roster: ResMut<'w, RaceRoster>,
+    race_session: ResMut<'w, RaceSession>,
     display: ResMut<'w, DisplaySettings>,
     camera: ResMut<'w, CameraViewState>,
     test_drive: ResMut<'w, TestDriveSettings>,
     diagnostics: Res<'w, DiagnosticsStore>,
     evaluations: Query<'w, 's, &'static EvaluationState>,
     selected: SelectedCarTelemetry<'w, 's>,
+    race_results: Query<'w, 's, (&'static RaceParticipant, &'static RaceMetrics)>,
     virtual_time: ResMut<'w, Time<Virtual>>,
 }
 
@@ -157,13 +162,7 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             SimulationMode::Champion,
                             "Champion",
                         );
-                        ui.add_enabled_ui(false, |ui| {
-                            ui.selectable_value(
-                                &mut selected_mode,
-                                SimulationMode::Race,
-                                "Race (later)",
-                            );
-                        });
+                        ui.selectable_value(&mut selected_mode, SimulationMode::Race, "Race");
                     });
                     ui.selectable_value(
                         &mut selected_mode,
@@ -187,12 +186,21 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                     egui::Grid::new("summary_grid")
                         .num_columns(2)
                         .show(ui, |ui| {
-                            ui.label("Generation");
-                            ui.monospace(data.training.generation().to_string());
-                            ui.end_row();
-                            ui.label("Population");
-                            ui.monospace(data.training.population().len().to_string());
-                            ui.end_row();
+                            if *data.mode == SimulationMode::Race {
+                                ui.label("Race state");
+                                ui.monospace(format!("{:?}", data.race_session.phase));
+                                ui.end_row();
+                                ui.label("Roster");
+                                ui.monospace(data.race_roster.len().to_string());
+                                ui.end_row();
+                            } else {
+                                ui.label("Generation");
+                                ui.monospace(data.training.generation().to_string());
+                                ui.end_row();
+                                ui.label("Population");
+                                ui.monospace(data.training.population().len().to_string());
+                                ui.end_row();
+                            }
                             let active = data
                                 .evaluations
                                 .iter()
@@ -203,12 +211,16 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             ui.monospace(format!("{active} / {finished}"));
                             ui.end_row();
                             ui.label("Phase");
-                            ui.monospace(match data.training.phase() {
-                                TrainingPhase::TrainingTrack { index, total, .. } => {
-                                    format!("training {}/{}", index + 1, total)
+                            ui.monospace(if *data.mode == SimulationMode::Race {
+                                format!("{:?}", data.race_session.phase).to_lowercase()
+                            } else {
+                                match data.training.phase() {
+                                    TrainingPhase::TrainingTrack { index, total, .. } => {
+                                        format!("training {}/{}", index + 1, total)
+                                    }
+                                    TrainingPhase::Validation { .. } => "validation".into(),
+                                    TrainingPhase::Evolving => "evolving".into(),
                                 }
-                                TrainingPhase::Validation { .. } => "validation".into(),
-                                TrainingPhase::Evolving => "evolving".into(),
                             });
                             ui.end_row();
                             ui.label("Episode");
@@ -217,12 +229,12 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                                 .iter()
                                 .map(|evaluation| evaluation.elapsed)
                                 .fold(0.0_f32, f32::max);
-                            ui.monospace(format!(
-                                "{elapsed:.1}s / {:.1}s safety cap",
-                                data.training
-                                    .evaluation_config()
-                                    .maximum_episode_duration
-                            ));
+                            let safety_cap = if *data.mode == SimulationMode::Race {
+                                data.race_session.safety_timeout
+                            } else {
+                                data.training.evaluation_config().maximum_episode_duration
+                            };
+                            ui.monospace(format!("{elapsed:.1}s / {safety_cap:.1}s safety cap"));
                             ui.end_row();
                         });
 
@@ -280,6 +292,24 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         ui.small(country);
                     }
                     ui.small(&data.track_selection.status);
+
+                    if *data.mode == SimulationMode::Race {
+                        let mut standings = data
+                            .race_results
+                            .iter()
+                            .map(|(participant, metrics)| RaceStanding {
+                                roster_index: participant.roster_index,
+                                metrics: RaceMetricsSummary::from(metrics),
+                            })
+                            .collect::<Vec<_>>();
+                        draw_race_panel(
+                            ui,
+                            &mut data.race_roster,
+                            &mut data.race_session,
+                            &data.track,
+                            &mut standings,
+                        );
+                    }
 
                     if *data.mode == SimulationMode::TestDrive {
                         ui.separator();
@@ -505,6 +535,10 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             CameraBehavior::FollowCar,
                             if *data.mode == SimulationMode::TestDrive {
                                 "Follow Car"
+                            } else if *data.mode == SimulationMode::Race
+                                && !data.race_session.auto_select_leader
+                            {
+                                "Follow Selected"
                             } else {
                                 "Follow Leader"
                             },
@@ -527,10 +561,15 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         _,
                         identity,
                         evaluation,
+                        race_participant,
                     )) = data.selected.iter().next()
                     {
                         if *data.mode != SimulationMode::TestDrive {
-                            ui.label(format!("Current leader: car #{}", identity.id));
+                            if let Some(participant) = race_participant {
+                                ui.label(format!("Inspected racer #{}", participant.roster_index + 1));
+                            } else {
+                                ui.label(format!("Current leader: car #{}", identity.id));
+                            }
                         }
                         ui.label(format!(
                             "Speed: {:+.1} u/s ({:+.1} km/h)",
@@ -635,30 +674,36 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                         ui.small("These are the same SimulationConfig values used by AI cars.");
                     } else {
                         ui.separator();
-                        ui.heading("Fitness");
-                        if data.training.history().is_empty() {
-                            ui.small("The first fitness sample appears when generation 0 finishes.");
-                        }
-                        draw_fitness_plot(ui, data.training.history());
+                        if *data.mode != SimulationMode::Race {
+                            ui.heading("Fitness");
+                            if data.training.history().is_empty() {
+                                ui.small("The first fitness sample appears when generation 0 finishes.");
+                            }
+                            draw_fitness_plot(ui, data.training.history());
 
-                        let laser_config = data.training.evaluation_config().laser;
-                        ui.small(format!(
+                            let laser_config = data.training.evaluation_config().laser;
+                            ui.small(format!(
                             "laser: grace {:.1}s • speed {:.1}/{:.1} u/s • progress {:.1}u",
                             laser_config.grace_period,
                             data.laser.speed,
                             laser_config.maximum_speed,
                             data.laser.progress,
                         ));
-                        ui.small(format!(
+                            ui.small(format!(
                             "fitness: progress={:.2}, useful speed={:.2}, completion bonus={:.2}, collision penalty={:.2}",
                             data.training.evaluation_config().progress_weight,
                             data.training.evaluation_config().speed_weight,
                             data.training.evaluation_config().completion_bonus,
                             data.training.evaluation_config().collision_penalty,
-                        ));
+                            ));
+                        }
 
                         ui.separator();
-                        ui.heading("Current Leader Neural Network");
+                        ui.heading(if *data.mode == SimulationMode::Race {
+                            "Inspected Racer Neural Network"
+                        } else {
+                            "Current Leader Neural Network"
+                        });
                         if let Some((
                             _,
                             _,
@@ -668,34 +713,53 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             Some(controller),
                             identity,
                             _,
+                            race_participant,
                         )) = data.selected.iter().next()
                         {
                             let telemetry = controller.telemetry();
-                            ui.label(format!(
-                                "Generation {} • car #{} • live progress {:.1}%",
-                                data.training.generation(),
-                                identity.id,
-                                progress.normalized_progress * 100.0
-                            ));
+                            if let Some(participant) = race_participant
+                                && let Some(entry) =
+                                    data.race_roster.entries().get(participant.roster_index)
+                            {
+                                ui.label(format!(
+                                    "{} · generation {} · live progress {:.1}%",
+                                    entry.architecture,
+                                    entry.generation,
+                                    progress.normalized_progress * 100.0
+                                ));
+                            } else {
+                                ui.label(format!(
+                                    "Generation {} • car #{} • live progress {:.1}%",
+                                    data.training.generation(),
+                                    identity.id,
+                                    progress.normalized_progress * 100.0
+                                ));
+                            }
                             draw_network(
                                 ui,
                                 telemetry.layer_sizes,
                                 telemetry.parameters,
                                 telemetry.activations,
                             );
-                            ui.small(
-                                "Activations update after every controller inference; the view follows the live first-place car.",
-                            );
+                            ui.small("Detailed activation trace is collected only for SelectedCar.");
                         } else {
-                            ui.small("Waiting for the current generation leader telemetry.");
+                            ui.small(if *data.mode == SimulationMode::Race {
+                                "Select Inspect on a racer to view its live network."
+                            } else {
+                                "Waiting for the current generation leader telemetry."
+                            });
                         }
-                        if let Some(stats) = data.training.current_training_fitness() {
+                        if *data.mode != SimulationMode::Race
+                            && let Some(stats) = data.training.current_training_fitness()
+                        {
                             ui.label(format!(
                                 "Training fitness: best {:.3} / average {:.3}",
                                 stats.best_fitness, stats.average_fitness
                             ));
                         }
-                        if let Some(validation) = data.training.latest_validation() {
+                        if *data.mode != SimulationMode::Race
+                            && let Some(validation) = data.training.latest_validation()
+                        {
                             ui.label(format!(
                                 "Validation: {} / {:.3} / {}",
                                 validation.track_id,
@@ -712,6 +776,8 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
                             &mut data.checkpoints,
                             &mut data.loaded_network,
                             &mut data.mode,
+                            &mut data.race_roster,
+                            &mut data.race_session,
                         );
                     }
                 });
