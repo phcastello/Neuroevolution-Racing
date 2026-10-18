@@ -4,7 +4,7 @@
 use racing_rl::{
     backend::{self, Cpu, Gpu, matrix, read},
     config::Config,
-    distribution,
+    distribution, manual,
     network::Network,
     optimizer::{Optimizer, clip_global_norm},
     ppo::{self, LossInputs},
@@ -16,6 +16,119 @@ fn compare(a: Vec<f32>, b: Vec<f32>) {
     for (a, b) in a.iter().zip(b) {
         assert!((a - b).abs() <= 1e-4 + 1e-3 * b.abs(), "{a} vs {b}");
     }
+}
+
+#[test]
+fn actual_hardware_backward_clipping_entropy_and_adam_parity() {
+    let (device, label) = backend::gpu_device(0).unwrap();
+    println!("backward: {label}");
+    for batch in [9, 18] {
+        for entropy_coef in [0., 0.017] {
+            let config = Config {
+                hidden: vec![8, 5],
+                latent_entropy_coef: entropy_coef,
+                ..Default::default()
+            };
+            let dim = config.observation.dimension();
+            let cpu = Network::<Cpu>::new(&config, &Default::default()).unwrap();
+            let gpu = Network::<Gpu>::new(&config, &device).unwrap();
+            let observations: Vec<_> = (0..batch * dim)
+                .map(|i| ((i % 17) as f32 - 8.) / 17.)
+                .collect();
+            let u: Vec<_> = (0..batch * 2).map(|i| ((i % 7) as f32 - 3.) / 5.).collect();
+            let cpu_cache = cpu
+                .forward(matrix(&observations, batch, dim, &Default::default()).unwrap())
+                .unwrap();
+            let gpu_cache = gpu
+                .forward(matrix(&observations, batch, dim, &device).unwrap())
+                .unwrap();
+            let cpu_distribution = distribution::evaluate(
+                cpu_cache.mean.clone(),
+                cpu.log_std.clone(),
+                matrix(&u, batch, 2, &Default::default()).unwrap(),
+            )
+            .unwrap();
+            let gpu_distribution = distribution::evaluate(
+                gpu_cache.mean.clone(),
+                gpu.log_std.clone(),
+                matrix(&u, batch, 2, &device).unwrap(),
+            )
+            .unwrap();
+            // Mesmos dados históricos nos dois dispositivos; grade completa de clipping.
+            let old: Vec<_> = read(cpu_distribution.joint_log_density.clone())
+                .unwrap()
+                .into_iter()
+                .enumerate()
+                .map(|(i, log_density)| log_density - [0.55_f32, 1.05, 1.55][i % 3].ln())
+                .collect();
+            let advantages: Vec<_> = (0..batch).map(|i| [0.7, -0.4, 0.][i / 3 % 3]).collect();
+            let (cpu_loss, _) = ppo::forward(
+                cpu_distribution,
+                cpu_cache.value.clone(),
+                LossInputs {
+                    old_log_prob: matrix(&old, batch, 1, &Default::default()).unwrap(),
+                    advantage: matrix(&advantages, batch, 1, &Default::default()).unwrap(),
+                    value_target: matrix(&vec![0.3; batch], batch, 1, &Default::default()).unwrap(),
+                },
+                &config,
+            )
+            .unwrap();
+            let (gpu_loss, _) = ppo::forward(
+                gpu_distribution,
+                gpu_cache.value.clone(),
+                LossInputs {
+                    old_log_prob: matrix(&old, batch, 1, &device).unwrap(),
+                    advantage: matrix(&advantages, batch, 1, &device).unwrap(),
+                    value_target: matrix(&vec![0.3; batch], batch, 1, &device).unwrap(),
+                },
+                &config,
+            )
+            .unwrap();
+            // Confere as regiões antes de comparar qualquer derivada.
+            let expected_ratios: Vec<_> = (0..batch).map(|i| [0.55, 1.05, 1.55][i % 3]).collect();
+            compare(
+                read(cpu_loss.ratio.clone()).unwrap(),
+                expected_ratios.clone(),
+            );
+            compare(read(gpu_loss.ratio.clone()).unwrap(), expected_ratios);
+            let cpu_outputs = manual::ppo_output_gradients(&cpu_loss).unwrap();
+            let gpu_outputs = manual::ppo_output_gradients(&gpu_loss).unwrap();
+            for (cpu_tensor, gpu_tensor) in [
+                (cpu_outputs.mean.clone(), gpu_outputs.mean.clone()),
+                (cpu_outputs.value.clone(), gpu_outputs.value.clone()),
+                (cpu_outputs.log_std.clone(), gpu_outputs.log_std.clone()),
+            ] {
+                compare(read(cpu_tensor).unwrap(), read(gpu_tensor).unwrap());
+            }
+            let cpu_gradients =
+                manual::shared_heads_backward(&cpu, cpu_cache, cpu_outputs).unwrap();
+            let gpu_gradients =
+                manual::shared_heads_backward(&gpu, gpu_cache, gpu_outputs).unwrap();
+            for (cpu_tensor, gpu_tensor) in cpu_gradients.iter().zip(&gpu_gradients) {
+                compare(
+                    read(cpu_tensor.clone()).unwrap(),
+                    read(gpu_tensor.clone()).unwrap(),
+                );
+            }
+            let cpu_parameters = cpu.parameters();
+            let gpu_parameters = gpu.parameters();
+            let mut cpu_adam = Optimizer::new(config.optimizer.clone(), &cpu_parameters);
+            let mut gpu_adam = Optimizer::new(config.optimizer.clone(), &gpu_parameters);
+            let (cpu_gradients, _) = clip_global_norm(cpu_gradients, 0.5).unwrap();
+            let (gpu_gradients, _) = clip_global_norm(gpu_gradients, 0.5).unwrap();
+            let cpu_updated = cpu_adam
+                .update(&cpu_parameters, cpu_gradients, 0.0003)
+                .unwrap();
+            let gpu_updated = gpu_adam
+                .update(&gpu_parameters, gpu_gradients, 0.0003)
+                .unwrap();
+            for (cpu_tensor, gpu_tensor) in cpu_updated.into_iter().zip(gpu_updated) {
+                compare(read(cpu_tensor).unwrap(), read(gpu_tensor).unwrap());
+            }
+            println!("paridade backward/Adam: B={batch}, entropia={entropy_coef}");
+        }
+    }
+    backend::sync::<Gpu>(&device).unwrap();
 }
 #[test]
 fn actual_hardware_forward_distribution_loss_optimizer_parity() {

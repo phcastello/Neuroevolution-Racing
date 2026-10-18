@@ -1,8 +1,8 @@
-# Área de aprendizado: cinco funções manuais
+# Backpropagation explícito: cinco funções implementadas
 
-Todas as pendências ficam em **`crates/rl/src/manual.rs`**. Não existem derivadas escondidas em shaders, helpers, testes ou bibliotecas de treino. Cada stub retorna `Error::MissingManualImplementation { function }`. A infraestrutura não produz gradientes zero para simular sucesso.
+As cinco funções estão implementadas em **`crates/rl/src/manual.rs`**, com operações tensoriais vetorizadas e comentários em português. Toda a matemática do backward permanece nesse arquivo, sem autodiferenciação, derivadas em shaders ou diferenças finitas no treino. O nome histórico deste documento foi preservado como guia de estudo.
 
-`B: Backend` é o backend Burn sem autodiff; o mesmo código matemático deve servir CPU e WGPU. Use `Tensor<B,2>` e as primitivas reexportadas por `backend`. Não será preciso implementar upload, seleção de linhas, shaders, buffers de rollout, resets ou comunicação com o app.
+`B: Backend` é o backend Burn sem autodiff; o mesmo código matemático serve CPU e WGPU. `Tensor<B,2>` e as primitivas reexportadas por `backend` mantêm as operações no dispositivo. Upload, seleção de linhas, buffers, resets, otimizadores e comunicação com o app continuam na infraestrutura existente.
 
 ## Ordem sugerida e contratos exatos
 
@@ -17,7 +17,7 @@ pub fn activation_backward<B: Backend>(
 ) -> Result<Tensor<B, 2>>
 ```
 
-Arquivo: `crates/rl/src/manual.rs`, função `activation_backward`. Enum local: `Relu`, `Linear`, `Tanh`. Inputs e output `[B,H]`. `z` é a pré-ativação, `activation` a saída já calculada, upstream é a derivada do escalar objetivo em relação à saída. Retorne a contribuição em relação a z. Escolha e documente uma convenção em ReLU zero; os testes centrais evitam esse ponto. Não há média/redução adicional aqui.
+Arquivo: `crates/rl/src/manual.rs`, função `activation_backward`. Enum local: `Relu`, `Linear`, `Tanh`. Inputs e output `[B,H]`. `z` é a pré-ativação, `activation` a saída já calculada, upstream é a derivada do escalar objetivo em relação à saída. Retorna a contribuição em relação a z pela regra da cadeia. ReLU em zero usa derivada zero, verificada em teste unitário; os testes centrais evitam esse ponto. Não há média/redução adicional aqui.
 
 Teste associado: `rl check-gradients --case activation` compara os três tipos com diferenças centrais. Não fornece fórmulas analíticas.
 
@@ -35,7 +35,7 @@ Arquivo: `crates/rl/src/manual.rs`, função `dense_backward`. Input X `[B,I]`; 
 
 Retorno `DenseGradients { input: [B,I], weights: [O,I], bias: [1,O] }`. A regra forward é `X*Wᵀ+b`. Bias faz broadcast entre linhas; preserve shapes e soma das contribuições. Não divida por B. Pesos são emprestados e não podem ser atualizados aqui.
 
-Teste: `--case dense`, incluindo pesos, biases e entradas, com upstream fixo.
+Teste: `--case dense`, incluindo pesos, biases e entradas, com upstream fixo. Usa `(B,I,O)=(2,3,4)` e `(5,4,2)`: pesos, entradas e upstream não são quadrados. As shapes dos gradientes são verificadas antes de comparar os valores, para detectar transposições e reduções no eixo errado.
 
 ### 3. MLP/tronco
 
@@ -104,13 +104,27 @@ Arquivo: `crates/rl/src/manual.rs`, função `ppo_output_gradients`. Outputs: de
 | total | `[1]`, loss escalar de minimização |
 | epsilon / coeficientes / batch_size | configuração usada por este forward |
 
-O forward está em `distribution.rs` e `ppo.rs`. Produza as derivadas do objetivo de minimização completo, incluindo value_coef e o sinal de latent_entropy_coef. Não há value clipping. Exploração existe pelo sorteio mesmo com entropia_coef zero.
+O forward está em `distribution.rs` e `ppo.rs`. O backward deriva exatamente esse objetivo de minimização, incluindo value_coef e o sinal de latent_entropy_coef. Não há value clipping. Exploração existe pelo sorteio mesmo com entropia_coef zero. O mínimo zera a contribuição da policy para vantagem positiva acima do limite superior e vantagem negativa abaixo do limite inferior. Nos empates, inclusive nas fronteiras, escolhe-se o ramo sem clip, como no forward; os checks evitam essas fronteiras. Com u histórico fixo, a correção Jacobiana da Tanh é constante em relação a mu e log_std.
 
 **Inclua exatamente uma média por B aqui.** As demais funções não dividem por B. log_std é compartilhado pelas linhas: o retorno deve já combinar todas as suas contribuições. O regularizador de entropia latente é escalar e não deve ganhar um fator B indevido por broadcast.
 
 Observações, u, ações, dados antigos, vantagens e targets são constantes de treinamento. O backward não atravessa o simulador, o reset ou o sorteio do rollout. Não sorteie ação nova durante o update; não recupere u com atanh. A projeção de log_std acontece **depois** do optimizer; não faz parte do grafo a derivar aqui.
 
-Testes: `--case log_std` isola os dois parâmetros globais; `--case ppo` verifica a rede completa com distribuição/loss; `--case synthetic` exige redução de um objetivo congelado usando os hooks e Adam. Casos de forward com vantagens positivas, negativas e zero e ratios fora da faixa ficam em `crates/rl/tests/infrastructure.rs`.
+Testes: `--case mu`, `--case value` e `--case log_std` comparam separadamente cada grupo de saída, mantendo os outros dois fixos. `--case ppo` verifica todos os parâmetros pela propagação integrada com distribuição/loss. `--case synthetic` exige redução de um objetivo congelado usando os hooks e Adam; é um smoke separado, sem função de cobertura das regiões de clipping.
+
+Os quatro casos numéricos PPO usam `FrozenPpoFixture`, em `crates/rl/src/verification.rs`, com a seguinte grade de **nove combinações** em cada minibatch:
+
+| Vantagem fixa | Ratio 0,55 (abaixo) | Ratio 1,05 (dentro) | Ratio 1,55 (acima) |
+|---|---|---|---|
+| Positiva | objetivo sem limitação pelo clip | objetivo sem limitação pelo clip | objetivo limitado pelo clip |
+| Negativa | objetivo limitado pelo clip | objetivo sem limitação pelo clip | objetivo sem limitação pelo clip |
+| Zero | termo de policy constante | termo de policy constante | termo de policy constante |
+
+Cada caso percorre **B=9 e B=18**, ambos com `latent_entropy_coef=0` e `0,017`: quatro fixtures por caso. B=18 repete a grade com magnitudes de vantagem diferentes e entradas/u variados. `value_coef=0,5` e epsilon=0,2 ficam fixos. O checker não contém soluções analíticas; compara o backward real de `manual.rs` com diferenças finitas.
+
+`old_log_prob` é calibrado **uma única vez**, a partir da log-densidade da rede não perturbada e dos ratios desejados, e armazenado na fixture. Todas as avaliações seguintes clonam esse mesmo tensor. Não o recalcule a partir da política perturbada: isso mudaria o objetivo da diferença finita. Observações, u histórico, vantagens e targets também permanecem fixos; não há RNG durante as perturbações.
+
+Antes de chamar o hook, a fixture confere os ratios iniciais contra os valores desejados (tolerância absoluta `1e-12`), o sinal/magnitude das vantagens e qual ramo limita o objetivo. **Cada avaliação perturbada** volta a verificar os dados congelados, a região de ratio e a seleção do ramo. A margem mínima exigida em relação às fronteiras de clipping é `0,1`; as pré-ativações do tronco devem permanecer positivas e maiores que `0,05`. Assim, um stencil que cruze uma fronteira gera erro de fixture, em vez de uma comparação de gradientes enganosa. Vantagem zero é uma constante histórica: o empate dos termos de policy permanece zero para todas as perturbações. Dentro da faixa, os dois termos coincidem como funções, sem criar uma troca de ramo não diferenciável nesse ponto.
 
 ## Executar e interpretar os testes
 
@@ -120,16 +134,35 @@ cargo run -p neuroevolution-racing-app -- rl check-gradients --case activation
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case dense
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case trunk
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case heads
+cargo run -p neuroevolution-racing-app -- rl check-gradients --case mu
+cargo run -p neuroevolution-racing-app -- rl check-gradients --case value
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case log_std
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case ppo
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case synthetic
 cargo run -p neuroevolution-racing-app -- rl check-gradients --case all
 ```
 
-Enquanto falta função, termina com código de erro, nome identificável e `PENDENTE`. Somente após uma comparação realmente passar imprime `APROVADO`. A suíte de infraestrutura pode passar verificando que a pendência foi reportada corretamente; isso **não** significa que a derivada passou. Use `cargo test -p racing-rl -- --nocapture` para ver esses estados.
+Os casos individuais e `all` agora imprimem `APROVADO` após comparações reais. O teste `manual::tests::completed_hooks_and_relu_zero_convention` exige que o preflight dos cinco hooks passe: regressão para stub falha a suíte, em vez de ser aceita como pendência. Use `cargo test -p racing-rl -- --nocapture` para ver os resultados por caso.
+
+| Caso | O que será comparado com os hooks reais |
+|---|---|
+| `activation` | ReLU, Linear e Tanh com upstream congelado |
+| `dense` | dW, db e dX em duas shapes não quadradas |
+| `trunk` | parâmetros e entrada do tronco |
+| `heads` | parâmetros de ambas cabeças, tronco e log_std com upstreams fixos |
+| `mu` | cada coordenada de dmu `[B,2]`, sem perturbar value/log_std |
+| `value` | cada coordenada de dV `[B,1]`, sem perturbar mu/log_std |
+| `log_std` | os dois parâmetros globais `[1,2]`, sem perturbar mu/value |
+| `ppo` | todos os parâmetros da rede, com a mesma grade de clipping e histórico congelado |
+| `synthetic` | diminuição de um objetivo pequeno usando hooks e Adam |
+| `all` | todos os casos anteriores; encerra na primeira pendência/erro |
+
+Os testes unitários de `verification::tests` verificam a grade, os stencils numéricos dos três grupos e da rede, a preservação dos dados e a restauração dos pesos. Também verificam que a guarda rejeita região errada, histórico alterado e aproximação excessiva da fronteira. Esses testes validam **a infraestrutura numérica**. O teste de integração de nome histórico `manual_suite_reports_pending_instead_of_fake_success` chama os hooks reais e agora aprova todos os casos por comparação numérica.
 
 Checker: `crates/rl/src/verification.rs`. Usa CPU NdArray **f64**, diferenças finitas **centrais**, passo 1e-5 e tolerância `abs 2e-6 + rel 2e-4*abs(referência)`. Fixtures pequenas, sem sorteio no objetivo, pesos/inputs/upstreams/u fixos; hidden preactivations afastadas de zero. Perturbações não devem cruzar os pontos não diferenciáveis de ReLU/min/clip; ao adicionar casos, confira essa condição. Não há soluções analíticas de teste para copiar.
 
 Diferenças finitas são validação, nunca fonte de gradientes do optimizer. O preflight de treino chama todos os hooks reais num caso pequeno, sem diferenças finitas; o update usa exclusivamente os retornos manuais. Execute os gradient checks explicitamente antes de iniciar treino longo.
 
-`simulation::rl_environment::tests::real_rollout_determinism_resets_at_different_times_and_manual_train_gate` coleta com física real e só exige optimizer.step>0 depois que o preflight passar; enquanto isso mostra `PENDENTE PPO train smoke`. O sintético e esse smoke não demonstram aprendizado na pista. Tal demonstração exigirá treinamento real e avaliação separada.
+`simulation::rl_environment::tests::real_rollout_determinism_resets_at_different_times_and_manual_train_gate` coleta com física real e exige optimizer.step>0 depois do preflight, que agora passa. O teste hardware `actual_hardware_backward_clipping_entropy_and_adam_parity` compara saídas do backward, todos os gradientes e parâmetros após Adam em CPU/WGPU f32, com B=9/18, a grade de clipping e entropia 0/0,017. Tolerância: `abs 1e-4 + rel 1e-3*abs(referência)`.
+
+O sintético e os smokes não demonstram aprendizado na pista. Veja [VALIDACAO.md](VALIDACAO.md) para os comandos efetivamente executados, treinos reais de três rollouts e avaliação separada.
