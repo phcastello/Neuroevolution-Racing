@@ -163,3 +163,83 @@ Resultado em `results_ppo/ppo-1792338139692250700-30196/checkpoint-000004.ron`: 
 Código de produção alterado somente em `manual.rs`. `crates/rl/tests/gpu.rs` ganhou o teste de paridade de backward/Adam. `BACKPROP_PARA_IMPLEMENTAR.md`, `COMO_EXECUTAR.md` e este registro foram atualizados para o estado implementado e os comandos reais. As mudanças anteriores de `verification.rs` foram preservadas. Não houve alteração de GA, cenas/física, coleta, backends, otimizadores, persistência, manifests ou lockfile.
 
 As execuções foram debug/dev, incluindo compilação de kernels e cache frio. Não constituem benchmark de desempenho, prova de convergência ou escolha validada de hiperparâmetros. O benchmark existente continua restrito a inferência/coleta; seu texto histórico de update indisponível não é um diagnóstico dos hooks atuais. `run.log` do treino registra tempos de update reais. O comando release para treino mais longo na Radeon está em [COMO_EXECUTAR.md](COMO_EXECUTAR.md); não foi iniciado automaticamente. Nenhuma função de backpropagation permanece pendente.
+## Integração visual PPO — 18/10/2026
+
+Validação no Windows 11 Pro, Ryzen 5 5600X e Radeon RX 6700 XT, usando o checkpoint real `results_ppo/ppo-1792340830035034100-29472/checkpoint-000100.ron` (25 entradas, tronco 64/64, Actor 2, Critic 1, 6.021 parâmetros). A inferência do playback permaneceu CPU f32, sem a feature `rl-gpu`; Vulkan foi usado pelo Bevy para renderização.
+
+| Verificação | Resultado |
+| --- | --- |
+| `cargo fmt --all --check` | Aprovado |
+| `cargo build -p neuroevolution-racing-app --locked` com `CARGO_INCREMENTAL=0` | Aprovado |
+| `cargo test --workspace --locked` com `CARGO_INCREMENTAL=0` | **245 testes aprovados**: 80 neuroevolution, 147 app, 4 unitários racing-rl e 14 de infraestrutura; zero falhas/ignorados |
+| `cargo test -p racing-rl --features gpu --test gpu --locked` com `CARGO_INCREMENTAL=0` | **2 testes aprovados** no hardware Radeon, incluindo backward e Adam; zero falhas/ignorados |
+| `rl train --config target/ppo-view-cli-smoke.ron` | Dois rollouts headless, checkpoints e perdas reais |
+| `rl train --config target/ppo-view-cli-resume.ron --resume target/ppo-view-cli-results/ppo-1792342684629309600-4316/checkpoint-000002.ron` | Retomada headless até o rollout 3 |
+| `rl evaluate --checkpoint results_ppo/ppo-1792340830035034100-29472/checkpoint-000100.ron --episodes 1 --cpu` | Três episódios headless: Spa, Suzuka e Monaco |
+| `rl evaluate --checkpoint target/ppo-view-cli-results/ppo-1792342701840932700-11752/checkpoint-000003.ron --episodes 1 --cpu` | Checkpoint retomado válido; três episódios headless |
+| `cargo run --locked -p neuroevolution-racing-app -- rl view --checkpoint results_ppo/ppo-1792340830035034100-29472/checkpoint-000100.ron --cars 2 --track interlagos --frames 600` com `CARGO_INCREMENTAL=0` | Inicialização completa e encerramento automático aprovados após as sessões gráficas prolongadas |
+
+Os dois arquivos de configuração temporários são cópias de `configs/rl/smoke.ron`, com `total_rollouts` 2/3 e saída em `target/ppo-view-cli-results`. Nenhum preset ou checkpoint existente foi sobrescrito. O treino e a retomada produziram `rendered_frames=0`.
+
+Os testes novos verificam restauração de arquitetura/parâmetros/física, rejeição atômica de checkpoints ausentes/malformados/incompatíveis, histórico por rollout, seleção de pistas de treinamento e validação, reset reproduzível, pausa/retomada, troca simultânea de checkpoint/pista, seleção ECS, ausência de recursos GA no playback, fim de episódio e auto-reset. Comparam decisões completas com inferência `Network::infer` e ambiente RL independentes até o término, incluindo observações, ações, Critic, recompensa, progresso, ticks e imutabilidade dos parâmetros. Um batch com estados distintos verifica que o trace corresponde ao carro correto. Outros testes cobrem topologia ramificada, orçamento visual, detalhes sem efeito sobre a política, sprites, limpeza de assets, profundidade da câmera e preservação de recursos GA.
+
+A inspeção gráfica usou sessões sem limite de frames, durante vários minutos, e não apenas um abre/fecha de janela. Foram observados:
+
+- Pista com asfalto, zebras, marcações e sprite original; zoom, acompanhamento, câmera livre e ajuste da pista.
+- Colisão com sprite escurecido, pose terminal visível e reinício automático do episódio.
+- Sensores com os 21 raios da observação PPO; telemetria e ativações atualizadas durante o movimento.
+- Pausa preservando o estado, troca de Spa para Interlagos durante a pausa e reset dos contadores sem retomar automaticamente.
+- Histórico com 112 checkpoints descobertos e troca real do rollout 100 para o rollout 1; versão, ativações e `log_std` mudaram juntos.
+- Janela neural mostrando integralmente tronco, Actor, Critic e caixa global de `log_std`, com rolagem para detalhes expandidos.
+- Aplicação GA original nos modos Training, Test Drive e Open Field, mantendo seus painéis, sprites e cenário.
+
+O teste de rotação da câmera executa o sistema compartilhado real com Q/E, tempo real avançando e playback pausado. A inspeção gráfica revelou e corrigiu o recorte herdado do asfalto: câmera em Z=1000 com plano distante de 1000 excluía a pista em Z=-2. A câmera compartilhada agora fica em Z=500; um teste verifica a inclusão das camadas de fundo, asfalto, linhas, zebras e carros. O enquadramento XY foi preservado.
+
+Na avaliação do checkpoint 100 em Spa, observaram-se 253 decisões/ticks, progresso `0.045804854`, colisão e recompensa `6.062719566747546`, coerentes com o painel do playback (arredondado). Isso valida consistência; não é uma afirmação de convergência ou de conclusão da pista.
+
+Logs desta integração: `target/ppo-view-tests-final.log`, `target/ppo-view-tests-gpu.log`, `target/ppo-view-build-final.log`, `target/ppo-view-cli-*.log`, `target/ppo-view-gui-final.*.log` e `target/ppo-view-ga.*.log`. Não houve erros de assets ou panic nas sessões gráficas inspecionadas.
+
+Esta cópia já apresentava metadados `.git` incompletos (`HEAD`/`config` ausentes) e cache incremental Rust com objetos ausentes. Não se modificou `.git`, nem se fez commit/push. A compilação foi validada com `$env:CARGO_INCREMENTAL = '0'`, sem mudar a configuração versionada de compilação. A limpeza por `cargo clean` foi abortada pelo próprio Cargo por ausência de `CACHEDIR.TAG`; nenhum arquivo de cache foi removido por esse procedimento.
+
+## Refinamento da visualização Actor-Critic — 18/10/2026
+
+Esta rodada modifica exclusivamente a apresentação neural PPO e o tamanho inicial de sua janela. A captura das ativações continua usando o forward real do carro selecionado. Não foram alterados treinamento, inferência, física, avaliação, checkpoints, câmera, sprites, histórico de políticas ou modos GA.
+
+| Verificação | Resultado |
+| --- | --- |
+| `cargo fmt --all --check` | Aprovado |
+| `cargo build -p neuroevolution-racing-app --locked` | Aprovado |
+| `cargo test --workspace --locked` | **263 testes aprovados**: 80 neuroevolution, 165 app, 4 unitários racing-rl e 14 de infraestrutura; zero falhas/ignorados |
+| Testes de layout | Seleção proporcional, prefixos/sufixos e índices reais, posição central das elipses, ausência de sobreposição dos grupos e layout expandido sem limite, inclusive camada de 8.192 neurônios |
+| Testes de conexões | Pesos e índices exatos, ramificação Actor/Critic, ausência de arestas para `log_std`, orçamento somente no condensado, invalidação de cache e recorte de segmentos que atravessam a viewport com ambas as pontas fora dela |
+| Quatro testes integrados da apresentação | Base, Stress e pequena nos dois modos, correspondência com ativações reais, parâmetros/inferência preservados, cache reutilizado e tooltip real de parâmetro global |
+
+Os comandos Cargo usaram `$env:CARGO_INCREMENTAL = '0'`. Os testes integrados estão incluídos nos 263 testes acima. Logs: `target/ppo-network-qa/tests.log`, `build.log` e `presentation-timings.log`.
+
+### Arquiteturas e contagens verificadas
+
+Os totais de neurônios abaixo incluem entradas, tronco e cabeças; os dois parâmetros globais do Actor são apresentados adicionalmente e não contam como neurônios conectados. A seleção condensada usa a densidade padrão 12.
+
+| Rede | Arquitetura do tronco | Condensada | Expandida | Conexões reais totais |
+| --- | --- | --- | --- | --- |
+| Base | 25 → 64 → 64 | 35/156 neurônios | 156/156 neurônios | 5.888 |
+| Stress | 25 → 256 → 256 → 256 → 256 → 128 | 66/1.180 neurônios | 1.180/1.180 neurônios | 236.160 |
+| Pequena | 25 → 8 → 4 | 40/40 neurônios, sem elipses | 40/40 neurônios | 244 |
+
+Na Base, as colunas condensadas mostram 8 entradas e 12 neurônios por camada oculta; na Stress, mostram 6 entradas, 12 por camada de 256 e 9 na camada de 128. Todos preservam os índices originais e os valores das ativações correspondentes. O orçamento condensado limita somente conexões entre nós efetivamente selecionados. A Expandida ignora esse orçamento, mesmo quando ele é zero.
+
+A Base usa o checkpoint treinado `results_ppo/ppo-1792340830035034100-29472/checkpoint-000100.ron`. Stress e pequena usam checkpoints iniciais válidos, produzidos pelo comando existente `rl collect` com configurações temporárias em `target/ppo-network-qa/stress.ron` e `small.ron`. Os caminhos dos artefatos estão em `target/ppo-network-qa/fixtures.json`; não se alterou nenhum preset ou checkpoint existente.
+
+### Inspeção gráfica real no Windows
+
+Foram abertas sessões interativas sem limite de frames das três arquiteturas, verificando ambos os modos com playback ativo. Na Base, a rolagem alcançou os índices finais 63; na Stress, alcançou 255 e permitiu navegar horizontalmente até Actor/Critic. A troca de modo, a exibição independente das conexões, o zoom, o enquadramento e a restauração para 100% responderam durante a execução e os resets dos episódios.
+
+A inspeção confirmou prefixos/sufixos, elipses centrais, contagens de omitidos e diferenças visuais entre as larguras das camadas. O espaçamento condensado da Stress permite ver a arquitetura completa na largura inicial da janela neural. Na pequena, não há omissão em nenhum modo; o enquadramento mostrou os 40 neurônios e as 244 conexões na viewport.
+
+As saídas do Actor aparecem junto dos dois círculos globais de `log_std`, com contorno distinto e sem conexões neurais para os parâmetros globais. O Critic permanece separado e conectado ao tronco. Foi conferido por hover o tooltip real de `log_std steering`, incluindo nome, valor, desvio padrão e significado. Ao afastar muito o zoom, os textos ilegíveis são ocultados sem remover nós ou conexões; na Stress, o enquadramento incluiu todos os 1.180 neurônios e as 236.160 conexões. Em escala natural, os índices e valores voltam a aparecer. Não foram observados erros de assets ou panic nos logs gráficos inspecionados.
+
+### Custo de desenho
+
+No teste CPU em perfil de testes não otimizado, com viewport de 1.000 × 700, a Stress expandida preparou as 236.160 conexões em aproximadamente 101 ms no primeiro desenho e reutilizou o cache em aproximadamente 0,63 ms no desenho estacionário seguinte. Nesse recorte, 29.963 segmentos eram visíveis. O teste verifica estruturalmente a reutilização de geometria/viewport e a integridade de todos os pesos; os tempos são observações locais, sem limite temporal artificial no teste. Esses números medem a preparação CPU do canvas, não o FPS completo do aplicativo.
+
+As sessões de QA foram encerradas. Nenhum commit ou push foi realizado.

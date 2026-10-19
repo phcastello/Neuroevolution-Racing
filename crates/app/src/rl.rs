@@ -1,9 +1,12 @@
 //! CLI orchestration. GA commands and all historical formats remain separate.
+mod persistence_policy;
+pub(crate) mod viewer;
 use crate::simulation::{
     SimulationConfig, TrackLibrary,
     rl_environment::{self as env, RacingEnvironment},
 };
 use clap::Subcommand;
+use persistence_policy::PersistenceOptions;
 use racing_rl::{
     Result,
     backend::{self, Backend, Cpu, Tensor, matrix, read},
@@ -40,6 +43,8 @@ pub enum RlCommand {
         config: PathBuf,
         #[arg(long)]
         resume: Option<PathBuf>,
+        #[command(flatten)]
+        persistence: PersistenceOptions,
     },
     /// Deterministic evaluation on held-out tracks, with independent seeds.
     Evaluate {
@@ -60,12 +65,15 @@ pub enum RlCommand {
         #[arg(long, default_value = "all")]
         case: String,
     },
-    /// Display a frozen PPO policy in a small standalone Bevy viewer.
+    /// Inspect a frozen PPO policy with the original sprites, camera and dashboard.
     View {
         #[arg(long)]
         checkpoint: PathBuf,
         #[arg(long, default_value_t = 4)]
         cars: usize,
+        /// Initial track ID; defaults to the first held-out evaluation track.
+        #[arg(long)]
+        track: Option<String>,
         /// Close after this many rendered frames (useful for a bounded preview/smoke).
         #[arg(long)]
         frames: Option<u64>,
@@ -108,11 +116,15 @@ fn run_inner(command: RlCommand) -> Result<()> {
             let c = resolve_config(Config::load(&config)?)?;
             dispatch(&c, Job::Collect)
         }
-        RlCommand::Train { config, resume } => {
+        RlCommand::Train {
+            config,
+            resume,
+            persistence,
+        } => {
             let c = Config::load(&config)?;
             manual::preflight()?;
             let c = resolve_config(c)?;
-            dispatch(&c, Job::Train(resume))
+            dispatch(&c, Job::Train(resume, persistence))
         }
         RlCommand::Benchmark { config } => {
             let c = resolve_config(Config::load(&config)?)?;
@@ -138,19 +150,20 @@ fn run_inner(command: RlCommand) -> Result<()> {
         RlCommand::View {
             checkpoint,
             cars,
+            track,
             frames,
         } => {
             ensure((1..=16).contains(&cars), "viewer cars 1..16")?;
             ensure(frames.is_none_or(|f| f > 0), "viewer frames > 0")?;
             let saved: Checkpoint = persistence::load(&checkpoint)?;
             saved.validate()?;
-            view(saved, cars, frames)
+            viewer::view(saved, checkpoint, cars, track, frames)
         }
     }
 }
 enum Job {
     Collect,
-    Train(Option<PathBuf>),
+    Train(Option<PathBuf>, PersistenceOptions),
     Benchmark,
     Evaluate(Box<Checkpoint>, usize),
 }
@@ -340,7 +353,7 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
     }
     let library = library()?;
     let (mut network, mut optimizer, p, mut rngs, mut completed, mut decisions, mut ticks) =
-        if let Job::Train(Some(ref path)) = job {
+        if let Job::Train(Some(ref path), _) = job {
             let saved: Checkpoint = persistence::load(path)?;
             let mut requested = c.clone();
             requested.device = saved.config.device.clone();
@@ -377,6 +390,15 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
         c.device,
         manual::FUNCTIONS
     )?;
+    let persistence = match &job {
+        Job::Train(_, options) => options.clone(),
+        _ => PersistenceOptions::default(),
+    };
+    writeln!(
+        log,
+        "artifact_persistence={persistence:?}; resumed_completed_rollouts={completed}; target_rollouts={}",
+        c.total_rollouts
+    )?;
     let mut metrics = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -385,7 +407,7 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
         metrics,
         "rollout,policy_version,decisions,physical_ticks,rendered_frames,reward,completed,collision,timeout,seconds,transitions_per_second,gradient_status"
     )?;
-    let train = matches!(job, Job::Train(_));
+    let train = matches!(job, Job::Train(..));
     let count = if train {
         c.total_rollouts.saturating_sub(completed as usize)
     } else {
@@ -393,9 +415,13 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
     };
     ensure(count > 0, "target rollouts already completed")?;
     for _ in 0..count {
+        let next_completed = completed + u64::from(train);
+        // This decision gates files/snapshots only. Collection, every update,
+        // RNG advancement, counters and telemetry still run for every rollout.
+        let save_heavy = !train || persistence.should_save(next_completed, c.total_rollouts);
         let r = rollout::collect(&network, &mut envs, c, &mut rngs.action, device)?;
         println!("{}", summary(&r));
-        writeln!(log, "{}", summary(&r))?;
+        writeln!(log, "rollout={next_completed} {}", summary(&r))?;
         if train {
             let start = Instant::now();
             let losses = racing_rl::trainer::update(
@@ -407,7 +433,10 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
                 device,
             )?;
             backend::sync::<B>(device)?;
-            persistence::save(&dir.join(format!("losses-{completed:06}.ron")), &losses)?;
+            if save_heavy {
+                let index = persistence.losses_index(next_completed);
+                persistence::save(&dir.join(format!("losses-{index:06}.ron")), &losses)?;
+            }
             writeln!(log, "update_seconds={}", start.elapsed().as_secs_f64())?;
         } else {
             // Reevaluate the SAME collected u; loss forward works without derivative hooks.
@@ -421,21 +450,23 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
             completed += 1;
         }
         rngs.environments = envs.iter().map(|e| e.rng.clone()).collect();
-        let saved = checkpoint(
-            &network,
-            &optimizer,
-            SaveContext {
-                config: c,
-                physics: &p,
-                rngs: &rngs,
-                backend: label,
-                completed_rollouts: completed,
-                decisions,
-                physical_ticks: ticks,
-            },
-        )?;
-        persistence::save(&dir.join(format!("checkpoint-{completed:06}.ron")), &saved)?;
-        persistence::save(&dir.join(format!("rollout-{completed:06}.ron")), &r)?;
+        if save_heavy {
+            let saved = checkpoint(
+                &network,
+                &optimizer,
+                SaveContext {
+                    config: c,
+                    physics: &p,
+                    rngs: &rngs,
+                    backend: label,
+                    completed_rollouts: completed,
+                    decisions,
+                    physical_ticks: ticks,
+                },
+            )?;
+            persistence::save(&dir.join(format!("checkpoint-{completed:06}.ron")), &saved)?;
+            persistence::save(&dir.join(format!("rollout-{completed:06}.ron")), &r)?;
+        }
         let counts = counts(&r);
         writeln!(
             metrics,
@@ -728,119 +759,4 @@ fn benchmark<B: Backend>(c: &Config, device: &B::Device, label: &str) -> Result<
     persistence::save(&dir.join("benchmark.ron"), &rows)?;
     println!("benchmark={}", dir.display());
     Ok(())
-}
-
-// Viewer uses CPU f32 for portability; same frozen forward + environment, independent RNG.
-struct Viewer {
-    network: Network<Cpu>,
-    environments: Vec<RacingEnvironment>,
-    config: Config,
-    error: Option<String>,
-    rendered_frames: u64,
-    maximum_frames: Option<u64>,
-}
-fn view(saved: Checkpoint, cars: usize, maximum_frames: Option<u64>) -> Result<()> {
-    use bevy::prelude::*;
-    let (network, _, p) = restore::<Cpu>(&saved, &Default::default())?;
-    let mut c = saved.config;
-    c.num_envs = cars;
-    let library = library()?;
-    let scenes = env::scenes(&library, &c.evaluation_tracks, true)?;
-    let environments =
-        env::seeded_environments(vec![scenes[0].clone()], &c, &p, c.evaluation_seed)?;
-    let decision_dt = c.physical_dt as f64 * c.action_repeat as f64;
-    println!(
-        "viewer CPU f32, deterministic, trained={}; close window to stop",
-        saved.trained
-    );
-    App::new()
-        .add_plugins(DefaultPlugins)
-        .insert_non_send(Viewer {
-            network,
-            environments,
-            config: c,
-            error: None,
-            rendered_frames: 0,
-            maximum_frames,
-        })
-        .add_systems(Startup, viewer_camera)
-        .add_systems(FixedUpdate, viewer_step)
-        .add_systems(Update, viewer_draw)
-        .insert_resource(Time::<Fixed>::from_seconds(decision_dt))
-        .run();
-    Ok(())
-}
-fn viewer_camera(mut commands: bevy::prelude::Commands, viewer: bevy::prelude::NonSend<Viewer>) {
-    use bevy::prelude::*;
-    let bounds = viewer.environments[0].scenes[0].track.bounds();
-    let size = bounds.size();
-    let scale = (size.x / 1200.).max(size.y / 700.).max(1.);
-    commands.spawn((
-        Camera2d,
-        Projection::Orthographic(OrthographicProjection {
-            scale,
-            ..OrthographicProjection::default_2d()
-        }),
-        Transform::from_translation(bounds.center().extend(1000.)),
-    ));
-}
-fn viewer_step(mut viewer: bevy::prelude::NonSendMut<Viewer>) {
-    if viewer.error.is_some() {
-        return;
-    }
-    let result = (|| -> Result<()> {
-        let count = viewer.environments.len();
-        let d = viewer.config.observation.dimension();
-        let observations = viewer
-            .environments
-            .iter_mut()
-            .map(Environment::observe)
-            .collect::<Result<Vec<_>>>()?;
-        let x = matrix(
-            &observations.into_iter().flatten().collect::<Vec<_>>(),
-            count,
-            d,
-            &Default::default(),
-        )?;
-        let actions = read(viewer.network.infer(x)?.mean.tanh())?;
-        for (i, e) in viewer.environments.iter_mut().enumerate() {
-            let step = e.step([actions[i * 2], actions[i * 2 + 1]])?;
-            if step.terminated || step.truncated {
-                e.reset()?;
-            }
-        }
-        Ok(())
-    })();
-    if let Err(error) = result {
-        eprintln!("viewer: {error}");
-        viewer.error = Some(error.to_string());
-    }
-}
-fn viewer_draw(
-    mut gizmos: bevy::prelude::Gizmos,
-    mut viewer: bevy::prelude::NonSendMut<Viewer>,
-    mut exit: bevy::prelude::MessageWriter<bevy::app::AppExit>,
-) {
-    use bevy::prelude::*;
-    viewer.rendered_frames += 1;
-    if viewer
-        .maximum_frames
-        .is_some_and(|max| viewer.rendered_frames >= max)
-    {
-        exit.write(bevy::app::AppExit::Success);
-    }
-    let track = &viewer.environments[0].scenes[0].track;
-    for border in [&track.left_border, &track.right_border] {
-        gizmos.linestrip_2d(
-            border.iter().copied().chain(border.first().copied()),
-            Color::srgb(0.8, 0.8, 0.8),
-        );
-    }
-    for e in &viewer.environments {
-        gizmos.rect_2d(
-            Isometry2d::new(e.state.position, Rot2::radians(e.state.heading)),
-            Vec2::new(crate::simulation::CAR_LENGTH, crate::simulation::CAR_WIDTH),
-            Color::srgb(0.1, 0.9, 0.4),
-        );
-    }
 }

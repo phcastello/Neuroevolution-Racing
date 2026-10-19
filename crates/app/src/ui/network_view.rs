@@ -7,6 +7,36 @@ const LAYER_SPACING: f32 = 100.0;
 const NODE_SPACING: f32 = 24.0;
 const NODE_RADIUS: f32 = 10.0;
 
+// Shared by the dense GA view and the branched PPO view. Keep activation and
+// signed-weight colors consistent without assuming the networks share topology.
+pub(super) fn activation_fill(activation: f32) -> egui::Color32 {
+    let intensity = activation.abs().min(1.0);
+    if activation >= 0.0 {
+        egui::Color32::from_rgb(
+            (35.0 + 35.0 * intensity) as u8,
+            (85.0 + 150.0 * intensity) as u8,
+            (95.0 + 125.0 * intensity) as u8,
+        )
+    } else {
+        egui::Color32::from_rgb(
+            (95.0 + 150.0 * intensity) as u8,
+            (45.0 + 35.0 * intensity) as u8,
+            (55.0 + 35.0 * intensity) as u8,
+        )
+    }
+}
+
+pub(super) fn weight_stroke(weight: f32, scale: f32) -> egui::Stroke {
+    let magnitude = (weight.abs() / scale.max(f32::EPSILON)).sqrt();
+    let alpha = (55.0 + 200.0 * magnitude) as u8;
+    let color = if weight >= 0.0 {
+        egui::Color32::from_rgba_unmultiplied(70, 220, 135, alpha)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(245, 90, 90, alpha)
+    };
+    egui::Stroke::new(0.35 + 2.4 * magnitude, color)
+}
+
 fn expected_parameter_count(layers: &[usize]) -> Option<usize> {
     layers.windows(2).try_fold(0_usize, |total, pair| {
         pair[0]
@@ -106,19 +136,12 @@ fn draw_network_canvas(
         for output in 0..output_count {
             for input in 0..input_count {
                 let weight = parameters[cursor + output * input_count + input];
-                let magnitude = (weight.abs() / scale).sqrt();
-                let alpha = (55.0 + 200.0 * magnitude) as u8;
-                let color = if weight >= 0.0 {
-                    egui::Color32::from_rgba_unmultiplied(70, 220, 135, alpha)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(245, 90, 90, alpha)
-                };
                 painter.line_segment(
                     [
                         positions[layer_index][input],
                         positions[layer_index + 1][output],
                     ],
-                    egui::Stroke::new(0.35 + 2.4 * magnitude, color),
+                    weight_stroke(weight, scale),
                 );
             }
         }
@@ -130,20 +153,7 @@ fn draw_network_canvas(
     for (layer_index, nodes) in positions.iter().enumerate() {
         for (node_index, &position) in nodes.iter().enumerate() {
             let activation = activations[layer_index][node_index];
-            let intensity = activation.abs().min(1.0);
-            let fill = if activation >= 0.0 {
-                egui::Color32::from_rgb(
-                    (35.0 + 35.0 * intensity) as u8,
-                    (85.0 + 150.0 * intensity) as u8,
-                    (95.0 + 125.0 * intensity) as u8,
-                )
-            } else {
-                egui::Color32::from_rgb(
-                    (95.0 + 150.0 * intensity) as u8,
-                    (45.0 + 35.0 * intensity) as u8,
-                    (55.0 + 35.0 * intensity) as u8,
-                )
-            };
+            let fill = activation_fill(activation);
             let bias = biases[layer_index][node_index];
             let outline = if layer_index == 0 || bias >= 0.0 {
                 egui::Color32::LIGHT_GREEN
@@ -208,5 +218,21 @@ mod tests {
         assert_eq!(expected_parameter_count(&[6, 8, 2]), Some(74));
         assert_eq!(expected_parameter_count(&[6, 16, 32, 2]), Some(722));
         assert_eq!(expected_parameter_count(&[6, usize::MAX, 2]), None);
+    }
+
+    #[test]
+    fn shared_colors_preserve_original_dense_network_presentation() {
+        assert_eq!(activation_fill(0.0), egui::Color32::from_rgb(35, 85, 95));
+        assert_eq!(activation_fill(1.0), egui::Color32::from_rgb(70, 235, 220));
+        assert_eq!(activation_fill(-1.0), egui::Color32::from_rgb(245, 80, 90));
+        assert_eq!(activation_fill(2.0), activation_fill(1.0));
+        assert_eq!(
+            weight_stroke(1.0, 1.0),
+            egui::Stroke::new(2.75, egui::Color32::from_rgb(70, 220, 135)),
+        );
+        assert_eq!(
+            weight_stroke(-1.0, 1.0),
+            egui::Stroke::new(2.75, egui::Color32::from_rgb(245, 90, 90)),
+        );
     }
 }

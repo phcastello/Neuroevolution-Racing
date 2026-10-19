@@ -115,7 +115,7 @@ fn run_interactive() {
         .add_plugins(
             DefaultPlugins
                 .set(AssetPlugin {
-                    file_path: "../../assets".into(),
+                    file_path: asset_directory(),
                     ..default()
                 })
                 .set(WindowPlugin {
@@ -139,6 +139,14 @@ fn run_interactive() {
             DashboardPlugin,
         ))
         .run();
+}
+
+/// Both visual modes resolve the same assets independently of the launch directory.
+pub(crate) fn asset_directory() -> String {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../assets")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn run_worker(options: WorkerOptions) -> Result<(), String> {

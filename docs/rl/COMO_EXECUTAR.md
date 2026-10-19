@@ -22,9 +22,17 @@ cargo run -p neuroevolution-racing-app -- rl check-gradients --case all
 cargo run -p neuroevolution-racing-app -- rl train --config configs/rl/smoke.ron
 ```
 
-`inspect-rollout` valida shapes, finitude, ordenação env/time, ids de episódio, continuidade, flags/motivos, ação=Tanh(u) e GAE; mostra dimensões, contadores, recompensa e términos. `evaluate` executa o número pedido **por pista** da suite validation, com sementes próprias, e grava resultados por episódio. Políticas aleatórias são marcadas UNTRAINED. `view` é um visualizador PPO separado com Bevy, sem alterar os modos originais; CPU f32, política determinística, pistas de avaliação, até 16 carros. Treino/coleta não abrem janela.
+`inspect-rollout` valida shapes, finitude, ordenação env/time, ids de episódio, continuidade, flags/motivos, ação=Tanh(u) e GAE; mostra dimensões, contadores, recompensa e términos. `evaluate` executa o número pedido **por pista** da suite validation, com sementes próprias, e grava resultados por episódio. Políticas aleatórias são marcadas UNTRAINED. `view` abre o playback PPO com a renderização, sprites, câmera e estrutura egui compartilhados com a interface original: até 16 carros, seleção de pista, histórico de políticas por rollout, sensores, hitboxes e ativações do Actor-Critic. A inferência é determinística em CPU f32, inclusive para checkpoints treinados na GPU, sem exigir `--features rl-gpu`. Treino/coleta não abrem janela. Consulte o [guia do visualizador PPO](VISUALIZADOR.md) para controles e comparação de checkpoints.
 
 No visualizador, `--frames 120` limita a prévia a 120 frames renderizados e fecha a janela automaticamente. A decisão RL usa período `action_repeat * physical_dt`; cada integração continua em ticks de 1/60 s.
+
+Para abrir uma política treinada com a interface completa e começar em Spa:
+
+```powershell
+cargo run --locked -p neuroevolution-racing-app -- rl view --checkpoint results_ppo/ppo-1792340830035034100-29472/checkpoint-000100.ron --cars 1 --track spa
+```
+
+Role o dashboard para acessar **PPO policy history**; abra **Inspect live Actor-Critic network** para inspecionar a rede. Os carros compartilham a política carregada e representam episódios, sem indivíduos ou campeões genéticos.
 
 `check-gradients --case all` compara o backward com diferenças centrais CPU f64 e agora deve imprimir `APROVADO`. `train` executa um preflight dos cinco hooks antes de criar cenas, inicializar GPU ou iniciar coleta. O treino usa exclusivamente derivadas analíticas e operações tensoriais. [Guia das cinco funções](BACKPROP_PARA_IMPLEMENTAR.md).
 

@@ -54,11 +54,18 @@ pub const CAR_SPRITE_LABELS: [&str; 11] = [
 
 pub struct RenderingPlugin;
 
+/// Playback adapters update presentation components before this set.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RenderingSet {
+    Visuals,
+}
+
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<CarVisualSettings>()
+            .init_resource::<TrackDebug>()
             .add_systems(Startup, load_car_sprite_assets)
-            .add_systems(Update, apply_turbo_visibility)
+            .add_systems(Update, apply_turbo_visibility.in_set(RenderingSet::Visuals))
             .add_systems(
                 Update,
                 (
@@ -66,9 +73,11 @@ impl Plugin for RenderingPlugin {
                     decorate_new_cars,
                     update_manual_car_sprite,
                     update_car_collision_tint,
+                    update_playback_car_tint,
                     draw_debug_visuals,
                 )
                     .chain()
+                    .in_set(RenderingSet::Visuals)
                     .run_if(rendering_enabled),
             );
     }
@@ -94,6 +103,23 @@ pub struct CarVisualSettings {
     pub test_drive_sprite: usize,
     pub show_hitbox: bool,
     pub show_sensors: bool,
+}
+
+/// Visual episode state for a non-GA controller. This never controls physics.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CarPresentation {
+    #[default]
+    Running,
+    Collided,
+    Completed,
+}
+
+/// Any sensor layout can reuse the original selected-car debug drawing.
+/// Values and endpoints must come from the real controller observations.
+#[derive(Component, Clone, Debug, Default)]
+pub struct SensorVisualization {
+    pub normalized: Vec<f32>,
+    pub endpoints: Vec<Vec2>,
 }
 
 impl Default for CarVisualSettings {
@@ -141,8 +167,8 @@ struct TrackVisualBuildData<'w, 's> {
     meshes: ResMut<'w, Assets<Mesh>>,
     materials: ResMut<'w, Assets<ColorMaterial>>,
     old_visuals: TrackVisualAssets<'w, 's>,
-    mode: Res<'w, SimulationMode>,
-    test_drive: Res<'w, TestDriveSettings>,
+    mode: Option<Res<'w, SimulationMode>>,
+    test_drive: Option<Res<'w, TestDriveSettings>>,
     last_environment: Local<'s, Option<(SimulationMode, TestDriveEnvironment)>>,
     last_track_id: Local<'s, Option<String>>,
 }
@@ -159,9 +185,10 @@ fn rebuild_track_visuals(data: TrackVisualBuildData) {
         mut last_environment,
         mut last_track_id,
     } = data;
-    let current_environment = (*mode, test_drive.environment);
+    let current_environment = visual_environment(mode.as_deref(), test_drive.as_deref());
     if *last_environment == Some(current_environment)
         && last_track_id.as_deref() == Some(track.definition.id.as_str())
+        && !track.is_changed()
     {
         return;
     }
@@ -177,9 +204,7 @@ fn rebuild_track_visuals(data: TrackVisualBuildData) {
         commands.entity(entity).despawn();
     }
 
-    if *mode == SimulationMode::TestDrive
-        && test_drive.environment == TestDriveEnvironment::OpenField
-    {
+    if current_environment == (SimulationMode::TestDrive, TestDriveEnvironment::OpenField) {
         spawn_open_field_grid(&mut commands);
         return;
     }
@@ -356,17 +381,27 @@ fn decorate_new_cars(
     }
 }
 
-fn rendering_enabled(fast_forward: Res<TrainingFastForward>) -> bool {
-    !fast_forward.is_active()
+fn visual_environment(
+    mode: Option<&SimulationMode>,
+    test_drive: Option<&TestDriveSettings>,
+) -> (SimulationMode, TestDriveEnvironment) {
+    (
+        mode.copied().unwrap_or_default(),
+        test_drive.map_or(TestDriveEnvironment::Track, |settings| settings.environment),
+    )
+}
+
+fn rendering_enabled(fast_forward: Option<Res<TrainingFastForward>>) -> bool {
+    !fast_forward.is_some_and(|fast_forward| fast_forward.is_active())
 }
 
 fn apply_turbo_visibility(
-    fast_forward: Res<TrainingFastForward>,
+    fast_forward: Option<Res<TrainingFastForward>>,
     mut previous: Local<Option<bool>>,
     mut cars: Query<&mut Visibility, (With<Car>, Without<TrackVisual>)>,
     mut track_visuals: Query<&mut Visibility, (With<TrackVisual>, Without<Car>)>,
 ) {
-    let turbo = fast_forward.is_active();
+    let turbo = fast_forward.is_some_and(|fast_forward| fast_forward.is_active());
     if *previous == Some(turbo) {
         return;
     }
@@ -427,6 +462,24 @@ fn update_car_collision_tint(
     }
 }
 
+fn update_playback_car_tint(
+    cars: Query<(&CarPresentation, &Children), Changed<CarPresentation>>,
+    mut visuals: Query<&mut Sprite, With<CarVisual>>,
+) {
+    for (presentation, children) in &cars {
+        let tint = if *presentation == CarPresentation::Collided {
+            COLLIDED_CAR_TINT
+        } else {
+            NORMAL_CAR_TINT
+        };
+        for child in children.iter() {
+            if let Ok(mut sprite) = visuals.get_mut(child) {
+                sprite.color = tint;
+            }
+        }
+    }
+}
+
 fn selected_car_isometry(transform: &Transform, state: &KinematicCar) -> Isometry2d {
     Isometry2d::new(
         transform.translation.truncate(),
@@ -474,26 +527,29 @@ fn assert_normalized_rgba_png(bytes: &[u8]) {
 fn draw_debug_visuals(
     mut gizmos: Gizmos,
     track: Res<Track>,
-    training: Res<TrainingState>,
-    laser: Res<LaserState>,
+    training: Option<Res<TrainingState>>,
+    laser: Option<Res<LaserState>>,
     debug: Res<TrackDebug>,
     car_visuals: Res<CarVisualSettings>,
-    mode: Res<SimulationMode>,
-    test_drive: Res<TestDriveSettings>,
-    race: Res<RaceSession>,
+    mode: Option<Res<SimulationMode>>,
+    test_drive: Option<Res<TestDriveSettings>>,
+    race: Option<Res<RaceSession>>,
     trails: Query<(&RaceTrail, &RaceVisual)>,
     selected: Query<
         (
             &Transform,
             &KinematicCar,
-            &SensorReadings,
+            Option<&SensorReadings>,
+            Option<&SensorVisualization>,
             Option<&CarProgress>,
+            Option<&CarPresentation>,
         ),
         With<SelectedCar>,
     >,
 ) {
+    let (mode, environment) = visual_environment(mode.as_deref(), test_drive.as_deref());
     let track_visible =
-        *mode != SimulationMode::TestDrive || test_drive.environment == TestDriveEnvironment::Track;
+        mode != SimulationMode::TestDrive || environment == TestDriveEnvironment::Track;
     if !track_visible {
         draw_open_field_grid(&mut gizmos);
     }
@@ -515,11 +571,13 @@ fn draw_debug_visuals(
         }
     }
 
-    if *mode == SimulationMode::Training {
+    if mode == SimulationMode::Training
+        && let (Some(laser), Some(training)) = (laser, training)
+    {
         draw_laser(&mut gizmos, &track, &laser, &training);
     }
 
-    if *mode == SimulationMode::Race && race.show_trails {
+    if mode == SimulationMode::Race && race.is_some_and(|race| race.show_trails) {
         for (trail, visual) in &trails {
             if trail.points.len() >= 2 {
                 gizmos.linestrip_2d(trail.points.iter().copied(), visual.color.as_srgba(0.82));
@@ -527,19 +585,21 @@ fn draw_debug_visuals(
         }
     }
 
-    for (transform, state, sensors, progress) in &selected {
+    for (transform, state, sensors, visualization, progress, presentation) in &selected {
         let origin = transform.translation.truncate();
         if car_visuals.show_sensors {
-            for (index, endpoint) in sensors.endpoints.iter().enumerate() {
-                let distance = sensors.normalized[index];
-                let color = Color::srgb(1.0 - distance * 0.65, 0.3 + distance * 0.7, 0.18);
-                gizmos.line_2d(origin, *endpoint, color);
-                gizmos.circle_2d(*endpoint, 3.0, color);
+            if let Some(sensors) = visualization {
+                draw_sensor_rays(&mut gizmos, origin, &sensors.normalized, &sensors.endpoints);
+            } else if let Some(sensors) = sensors {
+                draw_sensor_rays(&mut gizmos, origin, &sensors.normalized, &sensors.endpoints);
             }
             draw_car_selection_marker(&mut gizmos, transform, state);
         }
         if car_visuals.show_hitbox {
             draw_car_hitbox(&mut gizmos, transform, state);
+        }
+        if presentation == Some(&CarPresentation::Completed) {
+            gizmos.circle_2d(origin, CAR_LENGTH * 0.8, Color::srgba(0.2, 1.0, 0.35, 0.95));
         }
 
         if debug.enabled
@@ -548,6 +608,14 @@ fn draw_debug_visuals(
             gizmos.line_2d(origin, progress.projected_point, Color::srgb(1.0, 0.2, 0.9));
             gizmos.circle_2d(progress.projected_point, 5.0, Color::srgb(1.0, 0.2, 0.9));
         }
+    }
+}
+
+fn draw_sensor_rays(gizmos: &mut Gizmos, origin: Vec2, normalized: &[f32], endpoints: &[Vec2]) {
+    for (&distance, &endpoint) in normalized.iter().zip(endpoints) {
+        let color = Color::srgb(1.0 - distance * 0.65, 0.3 + distance * 0.7, 0.18);
+        gizmos.line_2d(origin, endpoint, color);
+        gizmos.circle_2d(endpoint, 3.0, color);
     }
 }
 
@@ -749,6 +817,197 @@ fn closed_segments(points: &[Vec2]) -> impl Iterator<Item = (Vec2, Vec2)> + '_ {
 #[cfg(test)]
 mod car_sprite_tests {
     use super::*;
+    use bevy::gizmos::{
+        config::{DefaultGizmoConfigGroup, GizmoConfigStore},
+        gizmos::GizmoStorage,
+    };
+
+    fn visual_app() -> App {
+        let library = crate::simulation::TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let mut app = App::new();
+        let mut images = Assets::<Image>::default();
+        let mut gizmo_config = GizmoConfigStore::default();
+        gizmo_config.insert(GizmoConfig::default(), DefaultGizmoConfigGroup);
+        let assets = CarSpriteAssets {
+            all: std::array::from_fn(|_| images.add(Image::default())),
+        };
+        app.insert_resource(track)
+            .insert_resource(assets)
+            .insert_resource(gizmo_config)
+            .init_resource::<GizmoStorage<DefaultGizmoConfigGroup, ()>>()
+            .init_resource::<Assets<Mesh>>()
+            .init_resource::<Assets<ColorMaterial>>()
+            .init_resource::<TrackDebug>()
+            .insert_resource(CarVisualSettings {
+                show_hitbox: true,
+                show_sensors: true,
+                ..default()
+            })
+            .add_systems(Update, apply_turbo_visibility)
+            .add_systems(
+                Update,
+                (
+                    rebuild_track_visuals,
+                    decorate_new_cars,
+                    update_car_collision_tint,
+                    update_playback_car_tint,
+                    draw_debug_visuals,
+                )
+                    .chain()
+                    .run_if(rendering_enabled),
+            );
+        app
+    }
+
+    fn playback_car(app: &mut App) -> Entity {
+        app.world_mut()
+            .spawn((
+                Car { id: 0 },
+                SelectedCar,
+                Transform::from_xyz(15.0, 20.0, 3.0).with_rotation(Quat::from_rotation_z(0.3)),
+                KinematicCar {
+                    heading: 0.3,
+                    speed: 40.0,
+                },
+                SensorVisualization {
+                    normalized: vec![0.7; 21],
+                    endpoints: vec![Vec2::new(50.0, 50.0); 21],
+                },
+                CarPresentation::Running,
+            ))
+            .id()
+    }
+
+    fn car_sprite(app: &App, car: Entity) -> &Sprite {
+        let child = app.world().get::<Children>(car).unwrap()[0];
+        app.world().get::<Sprite>(child).unwrap()
+    }
+
+    #[test]
+    fn shared_visuals_render_policy_cars_and_all_sensor_rays_without_ga_resources() {
+        let mut app = visual_app();
+        let car = playback_car(&mut app);
+        app.update();
+        assert!(!app.world().contains_resource::<TrainingState>());
+        assert!(!app.world().contains_resource::<SimulationMode>());
+        assert!(!app.world().contains_resource::<TrainingFastForward>());
+        assert_eq!(
+            car_sprite(&app, car).custom_size,
+            Some(Vec2::new(CAR_LENGTH, CAR_WIDTH))
+        );
+        assert_eq!(
+            car_sprite(&app, car).image,
+            app.world().resource::<CarSpriteAssets>().training_sprite(0)
+        );
+        assert_eq!(
+            app.world()
+                .get::<SensorVisualization>(car)
+                .unwrap()
+                .endpoints
+                .len(),
+            21
+        );
+        let child = app.world().get::<Children>(car).unwrap()[0];
+        assert_eq!(
+            *app.world().get::<Transform>(child).unwrap(),
+            Transform::IDENTITY
+        );
+        assert!(
+            app.world_mut()
+                .query_filtered::<Entity, With<TrackVisual>>()
+                .iter(app.world())
+                .count()
+                > 100
+        );
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 2);
+        assert_eq!(app.world().resource::<Assets<ColorMaterial>>().len(), 2);
+    }
+
+    #[test]
+    fn playback_collision_completion_and_reset_update_original_sprite_tint() {
+        let mut app = visual_app();
+        let car = playback_car(&mut app);
+        for (presentation, expected) in [
+            (CarPresentation::Running, NORMAL_CAR_TINT),
+            (CarPresentation::Collided, COLLIDED_CAR_TINT),
+            (CarPresentation::Completed, NORMAL_CAR_TINT),
+            (CarPresentation::Running, NORMAL_CAR_TINT),
+        ] {
+            *app.world_mut().get_mut::<CarPresentation>(car).unwrap() = presentation;
+            app.update();
+            assert_eq!(car_sprite(&app, car).color, expected);
+            assert_eq!(app.world().get::<Children>(car).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn switching_tracks_replaces_visuals_and_reclaims_mesh_assets() {
+        let mut app = visual_app();
+        app.update();
+        let old_visuals = app
+            .world_mut()
+            .query_filtered::<Entity, With<TrackVisual>>()
+            .iter(app.world())
+            .collect::<Vec<_>>();
+        let library = crate::simulation::TrackLibrary::load_default().unwrap();
+        let definition = library
+            .all_tracks()
+            .find(|track| track.id != "interlagos")
+            .unwrap();
+        app.insert_resource(Track::from_definition(definition).unwrap());
+        app.update();
+        assert!(
+            old_visuals
+                .iter()
+                .all(|entity| app.world().get_entity(*entity).is_err())
+        );
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 2);
+        assert_eq!(app.world().resource::<Assets<ColorMaterial>>().len(), 2);
+    }
+
+    #[test]
+    fn original_ga_collision_open_field_and_turbo_rendering_are_preserved() {
+        let mut app = visual_app();
+        let mut evaluation = EvaluationState::new(0.0);
+        evaluation.finish(FinishReason::Collision);
+        let car = app
+            .world_mut()
+            .spawn((Car { id: 1 }, Transform::IDENTITY, evaluation))
+            .id();
+        app.update();
+        assert_eq!(car_sprite(&app, car).color, COLLIDED_CAR_TINT);
+        app.insert_resource(SimulationMode::TestDrive)
+            .insert_resource(TestDriveSettings {
+                environment: TestDriveEnvironment::OpenField,
+                ..default()
+            });
+        app.update();
+        assert_eq!(
+            app.world_mut()
+                .query_filtered::<Entity, With<TrackVisual>>()
+                .iter(app.world())
+                .count(),
+            1
+        );
+        assert_eq!(app.world().resource::<Assets<Mesh>>().len(), 0);
+        let mut fast_forward = TrainingFastForward::default();
+        assert!(fast_forward.start(100, 0, 1.0, std::time::Duration::from_millis(250)));
+        app.insert_resource(fast_forward);
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(car).unwrap(),
+            Visibility::Hidden
+        );
+        app.world_mut()
+            .resource_mut::<TrainingFastForward>()
+            .cancel();
+        app.update();
+        assert_eq!(
+            *app.world().get::<Visibility>(car).unwrap(),
+            Visibility::Inherited
+        );
+    }
 
     #[test]
     fn all_generated_car_assets_are_normalized_rgba_pngs() {

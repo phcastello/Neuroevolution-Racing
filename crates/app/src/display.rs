@@ -146,6 +146,7 @@ impl CameraViewState {
 
 #[derive(SystemParam)]
 struct CameraInput<'w, 's> {
+    // Navigation remains responsive when playback pauses or scales virtual time.
     time: Res<'w, Time<Real>>,
     keyboard: Res<'w, ButtonInput<KeyCode>>,
     mouse_buttons: Res<'w, ButtonInput<MouseButton>>,
@@ -157,6 +158,12 @@ struct CameraInput<'w, 's> {
 }
 
 pub struct DisplayPlugin;
+
+/// Playback adapters update their selected-car ECS mirror before this set.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DisplaySet {
+    Camera,
+}
 
 impl Plugin for DisplayPlugin {
     fn build(&self, app: &mut App) {
@@ -171,13 +178,16 @@ impl Plugin for DisplayPlugin {
                     update_camera_view,
                     apply_camera_view,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(DisplaySet::Camera),
             );
     }
 }
 
 fn setup_camera(mut commands: Commands) {
-    commands.spawn((Camera2d, TrackCamera, Transform::from_xyz(0.0, 0.0, 1000.0)));
+    // The default far plane is 1000 units from the camera. Keep room behind
+    // world Z=0 so the road at -2 and the open-field background at -3 stay visible.
+    commands.spawn((Camera2d, TrackCamera, Transform::from_xyz(0.0, 0.0, 500.0)));
 }
 
 fn apply_display_requests(
@@ -396,8 +406,8 @@ fn update_camera_view(
     time: Res<Time<Real>>,
     window: Query<&Window, With<PrimaryWindow>>,
     track: Res<Track>,
-    mode: Res<SimulationMode>,
-    test_drive: Res<TestDriveSettings>,
+    mode: Option<Res<SimulationMode>>,
+    test_drive: Option<Res<TestDriveSettings>>,
     followed_car: Query<(&Transform, &CarObservation), With<SelectedCar>>,
     mut state: ResMut<CameraViewState>,
 ) {
@@ -406,14 +416,23 @@ fn update_camera_view(
     };
     let window_size = window.resolution.physical_size();
     let scale_factor = window.resolution.scale_factor();
-    let scene = (*mode, test_drive.environment);
+    // A standalone policy playback has no GA mode or test-drive resources.
+    // Their presence only determines the original app's open-field scene.
+    let scene = mode.as_deref().copied().map(|mode| {
+        (
+            mode,
+            test_drive
+                .as_deref()
+                .map_or(TestDriveEnvironment::Track, |settings| settings.environment),
+        )
+    });
     let resized = state.last_window_size.x.abs_diff(window_size.x) >= SIGNIFICANT_RESIZE_PIXELS
         || state.last_window_size.y.abs_diff(window_size.y) >= SIGNIFICANT_RESIZE_PIXELS
         || (state.last_scale_factor - scale_factor).abs() > 0.001;
-    let scene_changed = state.last_scene != Some(scene);
+    let scene_changed = state.last_scene != scene;
     state.last_window_size = window_size;
     state.last_scale_factor = scale_factor;
-    state.last_scene = Some(scene);
+    state.last_scene = scene;
 
     let behavior_changed = state.behavior != state.last_behavior;
     let entered_follow = behavior_changed && state.behavior == CameraBehavior::FollowCar;
@@ -426,8 +445,7 @@ fn update_camera_view(
     }
 
     if !state.initialized || resized || scene_changed || track.is_changed() || state.fit_requested {
-        let bounds = if *mode == SimulationMode::TestDrive
-            && test_drive.environment == TestDriveEnvironment::OpenField
+        let bounds = if scene == Some((SimulationMode::TestDrive, TestDriveEnvironment::OpenField))
         {
             TrackBounds {
                 min: Vec2::splat(-600.0),
@@ -584,6 +602,183 @@ mod tests {
             min: Vec2::new(-600.0, -400.0),
             max: Vec2::new(600.0, 400.0),
         }
+    }
+
+    fn camera_app() -> App {
+        let library = TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let mut app = App::new();
+        app.init_resource::<Time<Real>>()
+            .init_resource::<CameraViewState>()
+            .insert_resource(track)
+            .add_systems(Startup, setup_camera)
+            .add_systems(Update, (update_camera_view, apply_camera_view).chain());
+        app.world_mut().spawn((
+            Window {
+                resolution: WindowResolution::new(1400, 850),
+                ..default()
+            },
+            PrimaryWindow,
+        ));
+        app
+    }
+
+    #[test]
+    fn keyboard_camera_rotation_uses_real_time_while_playback_is_paused() {
+        let mut real_time = Time::<Real>::default();
+        real_time.advance_by(std::time::Duration::from_millis(200));
+        let mut virtual_time = Time::<Virtual>::default();
+        virtual_time.pause();
+        let mut keyboard = ButtonInput::<KeyCode>::default();
+        keyboard.press(KeyCode::KeyQ);
+        let mut app = App::new();
+        app.insert_resource(real_time)
+            .insert_resource(virtual_time)
+            .insert_resource(keyboard)
+            .init_resource::<Time>()
+            .init_resource::<ButtonInput<MouseButton>>()
+            .init_resource::<AccumulatedMouseScroll>()
+            .init_resource::<EguiWantsInput>()
+            .init_resource::<CameraViewState>()
+            .add_systems(Update, handle_camera_input);
+        app.update();
+        assert!(app.world().resource::<Time<Virtual>>().is_paused());
+        assert_eq!(app.world().resource::<Time>().delta_secs(), 0.0);
+        assert!(!app.world().contains_resource::<SimulationMode>());
+        assert!(
+            !app.world()
+                .contains_resource::<crate::simulation::TrainingState>()
+        );
+        let rotation = app.world().resource::<CameraViewState>().rotation;
+        assert!((rotation - ROTATION_SPEED * 0.2).abs() < 1.0e-6);
+        let mut keyboard = app.world_mut().resource_mut::<ButtonInput<KeyCode>>();
+        keyboard.release(KeyCode::KeyQ);
+        keyboard.press(KeyCode::KeyE);
+        app.update();
+        assert!(app.world().resource::<CameraViewState>().rotation.abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn shared_camera_depth_includes_road_curbs_cars_and_open_field() {
+        let mut app = camera_app();
+        app.update();
+        let world = app.world_mut();
+        let mut cameras = world.query_filtered::<(&Transform, &Projection), With<TrackCamera>>();
+        let (transform, projection) = cameras.single(world).unwrap();
+        let Projection::Orthographic(projection) = projection else {
+            panic!("The shared 2D camera must use an orthographic projection");
+        };
+        let clip_from_view = bevy::camera::CameraProjection::get_clip_from_view(projection);
+        for (surface, world_z) in [
+            ("open-field background", -3.0),
+            ("road", -2.0),
+            ("start line", 0.0),
+            ("edge references", 0.5),
+            ("curbs", 1.0),
+            ("car sprites", 3.0),
+        ] {
+            let distance = transform.translation.z - world_z;
+            assert!(
+                distance > projection.near && distance < projection.far,
+                "{surface} at Z={world_z} must be inside the camera depth range"
+            );
+            let clip_z = clip_from_view
+                .project_point3(Vec3::new(0.0, 0.0, -distance))
+                .z;
+            assert!((0.0..=1.0).contains(&clip_z), "{surface} was clipped");
+        }
+    }
+
+    #[test]
+    fn shared_camera_fits_and_follows_playback_without_ga_resources() {
+        let mut app = camera_app();
+        app.update();
+        let state = app.world().resource::<CameraViewState>();
+        assert!(state.initialized);
+        assert!(!app.world().contains_resource::<SimulationMode>());
+        assert!(!app.world().contains_resource::<TestDriveSettings>());
+        let car = app
+            .world_mut()
+            .spawn((
+                SelectedCar,
+                Transform::from_xyz(120.0, -30.0, 3.0).with_rotation(Quat::from_rotation_z(0.4)),
+                CarObservation::INITIAL,
+            ))
+            .id();
+        app.world_mut().resource_mut::<CameraViewState>().behavior = CameraBehavior::FollowCar;
+        app.update();
+        let state = app.world().resource::<CameraViewState>();
+        let expected = Vec2::new(120.0, -30.0)
+            + Vec2::from_angle(0.4) * FOLLOW_LOOK_AHEAD
+            + camera_panel_offset(state.visual_projection_scale(), state.rotation);
+        assert!(state.center.distance(expected) < 1.0e-4);
+        app.world_mut()
+            .get_mut::<Transform>(car)
+            .unwrap()
+            .translation
+            .x += 200.0;
+        app.update();
+        assert!(
+            (app.world().resource::<CameraViewState>().center.x - expected.x - 200.0).abs()
+                < 1.0e-4
+        );
+        let mut state = app.world_mut().resource_mut::<CameraViewState>();
+        state.behavior = CameraBehavior::Free;
+        state.rotation = 0.8;
+        state.request_reset();
+        app.update();
+        let state = app.world().resource::<CameraViewState>();
+        assert_eq!(state.rotation, 0.0);
+        assert_eq!(state.zoom, 1.0);
+        assert!(state.initialized);
+    }
+
+    #[test]
+    fn original_ga_open_field_camera_and_scene_switch_are_preserved() {
+        let mut app = camera_app();
+        app.insert_resource(SimulationMode::TestDrive)
+            .insert_resource(TestDriveSettings {
+                environment: TestDriveEnvironment::OpenField,
+                ..default()
+            });
+        app.update();
+        let expected = calculate_camera_fit(
+            TrackBounds {
+                min: Vec2::splat(-600.0),
+                max: Vec2::splat(600.0),
+            },
+            UVec2::new(1400, 850),
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        assert!(
+            (app.world()
+                .resource::<CameraViewState>()
+                .base_projection_scale
+                - expected.projection_scale)
+                .abs()
+                < 1.0e-5
+        );
+        app.world_mut()
+            .resource_mut::<TestDriveSettings>()
+            .environment = TestDriveEnvironment::Track;
+        app.update();
+        let expected = calculate_camera_fit(
+            app.world().resource::<Track>().bounds(),
+            UVec2::new(1400, 850),
+            1.0,
+            0.0,
+        )
+        .unwrap();
+        assert!(
+            (app.world()
+                .resource::<CameraViewState>()
+                .base_projection_scale
+                - expected.projection_scale)
+                .abs()
+                < 1.0e-5
+        );
     }
 
     #[test]
