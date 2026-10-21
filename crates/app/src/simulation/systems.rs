@@ -372,6 +372,16 @@ fn canonical_population_start(track: &Track) -> CanonicalPopulationStart {
     }
 }
 
+#[cfg(test)]
+pub(super) fn ga_canonical_start_for_test(track: &Track) -> VehicleState {
+    let start = canonical_population_start(track);
+    VehicleState {
+        position: start.position,
+        heading: start.heading,
+        speed: start.speed,
+    }
+}
+
 fn spawn_manual_car(commands: &mut Commands, track: &Track, environment: TestDriveEnvironment) {
     let (position, heading, progress) = manual_spawn_state(track, environment);
     let mut entity = commands.spawn((

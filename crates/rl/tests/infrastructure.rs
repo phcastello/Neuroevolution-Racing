@@ -323,7 +323,17 @@ fn manual_suite_reports_pending_instead_of_fake_success() {
 #[test]
 fn presets_and_preflight_limits_are_validated() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../configs/rl");
-    for name in ["smoke", "base", "stress"] {
+    for name in [
+        "smoke",
+        "base",
+        "stress",
+        "large_200k",
+        "large_200k_20k",
+        "ppo_update_a_control",
+        "ppo_update_b_lr",
+        "ppo_update_c_lr_entropy",
+        "ppo_reward_ga_inspired",
+    ] {
         let c = Config::load(&root.join(format!("{name}.ron"))).unwrap();
         assert_eq!(c.observation.dimension(), 25);
         assert!(c.estimated_bytes() < c.memory_limit_mib as u128 * 1024 * 1024);
@@ -346,6 +356,38 @@ fn presets_and_preflight_limits_are_validated() {
     c = Config {
         num_envs: usize::MAX,
         ..Default::default()
+    };
+    assert!(c.validate().is_err());
+}
+
+#[test]
+fn ga_reward_config_rejects_invalid_speed_settings_and_roundtrips() {
+    use racing_rl::config::RewardMode;
+    let mut c = Config::default();
+    for (weight, half_saturation) in [
+        (f32::NAN, 120.),
+        (-1., 120.),
+        (25., 0.),
+        (25., -1.),
+        (25., f32::INFINITY),
+    ] {
+        c.reward.mode = RewardMode::GaInspired {
+            speed_weight: weight,
+            progress_speed_half_saturation: half_saturation,
+        };
+        assert!(c.validate().is_err());
+    }
+    c.reward.mode = RewardMode::GaInspired {
+        speed_weight: 25.,
+        progress_speed_half_saturation: 120.,
+    };
+    c.validate().unwrap();
+    let restored: Config = ron::from_str(&ron::to_string(&c).unwrap()).unwrap();
+    assert_eq!(c, restored);
+    c.reward.progress_weight = f32::MAX;
+    c.reward.mode = RewardMode::GaInspired {
+        speed_weight: f32::MAX,
+        progress_speed_half_saturation: 120.,
     };
     assert!(c.validate().is_err());
 }
@@ -379,8 +421,21 @@ fn ppo_checkpoint_roundtrip_validates_shapes_state_and_cache_restoration() {
     };
     checkpoint.validate().unwrap();
     let text = ron::to_string(&checkpoint).unwrap();
-    let mut restored: persistence::Checkpoint = ron::from_str(&text).unwrap();
+    // This synthetic legacy-format checkpoint has no reward mode field. Never
+    // load or execute real experiment artifacts in this compatibility test.
+    assert!(text.contains("reward:(version:1,progress_weight:0.01"));
+    let legacy_text = text.replace("speed_normalization:LinearClamp,", "");
+    assert!(!legacy_text.contains("speed_normalization"));
+    let mut restored: persistence::Checkpoint = ron::from_str(&legacy_text).unwrap();
+    assert_eq!(
+        restored.config.observation.speed_normalization,
+        racing_rl::config::SpeedNormalization::LinearClamp
+    );
     restored.validate().unwrap();
+    assert_eq!(
+        restored.config.reward.mode,
+        racing_rl::config::RewardMode::Baseline
+    );
     let mut other = Network::<Cpu>::new(&c, &Default::default()).unwrap();
     let cache = other
         .forward(m(
@@ -396,4 +451,23 @@ fn ppo_checkpoint_roundtrip_validates_shapes_state_and_cache_restoration() {
     assert!(other.validate_cache(&cache).is_err());
     restored.optimizer.second[0][0] = -1.;
     assert!(restored.validate().is_err());
+}
+
+#[test]
+fn speed_normalization_old_specs_default_and_new_specs_persist_metadata() {
+    use racing_rl::config::SpeedNormalization;
+    let old_text = "(version:1,kind:Extended(ray_angles_degrees:[0.0]),sensor_range:1000.0,speed_scale:250.0,angular_speed_scale:2.15)";
+    let old: ObservationSpec = ron::from_str(old_text).unwrap();
+    assert_eq!(old.speed_normalization, SpeedNormalization::LinearClamp);
+    assert_eq!(old.features()[1].normalization, "clamp(v/250,-1,1)");
+    let mut new = old.clone();
+    new.speed_normalization = SpeedNormalization::SignedAsymptotic;
+    let text = ron::to_string(&new).unwrap();
+    assert!(text.contains("speed_normalization:SignedAsymptotic"));
+    assert_eq!(ron::from_str::<ObservationSpec>(&text).unwrap(), new);
+    assert_eq!(old.dimension(), new.dimension());
+    assert_ne!(old.features(), new.features());
+    assert_eq!(new.features()[1].normalization, "v/(250+abs(v))");
+    new.kind = ObservationKind::Legacy6;
+    assert!(new.validate().is_err());
 }

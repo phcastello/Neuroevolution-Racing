@@ -1,0 +1,149 @@
+PPO: VELOCIDADE E HORIZONTE TEMPORAL
+
+Implementação preparada sem executar D/E nem carregar/avaliar checkpoints reais.
+Sem commit/push. Alterações locais anteriores foram preservadas.
+
+EXECUTAR, A PARTIR DA RAIZ DO REPOSITÓRIO
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_ppo_speed_horizon_experiments.ps1
+
+O script compila uma vez em release (--locked, --features rl-gpu), verifica o
+código de saída e inicia D e depois E, do zero, sequencialmente. A ausência da
+GPU solicitada é erro; não há fallback para CPU no treinamento. Cada experimento
+usa um único processo de treinamento, com os ambientes contínuos entre rollouts.
+
+PRESETS
+
+  configs/rl/ppo_speed_d.ron:         gamma=0.99,  lambda=0.95
+  configs/rl/ppo_speed_horizon_e.ron: gamma=0.997, lambda=0.98
+
+Ambos derivam de ppo_reward_ga_inspired.ron. As mudanças comuns são a opção de
+velocidade SignedAsymptotic e total_rollouts=500. D/E diferem apenas em gamma,
+lambda e results_root. Mantêm 25 entradas, hidden=[256,256,256,256], ReLU,
+cabeças originais e 204.805 parâmetros; speed_scale=250, GPU adapter=0, N=32,
+T=256, minibatch=512, epochs=4, learning_rate=0.0001, latent_entropy_coef=0,
+target_kl=0.03 e max_gradient_norm=0.5. Recompensa, Adam, inicialização, log_std,
+seeds, pistas, condições iniciais, física e decisões a 60 Hz são os da origem.
+
+COMPATIBILIDADE
+
+ObservationSpec.speed_normalization é serializada na configuração/checkpoint:
+  LinearClamp (default quando ausente): clamp(v/speed_scale,-1,1), como antes.
+  SignedAsymptotic (opt-in Extended): v/(speed_scale+abs(v)).
+
+A implementação contínua reaproveita a magnitude assintótica estável do GA,
+restaurando o sinal. O GA permanece inalterado. NaN resulta em zero; infinitos
+resultam nos limites +1/-1. Escalas não finitas ou não positivas são rejeitadas
+na configuração; o helper retorna zero defensivamente. Valores extremos finitos
+não estouram a soma do denominador. Há a precisão/limitação usual de f32.
+
+Os metadados ordenados descrevem a fórmula efetiva; checkpoints com metadados
+incompatíveis são rejeitados. Legacy6 mantém sua magnitude histórica e não
+aceita SignedAsymptotic. Coleta, avaliador e visualizador usam ObservationSpec
+salva através do mesmo RacingEnvironment. Modelos antigos não são convertidos.
+A retomada compara a configuração completa, incluindo a semântica das entradas;
+permite aumentar total_rollouts e a troca de dispositivo já permitida antes.
+
+AVALIAÇÃO E PERSISTÊNCIA
+
+O script passa --save-every 100 --save-first 0 --save-last 0 --no-save-rollouts.
+Checkpoints e losses detalhados são preservados em 100/200/300/400/500. Todos os
+registros de metrics.csv, update_metrics.csv, track_metrics.csv e run.log ficam
+na execução. Não há dumps completos dos rollouts.
+
+--evaluate-every 100 habilita avaliação após salvar o checkpoint, fora dos
+temporizadores de coleta/update. A opção exige que os checkpoints correspondentes
+sejam persistidos. O avaliador existente é reutilizado em CPU com política
+congelada, uma tentativa determinística em cada pista de treinamento: monza,
+red_bull_ring, interlagos, catalunya e silverstone. Ambos usam evaluation_seed=55.
+O início é canônico: distância 16, velocidade 45, direção tangente, sem ações
+anteriores. Pistas de validação não entram na pontuação.
+
+O limite da avaliação aceita apenas o snapshot imutável; cria sua rede restaurada,
+seus ambientes/cenas e seus RNGs, sem acesso aos objetos vivos do treinamento.
+Não há update, alteração de Adam ou coleta de experiências de avaliação para PPO.
+periodic_evaluations.csv registra experimento, rollout, caminho absoluto do
+checkpoint, pista, conclusão/colisão/timeout, progresso, recompensa, decisões,
+ticks físicos e seeds. simulated_seconds é ticks*physical_dt;
+evaluation_wall_seconds é a duração real do episódio. run.log também registra a
+duração real total do lote, incluindo restore/cenas/escrita. Esses tempos não
+entram em coleta/update nem em seu throughput.
+
+SAÍDAS E PROCEDÊNCIA
+
+  results_ppo/speed_horizon_ablation/D_speed/ppo-<execução>/
+  results_ppo/speed_horizon_ablation/E_speed_horizon/ppo-<execução>/
+  results_ppo/speed_horizon_ablation/reports/batch-<data>-<GUID>/
+
+A aplicação escreve o caminho exato em um novo arquivo recebido por
+--run-path-file. O lote guarda D_speed-run-path.txt, E_speed_horizon-run-path.txt
+e runs.json; preserva os recibos já produzidos se o próximo experimento falhar.
+Nenhuma descoberta por "pasta mais recente" é usada. Diretórios são únicos;
+arquivos de checkpoints/recibos existentes nunca são substituídos.
+
+Ao final, comparison.txt mostra todos os checkpoints e resultados individuais
+das cinco pistas, com destaque para 300/400/500. comparison_manifest.json guarda
+os caminhos exatos e o melhor checkpoint por experimento: primeiro número de
+pistas concluídas, depois média simples do progresso nas cinco pistas. Empates
+exatos usam o primeiro rollout. A recompensa e o número de updates não selecionam
+o melhor checkpoint. Os arquivos originais não são renomeados nem copiados sobre
+outros. O resumo não estabelece superioridade por diferenças pequenas ou vantagens
+isoladas, nem inicia/seleciona automaticamente um treinamento maior.
+
+CONTINUAR DEPOIS (NÃO EXECUTADO)
+
+Copie o preset correspondente para um novo arquivo, por exemplo
+configs/rl/ppo_speed_d_continue.ron. Aumente somente total_rollouts (por exemplo,
+500 para 1000), conservando os demais campos. Use o caminho exato desejado,
+registrado no manifesto/recibo, em vez de localizar a execução mais recente:
+
+  .\target\release\neuroevolution-racing.exe rl train --config configs/rl/ppo_speed_d_continue.ron --resume "<caminho-exato-do-checkpoint.ron>" --save-every 100 --save-first 0 --save-last 0 --no-save-rollouts --evaluate-every 100 --experiment D_speed_continued
+
+Para E, use a cópia do preset E, seu checkpoint e o label E_speed_horizon_continued.
+total_rollouts é a meta acumulada, não o número adicional. A retomada cria outro
+diretório, preserva pesos/Adam/RNGs/contadores e, como já informado no checkpoint,
+reinicia os ambientes. Portanto, não equivale a uma trajetória ininterrupta.
+Não use o manifesto comparativo fixo de 100..500 para pontuar essa continuação.
+
+ARQUIVOS DESTA IMPLEMENTAÇÃO
+
+  crates/rl/src/config.rs
+  crates/rl/tests/infrastructure.rs
+  crates/app/src/simulation/rl_environment.rs
+  crates/app/src/rl.rs
+  crates/app/src/rl/persistence_policy.rs
+  crates/app/src/rl/evaluation.rs
+  crates/app/src/rl/evaluation/tests.rs
+  crates/app/src/rl/experiment_tests.rs
+  crates/app/src/rl/viewer/tests.rs
+  configs/rl/ppo_speed_d.ron
+  configs/rl/ppo_speed_horizon_e.ron
+  scripts/run_ppo_speed_horizon_experiments.ps1
+  scripts/ppo_speed_horizon_summary.ps1
+  scripts/test_ppo_speed_horizon.ps1
+  docs/rl/PPO_SPEED_HORIZON_EXPERIMENTS.txt
+
+VALIDAÇÃO
+
+Testes pequenos em CPU com redes/artefatos sintéticos: fórmula, sinal, ordem,
+extremos, entradas inválidas, preservação do clamp, configurações/checkpoints sem
+a opção, persistência/metadados, visualizador e rejeição de retomada incompatível.
+Comparação completa dos presets contra a origem; teste de aumento da meta.
+Fixture de isolamento compara snapshot, Adam, RNGs e o rollout seguinte com um
+controle sem avaliação. Outra fixture executa apenas dois rollouts minúsculos,
+duas vezes, em pasta temporária, verificando recibos únicos, checkpoints/losses,
+CSVs completos, tempos separados e ausência de dumps de rollout.
+
+O teste PowerShell gera somente tabelas/checkpoints fictícios e verifica ranking
+primário/secundário, empates, procedência, pistas duplicadas, execução alheia mais
+recente, preservação de originais e estrutura do comando do runner.
+
+  cargo test --locked -p racing-rl --test infrastructure
+  cargo test --locked -p neuroevolution-racing-app --bin neuroevolution-racing rl:: -- --test-threads=1
+  cargo test --locked -p neuroevolution-racing-app --bin neuroevolution-racing simulation::rl_environment::tests:: -- --test-threads=1
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_ppo_speed_horizon.ps1
+  cargo check --locked -p neuroevolution-racing-app --features rl-gpu
+
+A compilação com GPU não testa disponibilidade/performance do adaptador em runtime.
+Não há afirmação de desempenho/aprendizado de D/E: os experimentos de 500 rollouts
+e avaliações de checkpoints reais ficam sob controle do usuário.

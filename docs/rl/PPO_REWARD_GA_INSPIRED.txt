@@ -1,0 +1,153 @@
+Proxima etapa PPO: recompensa inspirada no fitness real do GA
+
+IMPLEMENTACAO
+
+O GA em crates/app/src/simulation/training.rs (EvaluationConfig, episode_score,
+normalize_useful_progress_speed) calcula, no final do episodio:
+  score = p + 0.40 * f(vmedio) + 0.45 * completou - 0.08 * colidiu
+  p = clamp((best - initial)/(L - initial), 0, 1)
+  vmedio = max(best - initial, 0) / elapsed
+  f(v) = v/(v + k), k = 120 unidades/s.
+
+O novo modo PPO e opt-in: reward.mode = GaInspired(...). Sem esse campo, ou
+com Baseline, permanece exatamente gain * progress_weight, bonus terminal e
+penalidade terminal originais. Baseline tambem omite o campo mode ao serializar.
+Nenhuma versao de preset, checkpoint ou rollout mudou; RewardParts continua
+com progress/completion/collision. Em GaInspired, progress agrega os dois termos
+densos abaixo. Presets e checkpoints antigos nao precisam de migracao.
+
+FORMULA POR TICK FISICO
+
+  g_t = ganho de NOVO melhor progresso validado pelo tracker existente
+  q_t = g_t / L
+  v_t = g_t / dt
+  f_t = normalize_useful_progress_speed(v_t, k)
+  r_t = q_t * (Wp + Ws * f_t) + C * I_conclusao - P * I_colisao
+
+Preset: Wp=100, Ws=25, k=120 unidades/s, C=10, P=2, dt=1/60 s.
+Para g=0, o termo denso e exatamente zero (incluindo a velocidade).
+Equivalentemente, para g>0: f_t = g_t/(g_t + 120*dt), sujeito ao clamp numerico
+da funcao real do GA (todo valor finito e estritamente menor que 1).
+A recompensa de uma decisao soma seus ticks fisicos, como no PPO baseline.
+O preset usa action_repeat=1: ha uma recompensa e um desconto a cada 1/60 s.
+
+ADAPTACAO DO GA
+
+1. Progresso: usar incrementos q_t, nao repetir o progresso total a cada tick.
+   O PPO corrigido mede progresso relativo ao spawn e completa apos percorrer L;
+   seu divisor e L, preservando a definicao atual de episodio. O GA usa o trecho
+   restante L-initial. Nao mudar o ambiente para imitar essa pequena diferenca.
+2. Velocidade util: substituir a media terminal pela velocidade do ganho novo.
+   Ponderar f(v_t) por q_t: o bonus e pago apenas pela fracao inedita percorrida.
+   Nao pagar f(v) por tempo nem usar velocidade absoluta do carro. O termo base
+   por igual fracao e identico entre pistas; k continua em unidades fisicas/s,
+   portanto a parcela de velocidade distingue velocidades fisicas diferentes.
+3. Conclusao: pagar C apenas na transicao terminal Completed. O guard finished
+   impede novas transicoes sem reset; reset nao paga recompensa.
+4. Colisao: pagar -P apenas na colisao translacional terminal, preservando o
+   criterio existente. Contatos apenas de rotacao continuam registrados nas
+   metricas fisicas. Colisao tem precedencia sobre conclusao no mesmo tick.
+
+Isso define um objetivo denso inspirado no GA; nao e uma transformacao por
+potencial que preserve exatamente a ordenacao do fitness terminal do GA.
+Nao ha recompensa por permanencia parada, velocidade sem ganho, marcha a re
+ou recuperacao de distancia ja creditada. Oscilacoes nao podem repetir credito.
+O tracker Progress.advance permanece integralmente: delta assinado com wrap,
+divida de marcha a re, high-water mark, rejeicao |delta| > 4*movimento + 2,
+reancoragem apos rejeicao e protecao contra juntar trechos desconexos.
+O ganho total por episodio e <= L, logo 0 <= soma densa <= 125 sem desconto.
+Nao existe premio terminal adicional por progresso ou velocidade, evitando
+dupla contagem.
+
+ESCALA E DESCONTO
+
+Com gamma=0.99 e 60 Hz, 1/(1-gamma)=100 decisoes, aproximadamente 1.67 s;
+a meia-vida do desconto e aproximadamente 69 ticks, 1.15 s. Em um exemplo
+de L=6000 e v_util=120 unidades/s (0.02 volta/s): g=2, f=0.5,
+r_denso=(2/6000)*(100+12.5)=0.0375 por tick. O retorno estacionario aproximado
+e r/(1-gamma)=3.75. -2 equivale a aproximadamente 53 ticks desse exemplo;
++10 equivale a aproximadamente 267 ticks e 2.67 vezes esse retorno local.
+O bonus de velocidade por fracao e limitado a 25% do termo base. Wp=100,
+Ws=25 e P=2 foram escolhidos nessa escala de transicoes, nao copiados do GA.
+k=120 conserva a interpretacao fisica e a meia-saturacao do GA; nao e peso de
+recompensa. C=10 conserva a escala terminal do PPO e e significativo perto da
+chegada. Com gamma=.99, uma conclusao distante ainda e fortemente descontada;
+nao ha promessa de que ela domine todo progresso imediato em voltas longas.
+O desconto favorece progresso antecipado, e o fator limitado favorece progresso
+rapido. Esperar antes de avancar reduz o retorno descontado, sem gerar credito.
+Outros action_repeat mudam a duracao fisica do desconto por decisao; este
+experimento mantem repeat=1 e gamma=.99 para isolar somente a recompensa.
+
+PRESET E EXECUCAO FUTURA (COMANDOS NAO EXECUTADOS NESTA PREPARACAO)
+
+configs/rl/ppo_reward_ga_inspired.ron deriva integralmente de ppo_update_b_lr.ron,
+alterando somente reward e results_root. Rede de 204805 parametros, LR .0001,
+entropia zero, seeds, Adam, PPO-Clip, GAE, sensores e fisica permanecem iguais.
+Cada novo treinamento cria um diretorio unico. Comecar do zero, sem --resume:
+
+  cargo run --release -p neuroevolution-racing-app --features rl-gpu -- rl train --config configs/rl/ppo_reward_ga_inspired.ron --save-every 100 --save-first 0 --save-last 0 --no-save-rollouts
+
+PRESERVACAO DO B
+
+Os quatro checkpoints foram copiados para:
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/
+manifest.json registra caminhos de origem/destino, rollout, tamanho e SHA-256;
+os hashes de cada copia e original foram comparados. Os originais permanecem
+intactos. Nao houve execucao de checkpoints, avaliacao ou treinamento.
+
+AVALIACAO PREPARADA
+
+Avaliacao deterministica continua como padrao; --mode stochastic usa a funcao
+Gaussian + Tanh existente e log_std real do Actor. --episodes e por pista.
+--tracks validation|training|both seleciona o conjunto somente de avaliacao;
+--track ID permite selecionar pistas explicitamente, sem mudar o aprendizado.
+As seeds das acoes e dos ambientes sao independentes, reproduziveis e registradas.
+O relatorio inclui episodios e resumo por pista com conclusoes, colisoes,
+progresso e recompensa. A politica fica congelada; nao ha atualizacao de pesos.
+Exemplos futuros (substituir CAMINHO_CHECKPOINT; nao executados):
+
+  cargo run --release -p neuroevolution-racing-app --features rl-gpu -- rl evaluate --checkpoint CAMINHO_CHECKPOINT --mode deterministic --tracks both --episodes 10
+  cargo run --release -p neuroevolution-racing-app --features rl-gpu -- rl evaluate --checkpoint CAMINHO_CHECKPOINT --mode stochastic --tracks both --episodes 10 --action-seed 12345 --environment-seed 55
+
+VALIDACAO
+
+Apenas testes automatizados com dados sinteticos/ambientes pequenos e checks de
+compilacao. Nenhum checkpoint real e carregado pelos novos testes; nenhum treino
+ou avaliacao de checkpoint foi executado. O teste preexistente
+real_rollout_determinism_resets_at_different_times_and_manual_train_gate chama
+trainer::update e foi excluido das execucoes desta preparacao.
+
+Resultados desta preparacao: 28 testes do app e 3 testes da infraestrutura
+aprovados (31 testes distintos), mais compilacao de todos os alvos com rl-gpu.
+Comandos de validacao executados:
+
+  cargo test -p neuroevolution-racing-app --bin neuroevolution-racing -- reward_tests experiment_tests rl::evaluation::tests progress_regression_tests simulation::rl_environment::parity_tests track_metrics_tests
+  cargo test -p racing-rl --test infrastructure -- presets_and_preflight_limits_are_validated ga_reward_config_rejects_invalid_speed_settings_and_roundtrips ppo_checkpoint_roundtrip_validates_shapes_state_and_cache_restoration
+  cargo check -p neuroevolution-racing-app --features rl-gpu --all-targets
+
+Tambem passaram as execucoes iniciais isoladas dos filtros reward_tests e
+presets_and_preflight_limits_are_validated, rustfmt e git diff --check.
+A compilacao apresentou avisos preexistentes de API depreciada nos testes de
+viewer e um aviso de cache incremental; concluiu com codigo zero.
+
+ARQUIVOS DESTA ALTERACAO
+
+  crates/rl/src/config.rs
+  crates/rl/tests/infrastructure.rs
+  crates/app/src/rl.rs
+  crates/app/src/rl/experiment_tests.rs
+  crates/app/src/rl/evaluation.rs
+  crates/app/src/rl/evaluation/tests.rs
+  crates/app/src/simulation/rl_environment.rs
+  crates/app/src/simulation/rl_environment/reward.rs
+  crates/app/src/simulation/rl_environment/reward_tests.rs
+  configs/rl/ppo_reward_ga_inspired.ron
+  docs/rl/PPO_REWARD_GA_INSPIRED.txt
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/manifest.json
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/checkpoint-000300.ron
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/checkpoint-000400.ron
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/checkpoint-000500.ron
+  results_ppo/preserved/B_lr_ppo-1792438377988327000-31812/checkpoint-001000.ron
+
+As demais alteracoes preexistentes na arvore de trabalho foram preservadas.
+Nenhum commit ou push foi feito.

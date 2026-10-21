@@ -1,0 +1,6 @@
+execution,name,seed,architecture,crossover_probability,mutation_probability,population_size,generations,best_final_fitness,status
+1,01_baseline,12345,6-8-2,0.8,0.1,500,200,1.724916339,completed
+2,02_crossover_060,12345,6-8-2,0.6,0.1,500,200,1.721980691,completed
+3,03_crossover_100,12345,6-8-2,1,0.1,500,200,1.724383712,completed
+4,04_mutation_005,12345,6-8-2,0.8,0.05,500,200,1.717452526,completed
+5,05_mutation_020,12345,6-8-2,0.8,0.2,500,200,1.724737644,completed

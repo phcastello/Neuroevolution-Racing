@@ -14,9 +14,57 @@ pub struct PersistenceOptions {
     /// Save this many final rollouts (default: 250 when --save-every is set).
     #[arg(long, value_name = "N", requires = "save_every")]
     pub(super) save_last: Option<u64>,
+    /// Omit full rollout buffers; checkpoints, losses and complete CSV logs remain available.
+    #[arg(long)]
+    pub(super) no_save_rollouts: bool,
+    /// Opt-in frozen CPU evaluation on the saved training suite, between rollouts.
+    /// Each evaluation boundary must also save a checkpoint.
+    #[arg(long, value_name = "N")]
+    pub(super) evaluate_every: Option<NonZeroU64>,
+    /// Label recorded in periodic evaluation rows.
+    #[arg(long, default_value = "training")]
+    pub(super) experiment: String,
+    /// Write the exact new run path to a new receipt file (never discover the latest run).
+    #[arg(long)]
+    pub(super) run_path_file: Option<std::path::PathBuf>,
+    /// Remaining cooperative session budget, INCLUDING initialization, in seconds.
+    #[arg(long)]
+    pub(super) wall_time_seconds: Option<f64>,
+    /// Session time already consumed by the supervising script (for provenance).
+    #[arg(long, default_value_t = 0.)]
+    pub(super) session_elapsed_seconds: f64,
+    #[arg(skip)]
+    pub(super) started: Option<std::time::Instant>,
 }
 
 impl PersistenceOptions {
+    pub(super) fn validate_evaluation(&self, total: usize) -> racing_rl::Result<()> {
+        if let Some(seconds) = self.wall_time_seconds {
+            racing_rl::ensure(
+                seconds.is_finite() && seconds >= 0.,
+                "invalid wall time budget",
+            )?;
+            racing_rl::ensure(
+                self.evaluate_every.is_some() && self.no_save_rollouts,
+                "bounded continuation requires periodic evaluation and --no-save-rollouts",
+            )?;
+        }
+        racing_rl::ensure(
+            self.session_elapsed_seconds.is_finite() && self.session_elapsed_seconds >= 0.,
+            "invalid session elapsed time",
+        )?;
+        if let Some(every) = self.evaluate_every {
+            racing_rl::ensure(!self.experiment.trim().is_empty(), "empty experiment label")?;
+            racing_rl::ensure(
+                (1..=total as u64)
+                    .filter(|n| n % every.get() == 0)
+                    .all(|n| self.should_save(n, total)),
+                "every periodic evaluation must have a persisted checkpoint",
+            )?;
+        }
+        Ok(())
+    }
+
     pub(super) fn should_save(&self, completed: u64, total: usize) -> bool {
         let total = total as u64;
         if completed == 0 || completed > total {
@@ -46,6 +94,81 @@ impl PersistenceOptions {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn bounded_cli_parses_real_session_arguments_without_execution() {
+        let args = crate::Cli::try_parse_from([
+            "neuroevolution-racing",
+            "rl",
+            "train",
+            "--config",
+            "configs/rl/ppo_e_continue_8h.ron",
+            "--resume",
+            "exact-source.ron",
+            "--save-every",
+            "100",
+            "--save-first",
+            "0",
+            "--save-last",
+            "0",
+            "--no-save-rollouts",
+            "--evaluate-every",
+            "100",
+            "--wall-time-seconds",
+            "26800.5",
+            "--session-elapsed-seconds",
+            "194.5",
+            "--run-path-file",
+            "exact-new-receipt.txt",
+        ])
+        .unwrap();
+        let Some(crate::CommandLine::Rl {
+            command: crate::rl::RlCommand::Train { persistence, .. },
+        }) = args.command
+        else {
+            panic!("train arguments");
+        };
+        persistence.validate_evaluation(4000).unwrap();
+        assert_eq!(persistence.wall_time_seconds, Some(26800.5));
+        assert_eq!(persistence.session_elapsed_seconds, 194.5);
+        let mut invalid = persistence;
+        invalid.wall_time_seconds = Some(f64::NAN);
+        assert!(invalid.validate_evaluation(4000).is_err());
+    }
+
+    #[test]
+    fn speed_horizon_cli_and_periodic_checkpoint_alignment() {
+        let cli = TestCli::try_parse_from([
+            "test",
+            "--save-every",
+            "100",
+            "--save-first",
+            "0",
+            "--save-last",
+            "0",
+            "--no-save-rollouts",
+            "--evaluate-every",
+            "100",
+            "--experiment",
+            "D_speed",
+            "--run-path-file",
+            "new-receipt.txt",
+        ])
+        .unwrap();
+        let mut options = cli.persistence;
+        options.validate_evaluation(500).unwrap();
+        let checkpoints: Vec<_> = (1..=500).filter(|n| options.should_save(*n, 500)).collect();
+        assert_eq!(checkpoints, [100, 200, 300, 400, 500]);
+        assert_eq!(options.evaluate_every.unwrap().get(), 100);
+        assert_eq!(options.experiment, "D_speed");
+        assert_eq!(
+            options.run_path_file.as_ref().unwrap(),
+            std::path::Path::new("new-receipt.txt")
+        );
+        options.evaluate_every = NonZeroU64::new(50);
+        assert!(options.validate_evaluation(500).is_err());
+        assert!(TestCli::try_parse_from(["test", "--evaluate-every", "0"]).is_err());
+    }
 
     fn sampled() -> PersistenceOptions {
         PersistenceOptions {
@@ -116,6 +239,7 @@ mod tests {
             save_every: NonZeroU64::new(3),
             save_first: Some(2),
             save_last: Some(2),
+            ..Default::default()
         };
         let selected: Vec<_> = (1..=11).filter(|n| policy.should_save(*n, 11)).collect();
         assert_eq!(selected, [1, 2, 3, 6, 9, 10, 11]);
@@ -202,5 +326,46 @@ mod tests {
         assert!(!persistence.should_save(251, 20_000));
         assert!(persistence.should_save(500, 20_000));
         assert!(persistence.should_save(20_000, 20_000));
+    }
+
+    #[test]
+    fn experiment_saves_only_each_hundredth_checkpoint_and_can_omit_rollouts() {
+        let cli = crate::Cli::try_parse_from([
+            "neuroevolution-racing",
+            "rl",
+            "train",
+            "--config",
+            "configs/rl/ppo_update_a_control.ron",
+            "--save-every",
+            "100",
+            "--save-first",
+            "0",
+            "--save-last",
+            "0",
+            "--no-save-rollouts",
+        ])
+        .unwrap();
+        let Some(crate::CommandLine::Rl {
+            command:
+                crate::rl::RlCommand::Train {
+                    resume,
+                    persistence,
+                    ..
+                },
+        }) = cli.command
+        else {
+            panic!("Expected fresh PPO training")
+        };
+        assert!(resume.is_none());
+        assert!(persistence.no_save_rollouts);
+        let selected: Vec<_> = (1..=1000)
+            .filter(|n| persistence.should_save(*n, 1000))
+            .collect();
+        assert_eq!(
+            selected,
+            [100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+        );
+        assert_eq!(persistence.losses_index(100), 100);
+        assert!(!PersistenceOptions::default().no_save_rollouts);
     }
 }

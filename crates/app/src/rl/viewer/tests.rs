@@ -613,3 +613,53 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
     );
     assert!(app.world().resource::<ViewerControls>().paused);
 }
+
+#[test]
+fn viewer_restores_saved_speed_semantics_and_metadata_without_reinterpreting_weights() {
+    use racing_rl::config::SpeedNormalization;
+    let library = TrackLibrary::load_default().unwrap();
+    for (mode, expected) in [
+        (SpeedNormalization::LinearClamp, 1.),
+        (SpeedNormalization::SignedAsymptotic, 2. / 3.),
+    ] {
+        let mut c = small_config();
+        c.observation.speed_normalization = mode;
+        let saved = saved_policy(&c, 0);
+        let text = ron::to_string(&saved).unwrap();
+        let text = if mode == SpeedNormalization::LinearClamp {
+            text.replace("speed_normalization:LinearClamp,", "")
+        } else {
+            assert!(text.contains("speed_normalization:SignedAsymptotic"));
+            text
+        };
+        let restored: Checkpoint = ron::from_str(&text).unwrap();
+        restored.validate().unwrap();
+        let mut incompatible: Checkpoint = ron::from_str(&text).unwrap();
+        incompatible.config.observation.speed_normalization =
+            if mode == SpeedNormalization::LinearClamp {
+                SpeedNormalization::SignedAsymptotic
+            } else {
+                SpeedNormalization::LinearClamp
+            };
+        assert!(
+            incompatible.validate().is_err(),
+            "same dimensions cannot hide changed metadata"
+        );
+        let mut viewer = Viewer::new(
+            restored,
+            PathBuf::from("synthetic.ron"),
+            1,
+            Some("monza"),
+            &library,
+            None,
+        )
+        .unwrap();
+        viewer.environments[0].state.speed = 500.;
+        viewer.observe().unwrap();
+        viewer.capture_inference().unwrap();
+        assert_close(viewer.observations[0][21], expected);
+        assert_eq!(viewer.trace_for(0).unwrap().input, viewer.observations[0]);
+        assert_eq!(viewer.saved.features, c.observation.features());
+        assert_eq!(viewer.config.observation.speed_normalization, mode);
+    }
+}

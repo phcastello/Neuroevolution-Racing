@@ -1,5 +1,6 @@
 //! RL episodes reuse the exact kinematic integrator, collision resolver, track geometry
 //! and Avian wall queries. Static scenes contain WALLS ONLY: cars are private state.
+mod reward;
 use super::{
     CAR_LENGTH, CAR_WIDTH, SimulationConfig, Track, TrackLibrary,
     components::SimulationLayer,
@@ -14,13 +15,22 @@ use avian2d::prelude::*;
 use bevy::{ecs::system::SystemState, prelude::*, time::TimeUpdateStrategy};
 use racing_rl::{
     Result,
-    config::{Config, ObservationKind},
+    config::{Config, ObservationKind, SpeedNormalization},
     ensure,
     rollout::{EndReason, Environment, RewardParts, Step},
 };
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha12Rng;
-use std::{cell::RefCell, rc::Rc, time::Duration};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, time::Duration};
+
+/// Reuse GA's overflow-safe magnitude without changing GA's unsigned behavior.
+/// NaN maps to zero; infinities map to their signed limit. Config rejects bad scales.
+fn normalize_signed_speed(speed: f32, scale: f32) -> f32 {
+    if !scale.is_finite() || scale <= 0. || speed.is_nan() {
+        return 0.;
+    }
+    normalize_speed(speed, scale).copysign(speed)
+}
 
 pub struct Scene {
     pub track: Track,
@@ -94,13 +104,27 @@ struct Progress {
     best: f32,
 }
 impl Progress {
+    #[cfg(test)]
     fn advance(&mut self, projected: f32, length: f32, movement: f32) -> f32 {
+        self.advance_connected(projected, length, movement, false)
+    }
+    fn advance_connected(
+        &mut self,
+        projected: f32,
+        length: f32,
+        movement: f32,
+        adjacent: bool,
+    ) -> f32 {
         let delta = wrapped_distance_delta(self.previous, projected, length);
+        // Like GA's centerline_distance, the reference follows every projection.
+        self.previous = projected;
         // Reject discontinuities rather than crediting teleportation or a wrong branch.
-        if delta.abs() > 4. * movement + 2. {
+        if delta.abs() > 4. * movement + 2. && !adjacent {
+            // Do not join disconnected forward stretches into a fictitious lap.
+            // Keep the high-water mark and any existing reverse-motion debt.
+            self.cumulative = self.cumulative.min(0.);
             return 0.;
         }
-        self.previous = projected;
         self.cumulative += delta;
         let best = self.cumulative.clamp(0., length).max(self.best);
         let gain = best - self.best;
@@ -108,6 +132,55 @@ impl Progress {
         gain
     }
 }
+
+/// Physical query events, not episode endings. Rotation can be rejected safely
+/// while translation continues. Episode resets deliberately retain these counts.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct CollisionEvents {
+    pub physical_ticks: u64,
+    pub translation: u64,
+    pub rotation: u64,
+    pub rotation_only: u64,
+}
+
+/// Lightweight accumulators for decisions since the caller last drained them.
+/// Resets retain these values, so episodes ending inside a rollout are included.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct TrackMetrics {
+    pub decisions: u64,
+    pub physical_ticks: u64,
+    pub reward_sum: f64,
+    pub progress_reward_sum: f64,
+    pub progress_gain: f64,
+    pub progress_fraction_sum: f64,
+    pub progress_fraction_max: f32,
+    pub episodes_completed: u64,
+    pub episodes_collision: u64,
+    pub episodes_timeout: u64,
+    /// Final progress of all ended episodes, including collisions and timeouts.
+    pub ended_episode_progress_sum: f64,
+    pub collision_events: CollisionEvents,
+}
+impl TrackMetrics {
+    pub fn merge(&mut self, other: &Self) {
+        self.decisions += other.decisions;
+        self.physical_ticks += other.physical_ticks;
+        self.reward_sum += other.reward_sum;
+        self.progress_reward_sum += other.progress_reward_sum;
+        self.progress_gain += other.progress_gain;
+        self.progress_fraction_sum += other.progress_fraction_sum;
+        self.progress_fraction_max = self.progress_fraction_max.max(other.progress_fraction_max);
+        self.episodes_completed += other.episodes_completed;
+        self.episodes_collision += other.episodes_collision;
+        self.episodes_timeout += other.episodes_timeout;
+        self.ended_episode_progress_sum += other.ended_episode_progress_sum;
+        self.collision_events.physical_ticks += other.collision_events.physical_ticks;
+        self.collision_events.translation += other.collision_events.translation;
+        self.collision_events.rotation += other.collision_events.rotation;
+        self.collision_events.rotation_only += other.collision_events.rotation_only;
+    }
+}
+
 pub struct RacingEnvironment {
     pub env_id: usize,
     pub scenes: Vec<Rc<Scene>>,
@@ -116,13 +189,19 @@ pub struct RacingEnvironment {
     pub rng: ChaCha12Rng,
     config: Config,
     pub physics: SimulationConfig,
+    pub collision_events: CollisionEvents,
+    pub track_metrics: BTreeMap<String, TrackMetrics>,
     episode: u64,
     ticks: u64,
     previous_action: [f32; 2],
     yaw_rate: f32,
     progress: Progress,
+    progress_position: Vec2,
     nearest: usize,
     finished: bool,
+}
+fn movement_is_connected(stored: Vec2, before: Vec2, old: usize, new: usize, count: usize) -> bool {
+    stored == before && old != new && ((old + 1) % count == new || (new + 1) % count == old)
 }
 impl RacingEnvironment {
     pub fn new(
@@ -145,11 +224,14 @@ impl RacingEnvironment {
             rng,
             config: config.clone(),
             physics: physics.clone(),
+            collision_events: CollisionEvents::default(),
+            track_metrics: BTreeMap::new(),
             episode: 0,
             ticks: 0,
             previous_action: [0.; 2],
             yaw_rate: 0.,
             progress: Progress::default(),
+            progress_position: Vec2::ZERO,
             nearest: 0,
             finished: false,
         };
@@ -160,8 +242,9 @@ impl RacingEnvironment {
         self.scene_index = self.rng.random_range(0..self.scenes.len());
         let scene = &self.scenes[self.scene_index];
         // Same canonical starting distance/speed as GA, with no perturbation of GA's RNG.
-        let (position, tangent) = scene.track.pose_at_distance(16.);
+        let position = scene.track.point_at_distance(16.);
         let projection = scene.track.project(position);
+        let tangent = scene.track.samples[projection.segment_index].tangent;
         self.state = VehicleState {
             position,
             heading: tangent.to_angle(),
@@ -172,6 +255,7 @@ impl RacingEnvironment {
             ..Default::default()
         };
         self.nearest = projection.segment_index;
+        self.progress_position = position;
         self.previous_action = [0.; 2];
         self.yaw_rate = 0.;
         self.ticks = 0;
@@ -183,6 +267,18 @@ impl RacingEnvironment {
     }
     pub fn progress_fraction(&self) -> f32 {
         self.progress.best / self.scenes[self.scene_index].track.total_length
+    }
+    #[cfg(test)]
+    pub(crate) fn diagnostic_progress(&self) -> [f32; 4] {
+        [
+            self.progress.previous,
+            self.progress.cumulative,
+            self.progress.best,
+            self.scenes[self.scene_index].track.total_length,
+        ]
+    }
+    pub fn take_track_metrics(&mut self) -> BTreeMap<String, TrackMetrics> {
+        std::mem::take(&mut self.track_metrics)
     }
 }
 impl Environment for RacingEnvironment {
@@ -209,7 +305,14 @@ impl Environment for RacingEnvironment {
                 obs.push(normalize_speed(self.state.speed, spec.speed_scale))
             }
             ObservationKind::Extended { .. } => {
-                obs.push((self.state.speed / spec.speed_scale).clamp(-1., 1.));
+                obs.push(match spec.speed_normalization {
+                    SpeedNormalization::LinearClamp => {
+                        (self.state.speed / spec.speed_scale).clamp(-1., 1.)
+                    }
+                    SpeedNormalization::SignedAsymptotic => {
+                        normalize_signed_speed(self.state.speed, spec.speed_scale)
+                    }
+                });
                 obs.push((self.yaw_rate / spec.angular_speed_scale).clamp(-1., 1.));
                 obs.extend(self.previous_action);
             }
@@ -235,6 +338,8 @@ impl Environment for RacingEnvironment {
         let mut reward = RewardParts::default();
         let mut reason = None;
         let mut ticks = 0;
+        let mut progress_gain = 0.;
+        let previous_events = self.collision_events;
         for _ in 0..self.config.action_repeat {
             let scene = &self.scenes[self.scene_index];
             let before = self.state;
@@ -243,6 +348,11 @@ impl Environment for RacingEnvironment {
             let resolved = resolve_vehicle_motion(before, integrated, |position, heading| {
                 scene.intersects(position, heading)
             });
+            self.collision_events.physical_ticks += 1;
+            self.collision_events.translation += u64::from(resolved.translation_collided);
+            self.collision_events.rotation += u64::from(resolved.rotation_collided);
+            self.collision_events.rotation_only +=
+                u64::from(resolved.rotation_collided && !resolved.translation_collided);
             self.state = resolved.state;
             self.yaw_rate = (self.state.heading - before.heading) / self.config.physical_dt;
             self.previous_action = action;
@@ -253,14 +363,44 @@ impl Environment for RacingEnvironment {
                 self.nearest,
                 self.physics.progress_search_radius,
             );
-            self.nearest = projected.segment_index;
-            let gain = self.progress.advance(
-                projected.track_distance,
-                scene.track.total_length,
-                before.position.distance(self.state.position),
+            // Nearest-point projection on a polyline is discontinuous outside a
+            // corner: switching to its adjacent segment can move the projected
+            // arclength farther than the physical displacement. This is connected
+            // motion, not a branch jump. Require continuous stored vehicle state;
+            // only immediate topological neighbors qualify (including the seam).
+            let segment_count = scene.track.samples.len();
+            let adjacent = movement_is_connected(
+                self.progress_position,
+                before.position,
+                self.nearest,
+                projected.segment_index,
+                segment_count,
             );
-            reward.progress += gain * self.config.reward.progress_weight;
-            if resolved.translation_collided || resolved.rotation_collided {
+            let relocated = self.progress_position != before.position;
+            self.progress_position = self.state.position;
+            self.nearest = projected.segment_index;
+            let gain = if relocated {
+                self.progress.previous = projected.track_distance;
+                self.progress.cumulative = self.progress.cumulative.min(0.);
+                0.
+            } else {
+                self.progress.advance_connected(
+                    projected.track_distance,
+                    scene.track.total_length,
+                    before.position.distance(self.state.position),
+                    adjacent,
+                )
+            };
+            progress_gain += f64::from(gain);
+            reward.progress += reward::progress_reward(
+                &self.config.reward,
+                gain,
+                scene.track.total_length,
+                self.config.physical_dt,
+            );
+            if resolved.translation_collided {
+                // GA evaluation stops the car on terminal translation collisions.
+                self.state.speed = 0.;
                 reason = Some(EndReason::Collision);
                 reward.collision = -self.config.reward.collision_penalty;
             } else if self.progress.best >= scene.track.total_length - 0.01 {
@@ -285,6 +425,34 @@ impl Environment for RacingEnvironment {
             "physical step",
         )?;
         let observation = self.observe()?;
+        let progress = self.progress_fraction();
+        let track_id = &self.scenes[self.scene_index].track.definition.id;
+        if !self.track_metrics.contains_key(track_id) {
+            self.track_metrics
+                .insert(track_id.clone(), TrackMetrics::default());
+        }
+        let metrics = self.track_metrics.get_mut(track_id).unwrap();
+        metrics.decisions += 1;
+        metrics.physical_ticks += ticks;
+        metrics.reward_sum += f64::from(reward.total());
+        metrics.progress_reward_sum += f64::from(reward.progress);
+        metrics.progress_gain += progress_gain;
+        metrics.progress_fraction_sum += f64::from(progress);
+        metrics.progress_fraction_max = metrics.progress_fraction_max.max(progress);
+        metrics.episodes_completed += u64::from(reason == Some(EndReason::Completed));
+        metrics.episodes_collision += u64::from(reason == Some(EndReason::Collision));
+        metrics.episodes_timeout += u64::from(reason == Some(EndReason::Timeout));
+        if reason.is_some() {
+            metrics.ended_episode_progress_sum += f64::from(progress);
+        }
+        metrics.collision_events.physical_ticks +=
+            self.collision_events.physical_ticks - previous_events.physical_ticks;
+        metrics.collision_events.translation +=
+            self.collision_events.translation - previous_events.translation;
+        metrics.collision_events.rotation +=
+            self.collision_events.rotation - previous_events.rotation;
+        metrics.collision_events.rotation_only +=
+            self.collision_events.rotation_only - previous_events.rotation_only;
         Ok(Step {
             observation,
             reward,
@@ -292,7 +460,7 @@ impl Environment for RacingEnvironment {
             truncated: reason == Some(EndReason::Timeout),
             reason,
             physical_ticks: ticks,
-            progress: self.progress_fraction(),
+            progress,
         })
     }
 }
@@ -347,6 +515,15 @@ pub fn seeded_environments(
         .collect();
     environments(scenes, c, physics, &rngs)
 }
+
+#[cfg(test)]
+mod parity_tests;
+#[cfg(test)]
+mod progress_regression_tests;
+#[cfg(test)]
+mod reward_tests;
+#[cfg(test)]
+mod track_metrics_tests;
 
 #[cfg(test)]
 mod tests {
@@ -510,6 +687,52 @@ mod tests {
             Err(e) => panic!("{e}"),
         }
     }
+    #[test]
+    fn signed_speed_formula_extremes_and_legacy_observation_are_preserved() {
+        for (speed, expected) in [
+            (0., 0.),
+            (150., 0.375),
+            (250., 0.5),
+            (500., 2. / 3.),
+            (-250., -0.5),
+        ] {
+            assert!((normalize_signed_speed(speed, 250.) - expected).abs() < 1e-6);
+        }
+        let speeds = [-1000., -500., -250., -150., 0., 150., 250., 500., 1000.];
+        let values = speeds.map(|v| normalize_signed_speed(v, 250.));
+        assert!(values.windows(2).all(|p| p[0] < p[1]));
+        assert_eq!(normalize_signed_speed(f32::NAN, 250.), 0.);
+        assert_eq!(normalize_signed_speed(f32::INFINITY, 250.), 1.);
+        assert_eq!(normalize_signed_speed(f32::NEG_INFINITY, 250.), -1.);
+        assert_eq!(normalize_signed_speed(f32::MAX, f32::MAX), 0.5);
+        assert_eq!(normalize_signed_speed(-f32::MAX, f32::MAX), -0.5);
+        for scale in [0., -1., f32::NAN, f32::INFINITY] {
+            assert_eq!(normalize_signed_speed(150., scale), 0.);
+            let mut spec = racing_rl::config::ObservationSpec::default();
+            spec.speed_scale = scale;
+            assert!(spec.validate().is_err());
+        }
+        let (c, scenes) = fixture();
+        let mut old =
+            seeded_environments(scenes.clone(), &c, &SimulationConfig::default(), 9).unwrap();
+        let mut continuous = c.clone();
+        continuous.observation.speed_normalization = SpeedNormalization::SignedAsymptotic;
+        let mut new =
+            seeded_environments(scenes, &continuous, &SimulationConfig::default(), 9).unwrap();
+        for speed in [-500., -250., 0., 150., 250., 500., 1000.] {
+            old[0].state.speed = speed;
+            new[0].state.speed = speed;
+            let a = old[0].observe().unwrap();
+            let b = new[0].observe().unwrap();
+            assert_eq!(a.len(), 25);
+            assert_eq!(b.len(), 25);
+            assert_eq!(a[21], (speed / 250.).clamp(-1., 1.));
+            assert_eq!(b[21], normalize_signed_speed(speed, 250.));
+            assert_eq!(&a[..21], &b[..21]);
+            assert_eq!(&a[22..], &b[22..]);
+        }
+    }
+
     #[test]
     fn held_out_tracks_rejected_from_collection() {
         let library = TrackLibrary::load_default().unwrap();

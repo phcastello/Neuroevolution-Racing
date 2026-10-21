@@ -1,0 +1,9 @@
+track,source_checkpoint,architecture,checkpoint_generation,stored_champion_training_fitness,stored_champion_validation_score,race_status,finish_time,final_best_normalized_progress,useful_progress_speed,final_elapsed_time
+"monza","results\6_16_16_2\bests_by_gen\generation_000999_1788170581.ron","6 -> 16 -> 16 -> 2",999,1.72898829,1.72338581,COMPLETED,38.69958115,1.00000000,307.45986938,38.69958115
+"monza","results\6_16_2\bests_by_gen\generation_000999_1788168326.ron","6 -> 16 -> 2",999,1.73070395,1.71885276,COLLISION,,0.88840276,303.03381348,34.88297272
+"monza","results\6_16_32_2\bests_by_gen\generation_000999_1788173889.ron","6 -> 16 -> 32 -> 2",999,1.72879410,0.52892405,COMPLETED,39.53290176,1.00000000,300.97888184,39.53290176
+"monza","results\6_32_16_2\bests_by_gen\generation_000999_1788170847.ron","6 -> 32 -> 16 -> 2",999,1.73408949,1.71906853,COMPLETED,37.96625900,1.00000000,313.39849854,37.96625900
+"monza","results\6_32_2\bests_by_gen\generation_000999_1788170256.ron","6 -> 32 -> 2",999,1.72998106,1.72342706,COMPLETED,39.71623230,1.00000000,299.58956909,39.71623230
+"monza","results\6_32_32_2\bests_by_gen\generation_000999_1788175783.ron","6 -> 32 -> 32 -> 2",999,1.72727489,1.72268176,COMPLETED,38.79957962,1.00000000,306.66744995,38.79957962
+"monza","results\6_8_2\bests_by_gen\generation_000999_1788166800.ron","6 -> 8 -> 2",999,1.73312104,1.72256112,COMPLETED,39.69956589,1.00000000,299.71533203,39.69956589
+"monza","results\6_8_8_2\bests_by_gen\generation_000999_1788168247.ron","6 -> 8 -> 8 -> 2",999,1.72870493,0.24108206,COMPLETED,40.34955597,1.00000000,294.88720703,40.34955597

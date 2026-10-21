@@ -1,9 +1,15 @@
 //! CLI orchestration. GA commands and all historical formats remain separate.
+mod console;
+mod evaluation;
+#[cfg(test)]
+mod experiment_tests;
 mod persistence_policy;
+mod session_budget;
+mod telemetry;
 pub(crate) mod viewer;
 use crate::simulation::{
     SimulationConfig, TrackLibrary,
-    rl_environment::{self as env, RacingEnvironment},
+    rl_environment::{self as env, CollisionEvents},
 };
 use clap::Subcommand;
 use persistence_policy::PersistenceOptions;
@@ -23,7 +29,7 @@ use rand_chacha::ChaCha12Rng;
 use serde::Serialize;
 use std::{
     fs::OpenOptions,
-    io::Write,
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -46,14 +52,12 @@ pub enum RlCommand {
         #[command(flatten)]
         persistence: PersistenceOptions,
     },
-    /// Deterministic evaluation on held-out tracks, with independent seeds.
+    /// Frozen evaluation; deterministic on held-out tracks unless explicitly selected.
     Evaluate {
         #[arg(long)]
         checkpoint: PathBuf,
-        #[arg(long, default_value_t = 4)]
-        episodes: usize,
-        #[arg(long)]
-        cpu: bool,
+        #[command(flatten)]
+        options: evaluation::EvaluationOptions,
     },
     /// Warmed, synchronized inference and real-physics rollout benchmarks.
     Benchmark {
@@ -83,6 +87,7 @@ pub fn run(command: RlCommand) -> std::result::Result<(), String> {
     run_inner(command).map_err(|e| e.to_string())
 }
 fn run_inner(command: RlCommand) -> Result<()> {
+    let command_started = Instant::now();
     match command {
         RlCommand::InspectRollout { file } => {
             let r: Rollout = persistence::load(&file)?;
@@ -119,9 +124,15 @@ fn run_inner(command: RlCommand) -> Result<()> {
         RlCommand::Train {
             config,
             resume,
-            persistence,
+            mut persistence,
         } => {
+            persistence.started = Some(command_started);
+            ensure(
+                persistence.wall_time_seconds.is_none() || resume.is_some(),
+                "wall time continuation requires --resume",
+            )?;
             let c = Config::load(&config)?;
+            persistence.validate_evaluation(c.total_rollouts)?;
             manual::preflight()?;
             let c = resolve_config(c)?;
             dispatch(&c, Job::Train(resume, persistence))
@@ -132,20 +143,16 @@ fn run_inner(command: RlCommand) -> Result<()> {
         }
         RlCommand::Evaluate {
             checkpoint,
-            episodes,
-            cpu,
+            options,
         } => {
-            ensure(
-                episodes > 0 && episodes <= 10000,
-                "evaluation episode count",
-            )?;
+            options.validate()?;
             let saved: Checkpoint = persistence::load(&checkpoint)?;
             saved.validate()?;
             let mut c = saved.config.clone();
-            if cpu {
+            if options.cpu {
                 c.device = DeviceChoice::Cpu;
             }
-            dispatch(&c, Job::Evaluate(Box::new(saved), episodes))
+            dispatch(&c, Job::Evaluate(Box::new(saved), options))
         }
         RlCommand::View {
             checkpoint,
@@ -165,7 +172,22 @@ enum Job {
     Collect,
     Train(Option<PathBuf>, PersistenceOptions),
     Benchmark,
-    Evaluate(Box<Checkpoint>, usize),
+    Evaluate(Box<Checkpoint>, evaluation::EvaluationOptions),
+}
+fn validate_resume(requested: &Config, saved: &Config) -> Result<()> {
+    let mut compatible = requested.clone();
+    compatible.device = saved.device.clone();
+    compatible.total_rollouts = saved.total_rollouts;
+    // Output destination is provenance, not a learning/observation parameter.
+    compatible.results_root.clone_from(&saved.results_root);
+    ensure(
+        compatible == *saved,
+        "resume configuration mismatch (including observation semantics)",
+    )?;
+    ensure(
+        requested.total_rollouts >= saved.total_rollouts,
+        "resume total_rollouts cannot decrease",
+    )
 }
 fn dispatch(c: &Config, job: Job) -> Result<()> {
     match c.device {
@@ -289,6 +311,7 @@ fn checkpoint<B: Backend>(
 #[derive(Serialize)]
 struct Manifest<'a> {
     version: u32,
+    environment_semantics: &'static str,
     config: &'a Config,
     backend: &'a str,
     physics: &'a SimulationConfig,
@@ -310,6 +333,7 @@ fn manifest(
         &dir.join("manifest.ron"),
         &Manifest {
             version: 1,
+            environment_semantics: session_budget::ENVIRONMENT_SEMANTICS,
             config: c,
             backend: label,
             physics: p,
@@ -335,6 +359,19 @@ fn manifest(
     )
 }
 fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) -> Result<()> {
+    let started = match &job {
+        Job::Train(_, options) => options.started.unwrap_or_else(Instant::now),
+        _ => Instant::now(),
+    };
+    execute_with_clock::<B, _>(c, job, device, label, session_budget::Monotonic(started))
+}
+fn execute_with_clock<B: Backend, C: session_budget::Clock>(
+    c: &Config,
+    job: Job,
+    device: &B::Device,
+    label: &str,
+    clock: C,
+) -> Result<()> {
     println!(
         "{label}\nN={} T={} N*T={} M={} E={} D={} estimated={:.3} MiB",
         c.num_envs,
@@ -348,17 +385,14 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
     if matches!(job, Job::Benchmark) {
         return benchmark::<B>(c, device, label);
     }
-    if let Job::Evaluate(saved, episodes) = job {
-        return evaluate::<B>(*saved, episodes, device, label);
+    if let Job::Evaluate(saved, options) = job {
+        return evaluation::evaluate::<B>(*saved, options, device, label);
     }
     let library = library()?;
     let (mut network, mut optimizer, p, mut rngs, mut completed, mut decisions, mut ticks) =
         if let Job::Train(Some(ref path), _) = job {
             let saved: Checkpoint = persistence::load(path)?;
-            let mut requested = c.clone();
-            requested.device = saved.config.device.clone();
-            requested.total_rollouts = saved.config.total_rollouts;
-            ensure(requested == saved.config, "resume configuration mismatch")?;
+            validate_resume(c, &saved.config)?;
             let (n, o, p) = restore(&saved, device)?;
             (
                 n,
@@ -379,6 +413,14 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
     // Validate held-out suite too, before creating a run.
     let _evaluation = env::scenes(&library, &c.evaluation_tracks, true)?;
     let dir = persistence::run_directory(Path::new(&c.results_root))?;
+    if let Job::Train(_, options) = &job {
+        if let Some(path) = &options.run_path_file {
+            let exact = std::fs::canonicalize(&dir)?;
+            let mut receipt = OpenOptions::new().create_new(true).write(true).open(path)?;
+            writeln!(receipt, "{}", exact.display())?;
+            receipt.sync_all()?;
+        }
+    }
     manifest(&dir, c, &p, label, &library)?;
     let mut log = OpenOptions::new()
         .create_new(true)
@@ -394,36 +436,157 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
         Job::Train(_, options) => options.clone(),
         _ => PersistenceOptions::default(),
     };
+    let bounded = persistence.wall_time_seconds.is_some();
+    let mut budget = session_budget::Budget::new(clock, persistence.wall_time_seconds);
+    let source_path = match &job {
+        Job::Train(Some(path), _) => Some(std::fs::canonicalize(path)?),
+        _ => None,
+    };
+    let source_rollout = completed;
+    let mut best: Option<evaluation::Score> = None;
+    let mut latest_evaluated = false;
+    let mut last_losses = None;
+    let mut stop_reason = "rollout_limit";
+    let mut index = if bounded {
+        let mut writer = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(dir.join("checkpoint_index.csv"))?;
+        writeln!(writer, "role,rollout,adam_step,checkpoint")?;
+        let path = source_path.as_ref().expect("bounded continuation source");
+        writeln!(
+            writer,
+            "source,{completed},{},{}",
+            optimizer.step,
+            evaluation::csv_string(&path.to_string_lossy())
+        )?;
+        writer.flush()?;
+        writeln!(
+            log,
+            "source_checkpoint={} source_rollout={completed} source_adam_step={} environment_semantics={}",
+            path.display(),
+            optimizer.step,
+            session_budget::ENVIRONMENT_SEMANTICS
+        )?;
+        Some(writer)
+    } else {
+        None
+    };
     writeln!(
         log,
         "artifact_persistence={persistence:?}; resumed_completed_rollouts={completed}; target_rollouts={}",
         c.total_rollouts
     )?;
+    let train = matches!(job, Job::Train(..));
+    let mut evaluations = if train && persistence.evaluate_every.is_some() {
+        let mut writer = BufWriter::new(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(dir.join("periodic_evaluations.csv"))?,
+        );
+        evaluation::write_periodic_header(&mut writer)?;
+        Some(writer)
+    } else {
+        None
+    };
+    let mut update_metrics = if train {
+        let mut writer = BufWriter::new(
+            OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(dir.join("update_metrics.csv"))?,
+        );
+        telemetry::UpdateTelemetry::write_header(&mut writer)?;
+        Some(writer)
+    } else {
+        None
+    };
+    let mut track_metrics = BufWriter::new(
+        OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(dir.join("track_metrics.csv"))?,
+    );
+    telemetry::write_track_header(&mut track_metrics)?;
     let mut metrics = OpenOptions::new()
         .create_new(true)
         .write(true)
         .open(dir.join("metrics.csv"))?;
     writeln!(
         metrics,
-        "rollout,policy_version,decisions,physical_ticks,rendered_frames,reward,completed,collision,timeout,seconds,transitions_per_second,gradient_status"
+        "rollout,policy_version,decisions,physical_ticks,rendered_frames,reward,completed,collision,timeout,seconds,transitions_per_second,gradient_status,collision_query_ticks,translation_collision_events,rotation_collision_events,rotation_only_collision_events,progress_mean,progress_max"
     )?;
-    let train = matches!(job, Job::Train(..));
     let count = if train {
         c.total_rollouts.saturating_sub(completed as usize)
     } else {
         1
     };
-    ensure(count > 0, "target rollouts already completed")?;
+    ensure(count > 0 || bounded, "target rollouts already completed")?;
+    // Evaluate the immutable source once with this exact runtime. It participates
+    // in selection; live network, optimizer, environments and RNGs never cross.
+    let mut source_ready = !bounded;
+    if bounded && budget.can_start(budget.evaluation_bound) {
+        let path = source_path.as_ref().unwrap();
+        let saved: Checkpoint = persistence::load(path)?;
+        let start = Instant::now();
+        best = Some(evaluation::periodic(
+            &saved,
+            path,
+            &persistence.experiment,
+            evaluations.as_mut().unwrap(),
+        )?);
+        let seconds = start.elapsed().as_secs_f64();
+        budget.observe_evaluation(seconds);
+        writeln!(log, "source_evaluation_wall_seconds={seconds}")?;
+        source_ready = true;
+    }
     for _ in 0..count {
         let next_completed = completed + u64::from(train);
+        let evaluation_due = train
+            && persistence
+                .evaluate_every
+                .is_some_and(|every| next_completed % every.get() == 0);
+        if bounded && (!source_ready || !budget.can_rollout(evaluation_due)) {
+            stop_reason = "wall_time_budget";
+            break;
+        }
+        let rollout_start = Instant::now();
+        let mut stop_after_rollout = false;
         // This decision gates files/snapshots only. Collection, every update,
         // RNG advancement, counters and telemetry still run for every rollout.
         let save_heavy = !train || persistence.should_save(next_completed, c.total_rollouts);
         let r = rollout::collect(&network, &mut envs, c, &mut rngs.action, device)?;
-        println!("{}", summary(&r));
-        writeln!(log, "rollout={next_completed} {}", summary(&r))?;
+        // Drain diagnostics only; episode state, observations and saved rollouts
+        // are untouched. Counts include episodes reset inside this collection.
+        let mut collisions = CollisionEvents::default();
+        for e in &mut envs {
+            let events = std::mem::take(&mut e.collision_events);
+            collisions.physical_ticks += events.physical_ticks;
+            collisions.translation += events.translation;
+            collisions.rotation += events.rotation;
+            collisions.rotation_only += events.rotation_only;
+        }
+        let mut tracks = std::collections::BTreeMap::<String, env::TrackMetrics>::new();
+        for e in &mut envs {
+            for (id, stats) in e.take_track_metrics() {
+                tracks.entry(id).or_default().merge(&stats);
+            }
+        }
+        for (id, stats) in &tracks {
+            telemetry::write_track_row(next_completed, id, stats, &mut track_metrics)?;
+        }
+        if !train {
+            println!("{}", summary(&r));
+        }
+        writeln!(
+            log,
+            "rollout={next_completed} {} collision_events={collisions:?}",
+            summary(&r)
+        )?;
         if train {
             let start = Instant::now();
+            let optimizer_steps_before = optimizer.step;
             let losses = racing_rl::trainer::update(
                 &mut network,
                 &mut optimizer,
@@ -433,11 +596,33 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
                 device,
             )?;
             backend::sync::<B>(device)?;
-            if save_heavy {
-                let index = persistence.losses_index(next_completed);
-                persistence::save(&dir.join(format!("losses-{index:06}.ron")), &losses)?;
+            let log_std = read(network.log_std.clone())?;
+            ensure(log_std.len() == 2, "telemetry log_std shape")?;
+            let update = telemetry::UpdateTelemetry::from_metrics(
+                &losses,
+                c,
+                optimizer_steps_before,
+                optimizer.step,
+                [log_std[0], log_std[1]],
+            )?;
+            if let Some(writer) = &mut update_metrics {
+                update.write_row(next_completed, writer)?;
+                writer.flush()?;
             }
-            writeln!(log, "update_seconds={}", start.elapsed().as_secs_f64())?;
+            writeln!(log, "update_telemetry={update:?}")?;
+            let update_seconds = start.elapsed().as_secs_f64();
+            writeln!(log, "update_seconds={update_seconds}")?;
+            print!(
+                "{}",
+                console::training_rollout(
+                    next_completed,
+                    c.total_rollouts,
+                    &r,
+                    &update,
+                    update_seconds
+                )
+            );
+            last_losses = Some(losses);
         } else {
             // Reevaluate the SAME collected u; loss forward works without derivative hooks.
             let loss = preview_loss(&network, &r, c, device)?;
@@ -450,7 +635,10 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
             completed += 1;
         }
         rngs.environments = envs.iter().map(|e| e.rng.clone()).collect();
+        budget.observe_rollout(rollout_start.elapsed().as_secs_f64());
+        latest_evaluated = false;
         if save_heavy {
+            let save_start = Instant::now();
             let saved = checkpoint(
                 &network,
                 &optimizer,
@@ -464,13 +652,60 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
                     physical_ticks: ticks,
                 },
             )?;
-            persistence::save(&dir.join(format!("checkpoint-{completed:06}.ron")), &saved)?;
-            persistence::save(&dir.join(format!("rollout-{completed:06}.ron")), &r)?;
+            let checkpoint_path = dir.join(format!("checkpoint-{completed:06}.ron"));
+            persistence::save(&checkpoint_path, &saved)?;
+            if let Some(losses) = &last_losses {
+                let index = persistence.losses_index(completed);
+                persistence::save(&dir.join(format!("losses-{index:06}.ron")), losses)?;
+            }
+            if let Some(writer) = &mut index {
+                writeln!(
+                    writer,
+                    "periodic,{completed},{},{}",
+                    optimizer.step,
+                    evaluation::csv_string(
+                        &std::fs::canonicalize(&checkpoint_path)?.to_string_lossy()
+                    )
+                )?;
+                writer.flush()?;
+            }
+            if !persistence.no_save_rollouts {
+                persistence::save(&dir.join(format!("rollout-{completed:06}.ron")), &r)?;
+            }
+            let seconds = save_start.elapsed().as_secs_f64();
+            budget.observe_persistence(seconds);
+            writeln!(
+                log,
+                "rollout={completed} persistence_wall_seconds={seconds}"
+            )?;
+            if evaluation_due && budget.can_start(budget.evaluation_bound) {
+                let start = Instant::now();
+                let score = evaluation::periodic(
+                    &saved,
+                    &checkpoint_path,
+                    &persistence.experiment,
+                    evaluations.as_mut().expect("opt-in evaluation writer"),
+                )?;
+                if best.as_ref().is_none_or(|old| score.better_than(old)) {
+                    best = Some(score);
+                }
+                latest_evaluated = true;
+                budget.observe_evaluation(start.elapsed().as_secs_f64());
+                // Includes CPU restore and scene setup; never enters collect/update timers.
+                writeln!(
+                    log,
+                    "rollout={completed} evaluation_wall_seconds={:.6}",
+                    start.elapsed().as_secs_f64()
+                )?;
+            }
+            if bounded && evaluation_due && !latest_evaluated {
+                stop_after_rollout = true;
+            }
         }
         let counts = counts(&r);
         writeln!(
             metrics,
-            "{completed},{},{},{},0,{},{},{},{},{},{},{}",
+            "{completed},{},{},{},0,{},{},{},{},{},{},{},{},{},{},{},{},{}",
             network.version(),
             decisions,
             ticks,
@@ -483,10 +718,155 @@ fn execute<B: Backend>(c: &Config, job: Job, device: &B::Device, label: &str) ->
             counts[2],
             r.timings.total_seconds,
             r.transitions.len() as f64 / r.timings.total_seconds,
-            if train { "available" } else { "PENDENTE" }
+            if train { "available" } else { "PENDENTE" },
+            collisions.physical_ticks,
+            collisions.translation,
+            collisions.rotation,
+            collisions.rotation_only,
+            r.transitions.iter().map(|s| s.progress as f64).sum::<f64>()
+                / r.transitions.len() as f64,
+            r.transitions.iter().map(|s| s.progress).fold(0., f32::max)
         )?;
         metrics.flush()?;
+        track_metrics.flush()?;
         log.flush()?;
+        if bounded {
+            let best_description = best.as_ref().map_or_else(
+                || "not_evaluated".into(),
+                |b| {
+                    format!(
+                        "{} completed_training_tracks={} rollout={} adam_step={}",
+                        b.path.display(),
+                        b.completed,
+                        b.rollout,
+                        b.adam_step
+                    )
+                },
+            );
+            let status = format!(
+                "source_checkpoint={} current_rollout={completed} rollout_cap={} session_elapsed_seconds={:.3} remaining_time_budget_seconds={:.3} best_checkpoint={best_description}",
+                source_path.as_ref().unwrap().display(),
+                c.total_rollouts,
+                persistence.session_elapsed_seconds + session_budget::Clock::seconds(&budget.clock),
+                budget.remaining()
+            );
+            writeln!(log, "{status}")?;
+            println!("{status}");
+            log.flush()?;
+        }
+        if stop_after_rollout && completed < c.total_rollouts as u64 {
+            stop_reason = "wall_time_budget";
+            break;
+        }
+    }
+    if bounded {
+        // Mandatory final snapshot at a complete rollout boundary, including an
+        // off-interval budget stop (or initialization that exhausted the budget).
+        if !source_ready && completed < c.total_rollouts as u64 {
+            stop_reason = "wall_time_budget";
+        }
+        let final_path = dir.join(format!("checkpoint-{completed:06}.ron"));
+        if !final_path.exists() {
+            let start = Instant::now();
+            let saved = checkpoint(
+                &network,
+                &optimizer,
+                SaveContext {
+                    config: c,
+                    physics: &p,
+                    rngs: &rngs,
+                    backend: label,
+                    completed_rollouts: completed,
+                    decisions,
+                    physical_ticks: ticks,
+                },
+            )?;
+            persistence::save(&final_path, &saved)?;
+            if let Some(losses) = &last_losses {
+                persistence::save(&dir.join(format!("losses-{completed:06}.ron")), losses)?;
+            }
+            writeln!(
+                log,
+                "final_persistence_wall_seconds={:.6}",
+                start.elapsed().as_secs_f64()
+            )?;
+            let path = std::fs::canonicalize(&final_path)?;
+            let writer = index.as_mut().unwrap();
+            writeln!(
+                writer,
+                "final,{completed},{},{}",
+                optimizer.step,
+                evaluation::csv_string(&path.to_string_lossy())
+            )?;
+            writer.flush()?;
+        }
+        // Saving takes priority. Do not evaluate an off-interval final snapshot
+        // unless the conservative suite bound AND a save reserve still fit.
+        if source_ready
+            && completed > source_rollout
+            && !latest_evaluated
+            && budget.can_start(budget.evaluation_bound)
+        {
+            let saved: Checkpoint = persistence::load(&final_path)?;
+            let start = Instant::now();
+            let score = evaluation::periodic(
+                &saved,
+                &final_path,
+                &persistence.experiment,
+                evaluations.as_mut().unwrap(),
+            )?;
+            if best.as_ref().is_none_or(|old| score.better_than(old)) {
+                best = Some(score);
+            }
+            latest_evaluated = true;
+            writeln!(
+                log,
+                "final_evaluation_wall_seconds={:.6}",
+                start.elapsed().as_secs_f64()
+            )?;
+        }
+        let mut state = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(dir.join("continuation_state.csv"))?;
+        writeln!(
+            state,
+            "source_checkpoint,best_checkpoint,latest_checkpoint,source_rollout,latest_rollout,adam_step,latest_evaluated,stop_reason,environment_semantics"
+        )?;
+        writeln!(
+            state,
+            "{},{},{},{source_rollout},{completed},{},{latest_evaluated},{stop_reason},{}",
+            evaluation::csv_string(&source_path.as_ref().unwrap().to_string_lossy()),
+            evaluation::csv_string(
+                &best
+                    .as_ref()
+                    .map_or_else(String::new, |s| s.path.to_string_lossy().into_owned())
+            ),
+            evaluation::csv_string(&std::fs::canonicalize(&final_path)?.to_string_lossy()),
+            optimizer.step,
+            session_budget::ENVIRONMENT_SEMANTICS
+        )?;
+        state.flush()?;
+        state.sync_all()?;
+        writeln!(
+            log,
+            "stop_reason={stop_reason} latest_evaluated={latest_evaluated} latest_checkpoint={}",
+            final_path.display()
+        )?;
+        if let Some(writer) = &mut evaluations {
+            writer.flush()?;
+        }
+        if let Some(writer) = &mut update_metrics {
+            writer.flush()?;
+        }
+        track_metrics.flush()?;
+        metrics.flush()?;
+        log.flush()?;
+        log.sync_all()?;
+        println!(
+            "stop_reason={stop_reason} latest_checkpoint={}",
+            final_path.display()
+        );
     }
     println!("run={}", dir.display());
     Ok(())
@@ -581,88 +961,6 @@ fn summary(r: &Rollout) -> String {
         r.transitions.len() as f64 / r.timings.total_seconds,
         r.timings
     )
-}
-#[derive(Serialize, Debug)]
-struct EvaluationEpisode {
-    track: String,
-    seed: u64,
-    reward: f64,
-    completed: bool,
-    collision: bool,
-    timeout: bool,
-    progress: f32,
-    decisions: u64,
-    physical_ticks: u64,
-    seconds: f64,
-    trained: bool,
-}
-fn evaluate<B: Backend>(
-    saved: Checkpoint,
-    episodes: usize,
-    device: &B::Device,
-    label: &str,
-) -> Result<()> {
-    let (n, _, p) = restore::<B>(&saved, device)?;
-    let c = &saved.config;
-    let library = library()?;
-    let scenes = env::scenes(&library, &c.evaluation_tracks, true)?;
-    let mut results = vec![];
-    for scene in scenes {
-        for i in 0..episodes {
-            let seed = c.evaluation_seed.wrapping_add(i as u64);
-            let mut e = RacingEnvironment::new(
-                0,
-                vec![scene.clone()],
-                c,
-                &p,
-                ChaCha12Rng::seed_from_u64(seed),
-            )?;
-            let mut reward = 0.;
-            let mut decisions = 0;
-            let mut ticks = 0;
-            let start = Instant::now();
-            let final_step = loop {
-                let x = matrix(&e.observe()?, 1, c.observation.dimension(), device)?;
-                let action = read(n.infer(x)?.mean.tanh())?;
-                let s = e.step([action[0], action[1]])?;
-                reward += s.reward.total() as f64;
-                decisions += 1;
-                ticks += s.physical_ticks;
-                if s.terminated || s.truncated {
-                    break s;
-                }
-            };
-            let result = EvaluationEpisode {
-                track: scene.track.definition.id.clone(),
-                seed,
-                reward,
-                completed: final_step.reason == Some(EndReason::Completed),
-                collision: final_step.reason == Some(EndReason::Collision),
-                timeout: final_step.truncated,
-                progress: final_step.progress,
-                decisions,
-                physical_ticks: ticks,
-                seconds: start.elapsed().as_secs_f64(),
-                trained: saved.trained,
-            };
-            println!("{result:?}");
-            results.push(result);
-        }
-    }
-    let dir = persistence::run_directory(Path::new(&c.results_root))?;
-    manifest(&dir, c, &p, label, &library)?;
-    persistence::save(&dir.join("evaluation.ron"), &results)?;
-    println!(
-        "evaluation={} episodes={} label={}",
-        dir.display(),
-        results.len(),
-        if saved.trained {
-            "updated policy (no convergence claim)"
-        } else {
-            "UNTRAINED random initialization"
-        }
-    );
-    Ok(())
 }
 #[derive(Serialize, Debug)]
 struct BenchmarkRow {

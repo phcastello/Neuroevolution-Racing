@@ -1,0 +1,9 @@
+track,source_checkpoint,architecture,checkpoint_generation,stored_champion_training_fitness,stored_champion_validation_score,race_status,finish_time,final_best_normalized_progress,useful_progress_speed,final_elapsed_time
+"monaco","results\6_16_16_2\bests_by_gen\generation_000999_1788170581.ron","6 -> 16 -> 16 -> 2",999,1.72898829,1.72338581,COMPLETED,69.91712189,1.00000000,259.10452271,69.91712189
+"monaco","results\6_16_2\bests_by_gen\generation_000999_1788168326.ron","6 -> 16 -> 2",999,1.73070395,1.71885276,COLLISION,,0.06751499,197.80361938,6.18335915
+"monaco","results\6_16_32_2\bests_by_gen\generation_000999_1788173889.ron","6 -> 16 -> 32 -> 2",999,1.72879410,0.52892405,COMPLETED,69.85044098,1.00000000,259.35186768,69.85044098
+"monaco","results\6_32_16_2\bests_by_gen\generation_000999_1788170847.ron","6 -> 32 -> 16 -> 2",999,1.73408949,1.71906853,COLLISION,,0.00539885,87.58631134,1.11666632
+"monaco","results\6_32_2\bests_by_gen\generation_000999_1788170256.ron","6 -> 32 -> 2",999,1.72998106,1.72342706,COMPLETED,69.88378143,1.00000000,259.22811890,69.88378143
+"monaco","results\6_32_32_2\bests_by_gen\generation_000999_1788175783.ron","6 -> 32 -> 32 -> 2",999,1.72727489,1.72268176,COMPLETED,70.75063324,1.00000000,256.05200195,70.75063324
+"monaco","results\6_8_2\bests_by_gen\generation_000999_1788166800.ron","6 -> 8 -> 2",999,1.73312104,1.72256112,COLLISION,,0.35220620,243.37828064,26.21643829
+"monaco","results\6_8_8_2\bests_by_gen\generation_000999_1788168247.ron","6 -> 8 -> 8 -> 2",999,1.72870493,0.24108206,COLLISION,,0.07083967,200.51789856,6.40002871

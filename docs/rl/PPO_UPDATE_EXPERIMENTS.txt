@@ -1,0 +1,103 @@
+Experimento controlado de eficacia das atualizacoes PPO
+
+EXECUCAO (PowerShell, na raiz do repositorio)
+
+    .\scripts\run_ppo_update_experiments.ps1
+
+O script compila uma vez em release com rl-gpu e executa A, B e C sequencialmente.
+Ele usa Gpu(adapter: 0), que deve corresponder a RX 6700 XT na maquina local.
+O backend informa o adaptador utilizado; uma falha de build/execucao interrompe a
+sequencia. Nao existe fallback silencioso para CPU. O script nao foi executado
+durante a preparacao deste experimento.
+
+Presets independentes, todos com 1.000 rollouts e inicializacao do zero:
+
+    A  configs/rl/ppo_update_a_control.ron       LR=0.0003, entropia=0
+    B  configs/rl/ppo_update_b_lr.ron            LR=0.0001, entropia=0
+    C  configs/rl/ppo_update_c_lr_entropy.ron    LR=0.0001, entropia=0.001
+
+Resultados:
+
+    results_ppo/update_ablation/A_control/ppo-<execucao>/
+    results_ppo/update_ablation/B_lr/ppo-<execucao>/
+    results_ppo/update_ablation/C_lr_entropy/ppo-<execucao>/
+
+Cada execucao cria um subdiretorio unico. Nenhum resultado anterior e apagado.
+Todos preservam gamma=0.99, lambda=0.95, seeds 11/22/33/44/55, sensores, recompensa,
+fisica, Adam e rede 25 -> 256 -> 256 -> 256 -> 256 -> Actor/Critic (204.805
+parametros). O ambiente e o da revisao atual, com as correcoes PPO/GA.
+
+O comando efetivo de cada preset, apos compilar, tem este formato:
+
+    .\target\release\neuroevolution-racing.exe rl train --config configs/rl/ppo_update_a_control.ron --save-every 100 --save-first 0 --save-last 0 --no-save-rollouts
+
+Nao adicionar --resume. Os tres experimentos devem comecar com pesos, estado Adam,
+RNGs e contadores iniciais iguais. Conforme as politicas divergem, a sequencia de
+episodios e o consumo das RNGs ambientais podem divergir mesmo com seeds iguais.
+
+PERSISTENCIA E TELEMETRIA
+
+metrics.csv, update_metrics.csv, track_metrics.csv e run.log ficam completos para
+os 1.000 rollouts. Checkpoints sao salvos em 100, 200, ..., 1.000, incluindo o
+final. Os losses detalhados seguem o mesmo intervalo de persistencia pesada.
+--no-save-rollouts evita os grandes dumps rollout-*.ron; coleta, GAE, minibatches e
+updates continuam sendo executados normalmente. O checkpoint continua completo
+para retomar/avaliar/visualizar a politica, independentemente desses dumps.
+
+COMPARACAO OBJETIVA
+
+1. Compare A/B para isolar LR e B/C para isolar o bonus de entropia latente.
+   Compare nos mesmos indices de rollout e nos mesmos intervalos (1-100, 101-200,
+   ..., 901-1.000), mantendo tambem a curva por rollout. Cada braco coleta
+   8.192.000 decisoes: 1.000 x 32 x 256. O teto Adam e 64.000 passos por braco.
+
+2. Em update_metrics.csv, some os updates realmente executados e divida por
+   64.000 para obter a utilizacao do orcamento. Reporte media, mediana e percentis
+   p10/p25/p75/p90 por rollout, fracao com 64 updates e fracao com apenas 0-3.
+   Confira a soma com optimizer.step do checkpoint final (inicializacao do zero).
+
+3. Reporte fracao de early stops por epoca (1-4) e minibatch (1-16). Mostre
+   separadamente stops na primeira epoca, apos apenas 0-3 updates, na quarta
+   epoca e ausencia de stop. O minibatch que detecta KL excessiva e rejeitado;
+   ele nao conta como um update Adam.
+
+4. Compare kl_initial, kl_after_first_update, kl_mean, kl_max, kl_last e as
+   clip_fraction iniciais, finais e agregadas dos minibatches de cada rollout.
+   KL inicial proximo de zero e esperado antes do primeiro update.
+   O valor final pode pertencer ao minibatch rejeitado pelo early stopping.
+   Reduzir early stops sem melhorar desempenho por pista nao comprova sucesso.
+
+5. Compare gradient_norm_mean, gradient_norm_max e gradient_clipped_fraction.
+   Percentis dessas colunas descrevem resumos por rollout, nao a distribuicao de
+   todas as normas dos minibatches. Os losses detalhados a cada 100 rollouts
+   permitem inspecionar uma amostra. A norma nao separa Actor/Critic/tronco. Clipping
+   frequente isoladamente nao prova updates Adam pequenos nem causa estagnacao.
+
+6. Compare log_std e exp(log_std) para direcao e aceleracao. Esses desvios sao da
+   Normal latente, antes de tanh: saturacao das medias pode comprimir a variancia
+   efetiva das acoes mesmo com log_std razoavel. O bonus configurado e da
+   entropia latente existente, sem alterar a avaliacao deterministica.
+
+7. Em track_metrics.csv, compare por pista recompensa por decisao, progresso,
+   episodios completos, colisoes e timeouts. Use taxas por episodio encerrado
+   para desfechos e por tick/decisao para eventos; sempre mostre denominadores.
+   Episodios podem atravessar rollouts: medias dos episodios encerrados no
+   intervalo nao equivalem a medias de todos os carros naquele instante.
+
+8. Priorize voltas completas, progresso e colisoes na avaliacao deterministica,
+   usando os mesmos checkpoints (100/200/.../1.000), numero de episodios, seeds
+   e pistas reservadas em A/B/C. A avaliacao continua usando tanh(mu), sem ruido
+   de exploracao e sem mudar os arquivos dos checkpoints. Exemplo:
+
+    .\target\release\neuroevolution-racing.exe rl evaluate --checkpoint results_ppo/update_ablation/A_control/ppo-<execucao>/checkpoint-001000.ron --episodes 4 --cpu
+
+   Substitua o caminho pelo run efetivo e repita em B/C. A seed de avaliacao e
+   preservada (55). Pode omitir --cpu para usar a GPU do checkpoint; mantenha o
+   mesmo backend nas comparacoes para reduzir diferencas numericas. Os relatorios
+   de avaliacao sao gravados em novos diretorios, sem sobrescrever os anteriores.
+
+Interpretacao: B melhora a estabilidade se ampliar updates/rollout e reduzir stops
+precoces sem perder desempenho deterministico. C sustenta exploracao se preservar
+sigma sem degradar esse desempenho. Melhor utilizacao Adam e maior entropia sao
+diagnosticos, nao o objetivo de corrida. Este experimento usa uma seed por braco;
+ele investiga mecanismos e nao estima significancia estatistica entre seeds.

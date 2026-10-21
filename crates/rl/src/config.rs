@@ -19,7 +19,16 @@ pub struct ObservationSpec {
     pub kind: ObservationKind,
     pub sensor_range: f32,
     pub speed_scale: f32,
+    /// Missing in historical presets/checkpoints: retain the original signed clamp.
+    #[serde(default)]
+    pub speed_normalization: SpeedNormalization,
     pub angular_speed_scale: f32,
+}
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SpeedNormalization {
+    #[default]
+    LinearClamp,
+    SignedAsymptotic,
 }
 impl Default for ObservationSpec {
     fn default() -> Self {
@@ -30,6 +39,7 @@ impl Default for ObservationSpec {
             },
             sensor_range: 1000.0,
             speed_scale: 250.0,
+            speed_normalization: SpeedNormalization::LinearClamp,
             angular_speed_scale: 2.15,
         }
     }
@@ -68,6 +78,8 @@ impl ObservationSpec {
             unit: "world unit/s".into(),
             normalization: if matches!(self.kind, ObservationKind::Legacy6) {
                 format!("abs(v)/(abs(v)+{})", self.speed_scale)
+            } else if self.speed_normalization == SpeedNormalization::SignedAsymptotic {
+                format!("v/({}+abs(v))", self.speed_scale)
             } else {
                 format!("clamp(v/{},-1,1)", self.speed_scale)
             },
@@ -93,6 +105,11 @@ impl ObservationSpec {
     pub fn validate(&self) -> Result<()> {
         ensure(self.version == 1, "observation version")?;
         ensure(
+            !matches!(self.kind, ObservationKind::Legacy6)
+                || self.speed_normalization == SpeedNormalization::LinearClamp,
+            "signed speed normalization requires Extended observations",
+        )?;
+        ensure(
             [
                 self.sensor_range,
                 self.speed_scale,
@@ -111,9 +128,28 @@ impl ObservationSpec {
         )
     }
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub enum RewardMode {
+    #[default]
+    Baseline,
+    GaInspired {
+        /// Extra reward per normalized lap, gated by useful forward speed.
+        speed_weight: f32,
+        /// Useful progress speed in world units/s where the speed factor is 0.5.
+        progress_speed_half_saturation: f32,
+    },
+}
+impl RewardMode {
+    fn is_baseline(&self) -> bool {
+        matches!(self, Self::Baseline)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct RewardConfig {
     pub version: u32,
+    /// Omitted by legacy presets/checkpoints; their reward remains exactly Baseline.
+    #[serde(default, skip_serializing_if = "RewardMode::is_baseline")]
+    pub mode: RewardMode,
     pub progress_weight: f32,
     pub completion_bonus: f32,
     pub collision_penalty: f32,
@@ -122,6 +158,7 @@ impl Default for RewardConfig {
     fn default() -> Self {
         Self {
             version: 1,
+            mode: RewardMode::Baseline,
             progress_weight: 0.01,
             completion_bonus: 10.,
             collision_penalty: 1.,
@@ -313,6 +350,21 @@ impl Config {
                 && self.reward.version == 1,
             "loss/reward coefficients",
         )?;
+        if let RewardMode::GaInspired {
+            speed_weight,
+            progress_speed_half_saturation,
+        } = self.reward.mode
+        {
+            ensure(
+                speed_weight.is_finite()
+                    && speed_weight >= 0.
+                    && progress_speed_half_saturation.is_finite()
+                    && progress_speed_half_saturation > 0.
+                    && (self.reward.progress_weight + speed_weight + self.reward.completion_bonus)
+                        .is_finite(),
+                "GA-inspired reward coefficients",
+            )?;
+        }
         let [lo, hi] = self.log_std_bounds;
         ensure(
             lo.is_finite()

@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "source_checkpoint": "results_ppo/e_continuation_8h/preparation-20261020-213616-03c6f203be304b5ab77955ae1b4c01e0/preserved/E200/checkpoint-000200.ron",
+  "original_checkpoint": "results_ppo/speed_horizon_ablation/E_speed_horizon/ppo-1792524131440514300-32024/checkpoint-000200.ron",
+  "sha256": "9D51C0F38D931A7E9C41021AB41327A38924E817942817AD556C716E54CFC05C",
+  "source_rollout": 200,
+  "source_adam_step": 12781,
+  "environment_semantics": "rl-progress-connected-adjacent-v2",
+  "preparation_manifest": "results_ppo/e_continuation_8h/preparation-20261020-213616-03c6f203be304b5ab77955ae1b4c01e0/preparation_manifest.json",
+  "supervisor_assembly": "results_ppo/e_continuation_8h/preparation-20261020-213616-03c6f203be304b5ab77955ae1b4c01e0/ppo_session_job.dll",
+  "supervisor_assembly_sha256": "94DF1BE90C42C152FB9CF9839EE1C0C8ECF8A9D5748C6E5D0AEAD25C36BCB8D5",
+  "supervisor_source_sha256": "8DBEC53B455B55154AF4BCCC3E976135C7CA2ABEF89ED8A2C7F2696363228610",
+  "environment_source_sha256": "AE27F46F31C1EB3B875629C7EA3F2E81A0978FBAFDCE337A3EFABAEF4FD5C859"
+}

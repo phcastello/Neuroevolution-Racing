@@ -1,0 +1,167 @@
+PPO E CONTINUATION - PREPARED, NOT STARTED
+
+Run from the repository root, using Windows PowerShell 5.1:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_ppo_e_continuation_8h.ps1
+
+The command above STARTS the real session. Preparation did not execute it.
+No commit or push was performed.
+
+DIAGNOSIS AND SOURCE
+
+Only E200/Interlagos, E400/Interlagos and E200/Silverstone were traced under
+the historical implementation. All three reproduced the historical progress
+values exactly, ending after 10,800 deterministic CPU decisions. CSV traces
+contain every decision: position, signed speed, actions, local/global projection,
+segment, signed accumulated progress, best progress, remaining distance, movement,
+projection delta, rejected flag and terminal condition.
+
+The policies continued moving forward around the track, without reverse motion.
+Local and global projections agreed. On sharp corners, nearest-point projection
+switched between immediate adjacent polyline segments. Its arclength jumped
+farther than the physical displacement, triggering the old generic discontinuity
+guard and erasing accumulated progress on every lap.
+
+Example: E400/Interlagos, decision 1969, segments 323 -> 324:
+  movement=2.3573954; projected delta=15.454102; accumulated progress=9828.138 -> 0.
+
+The RL-only correction recognizes connected immediate-neighbor transitions,
+including the track seam. A stored physical position rejects relocation. Signed
+progress, reverse debt and the high-water reward prevent oscillation farming.
+Non-adjacent projection jumps retain the existing discontinuity guard. The full
+lap criterion, start reference, track geometry, GA, shared physics, observation
+semantics, reward formula and reward coefficients were not changed.
+
+Environment implementation identifier: rl-progress-connected-adjacent-v2
+
+Only E200/E400/E500 were then rescored, once each on the same five training tracks,
+with the corrected implementation, deterministic CPU actions and evaluation_seed=55:
+
+  checkpoint   completed training tracks   equal-weight mean progress
+  E200         4 / 5                       0.978195106
+  E400         4 / 5                       0.827728646
+  E500         2 / 5                       0.676143980
+
+E200 is the selected source. Historical scores were not mixed into this ranking.
+Its original run is:
+  results_ppo/speed_horizon_ablation/E_speed_horizon/ppo-1792524131440514300-32024
+Original checkpoint: checkpoint-000200.ron
+Source rollout: 200; Adam step: 12781.
+SHA-256: 9D51C0F38D931A7E9C41021AB41327A38924E817942817AD556C716E54CFC05C
+
+The exact preserved source and preparation manifest are recorded in:
+  configs/rl/ppo_e_continue_8h_source.json
+The preparation directory contains byte-identical copies of E200, E400 and E500,
+preservation_manifest.json, preparation_manifest.json, the three trace CSVs and
+diagnostic/corrected_candidate_evaluations.csv. Originals were not overwritten.
+
+CONFIGURATION AND TRUE RESUME
+
+  configs/rl/ppo_e_continue_8h.ron
+
+The preset differs from E only in total_rollouts=4000 and the output root.
+The cap is accumulated: from E200, at most 3800 NEW rollouts (201..4000).
+It is a new branch; old E rollouts 201..500 are not appended to its metrics.
+All 204,805 parameters, 25 signed continuous observations, GPU adapter 0,
+architecture, Adam, gamma/lambda, learning rate, exploration and other PPO
+hyperparameters are preserved. No silent GPU-to-CPU training fallback exists.
+
+The existing restore path loads parameters, Adam moments/step, RNG states,
+policy version, decisions, ticks and rollout counters. Only total rollout cap,
+device selection (the existing contract) and output destination may differ.
+Observation or other learning configuration mismatches still fail validation.
+Environments restart once on resume. Evaluations do not reset live environments.
+
+TIME CONTRACT
+
+One Stopwatch/QPC origin starts at script entry, before manifest reads or setup.
+The small prepared .NET Framework supervisor DLL is verified against its SHA-256
+and auditable C# source. It is loaded without launching a bootstrap compiler.
+
+Cooperative cutoff: 27,000 seconds (7h30) from script entry. Build and setup
+time are deducted before launching the trainer, plus five seconds for process
+handoff. The Rust monotonic clock also includes config/GPU/scene initialization.
+Before each rollout and evaluation, the trainer checks conservative work margins:
+  rollout floor 60 s; five-track CPU evaluation floor 300 s; final save floor 60 s.
+  Observed durations can only increase each bound: max(previous, 3*duration+30).
+The trainer stops starting work when the next unit plus the final-save reserve
+does not fit. It saves a valid final checkpoint at a complete rollout boundary,
+even away from a multiple of 100. stop_reason is wall_time_budget or rollout_limit.
+A normal budget stop returns success. It does not try to finish 4000 afterwards.
+
+The last 30 minutes are reserved for finalization/reporting or unexpected delay.
+The outer Windows Job Object starts its worker suspended, assigns it before it
+runs, and owns all descendants, including build tools, trainer and report.
+A timer independent of the PowerShell wait loop terminates this job exceptionally
+at 28,790 seconds (7h59m50), leaving 10 seconds to record supervision.json before
+the eight-hour maximum. Closing the supervisor also closes/kills its owned job.
+No global process search, name-based termination, service or machine shutdown.
+The C# watchdog was exercised with a synthetic stuck parent/child tree while
+a separate synthetic job remained alive.
+
+PERSISTENCE, EVALUATION AND SELECTION
+
+Every accumulated multiple of 100: checkpoint, losses and one deterministic CPU
+attempt on each training track, with separate frozen networks/scenes/RNGs.
+The source is evaluated once before any new training, using the actual compiled
+runtime. That score participates in best selection. Ties keep the older rollout.
+No best-policy rollback occurs during learning. Every periodic checkpoint stays.
+Collection/update timings exclude persistence/evaluation timings.
+Full experience dumps are disabled with --no-save-rollouts.
+
+The final checkpoint is evaluated only if the conservative evaluation/save
+margin remains. Otherwise it is explicitly unevaluated and cannot displace the
+best measured checkpoint. The report distinguishes source, best and latest.
+
+The existing save routine serializes into a new temporary file, flushes/syncs it,
+then publishes by same-directory rename. Existing checkpoint names are refused.
+Only published checkpoints enter checkpoint_index.csv. A failed new write cannot
+replace an older checkpoint. Temporary files are never resume candidates.
+
+FUTURE SESSION OUTPUTS
+
+  results_ppo/e_continuation_8h/sessions/session-<timestamp>-<GUID>/
+    session_budget.json, source_manifest.json, source_checkpoint.ron
+    build_manifest.json, build.stdout.log, build.stderr.log
+    run-path.txt (exact receipt; no latest-directory lookup)
+    training.stdout.log, training.stderr.log
+    comparison.txt, comparison_manifest.json
+    worker_status.json, supervision.json (worker_error.json on error)
+
+  results_ppo/e_continuation_8h/runs/ppo-<timestamp>-<PID>/
+    complete metrics.csv, update_metrics.csv, track_metrics.csv
+    periodic_evaluations.csv (source + this branch's measured checkpoints)
+    run.log, manifest.ron, checkpoint_index.csv, continuation_state.csv
+    checkpoint-<accumulated rollout>.ron, losses-<accumulated rollout>.ron
+
+Reports include checkpoint paths, SHA-256, rollout, Adam step, evaluation state
+and individual track results. Session provenance identifies the correction,
+source/config/build/implementation hashes and selection manifest.
+
+RECOVERY INTO ANOTHER SESSION
+
+Use the exact latest_checkpoint from the completed comparison manifest, or a
+complete checkpoint_index.csv record after exceptional interruption. Never use
+a temporary file or choose a directory by date. The resume loader validates the
+entire checkpoint. A new session has its own complete eight-hour budget and
+preserves the previous branch:
+
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_ppo_e_continuation_8h.ps1 -ResumeCheckpoint "<exact intact checkpoint path>"
+
+The cap remains 4000 accumulated rollouts; a checkpoint already at 4000 does not
+authorize additional rollouts. The script preserves a new source copy and runs
+its fresh baseline evaluation under the verified implementation. An exhausted
+budget before training records a planned wall_time_budget stop without training.
+
+AUTOMATED VALIDATION (NO LONG TRAINING)
+
+  cargo test --release --locked -p neuroevolution-racing-app --bin neuroevolution-racing rl:: -- --test-threads=1
+  cargo test --release --locked -p neuroevolution-racing-app --bin neuroevolution-racing simulation::rl_environment:: -- --test-threads=1
+  cargo test --release --locked -p racing-rl --test infrastructure
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_ppo_e_continuation_8h.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test_ppo_speed_horizon.ps1
+
+The two historical-policy diagnostic tests are explicitly ignored by ordinary
+test runs. They were invoked separately during preparation; repeating them is
+not part of starting a continuation. Tiny CPU training fixtures exercise true
+resume and the injected budget clock; they do not train the E policy.
