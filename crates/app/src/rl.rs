@@ -196,7 +196,7 @@ enum Job {
     Benchmark,
     Evaluate(Box<Checkpoint>, evaluation::EvaluationOptions),
 }
-fn validate_resume(requested: &Config, saved: &Config) -> Result<()> {
+pub(crate) fn validate_resume(requested: &Config, saved: &Config) -> Result<()> {
     let mut compatible = requested.clone();
     compatible.device = saved.device.clone();
     compatible.total_rollouts = saved.total_rollouts;
@@ -614,6 +614,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                 tracks.entry(id).or_default().merge(&stats);
             }
         }
+        curriculum.observe_rollout(&tracks);
         for (id, stats) in &tracks {
             telemetry::write_track_row(next_completed, id, stats, &mut track_metrics)?;
         }
@@ -683,7 +684,15 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                 .as_ref()
                 .is_some_and(|options| options.due(completed))
         {
+            let terminal_preparation = completed >= c.total_rollouts as u64;
+            let search_before = curriculum.search_seconds;
             curriculum.activate(&network, c, &p, device, completed, &dir)?;
+            performance.record_search(curriculum.search_seconds - search_before);
+            writeln!(
+                log,
+                "curriculum_activation rollout={completed} terminal_preparation={terminal_preparation} selected={}",
+                curriculum.active.len()
+            )?;
             let scenes = curriculum.scenes(&original_scenes, c.curriculum.as_ref().unwrap())?;
             envs = env::environments(scenes, c, &p, &rngs.environments)?;
             // Environment reconstruction consumes only each environment's private stream.
@@ -954,6 +963,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             final_path.display()
         );
     }
+    performance.set_curriculum(&curriculum);
     performance.finish(stop_reason)?;
     println!("run={}", dir.display());
     Ok(())

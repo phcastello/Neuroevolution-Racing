@@ -27,7 +27,8 @@ case "${1:-help}" in
 help|--help|-h) usage ;;
 prerequisites)
     command -v cargo; cargo --version; rustc --version
-    command -v cc; command -v pkg-config
+    command -v cc; command -v pkg-config; command -v python3; command -v git
+    [[ ! -f /etc/os-release ]] || cat /etc/os-release
     uname -a; getconf _NPROCESSORS_ONLN; free -h; df -h .
     lscpu | sed -n '1,32p'
     ;;
@@ -44,13 +45,13 @@ smoke)
     output=${2:-"results_ppo/smoke-$(date -u +%Y%m%dT%H%M%S)-$$"}
     mkdir -p "$(dirname "$output")"
     mkdir "$output"
-    # Historical small smoke preset; only output path overridden in generated effective config.
+    # Historical small smoke preset, capped at one rollout in its own output directory.
     python3 - "$output" <<'PY'
 import json,pathlib,re,sys
 out=pathlib.Path(sys.argv[1]); text=pathlib.Path('configs/rl/smoke.ron').read_text()
 text=re.sub(r'device:\s*Gpu\(adapter:\s*\d+\)', 'device: Cpu',text)
 text=re.sub(r'total_rollouts:\s*\d+', 'total_rollouts: 1',text)
-text=re.sub(r'results_root:\s*"[^"]*"','results_root: '+json.dumps(str(out/'runs')),text)
+text=re.sub(r'results_root:\s*"[^"]*"',lambda _: 'results_root: '+json.dumps(str(out/'runs'),ensure_ascii=False),text)
 (out/'config.ron').write_text(text)
 PY
     "$bin_cpu" rl train --config "$output/config.ron" --save-every 100 --save-first 0 --save-last 0 --no-save-rollouts --run-path-file "$output/run-path.txt"

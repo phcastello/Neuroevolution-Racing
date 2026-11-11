@@ -1,6 +1,11 @@
 /target
 /results_ppo/
+/results/
 /checkpoints/
+.env
+.env.*
+!.env.example
+!.env.sample
 *.log
 gitdiff.txt
 .vscode/

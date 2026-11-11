@@ -100,7 +100,7 @@ impl SearchDashboard {
             }
             if let Some(archive) = &self.archive {
                 ui.collapsing("Parâmetros / orçamento", |ui| {
-                    ui.monospace(format!("Seed {} · {:?}\n{} formigas × {} iterações\nCandidatas {}/{} · passos {}/{}\nα={} β={} evaporação={} q0={}\nGeometria {:?} · {} setores\nEscalas {:?} · larguras {:?}",archive.state.seed,archive.config.strategy,archive.config.ants,archive.config.iterations,archive.state.candidates,archive.config.max_candidates,archive.state.evaluation_steps,archive.config.max_evaluation_steps,archive.config.alpha,archive.config.beta,archive.config.evaporation,archive.config.exploitation_probability,archive.config.generator.shape,archive.config.generator.sectors,archive.config.generator.radial_levels,archive.config.generator.widths));
+                    ui.monospace(format!("Seed {} · {:?}\n{} formigas × {} iterações\nCandidatas {}/{} · decisões debitadas {}/{}\nα={} β={} evaporação={} q0={}\nGeometria {:?} · {} setores\nEscalas {:?} · larguras {:?}",archive.state.seed,archive.config.strategy,archive.config.ants,archive.config.iterations,archive.state.candidates,archive.config.max_candidates,archive.state.evaluation_steps,archive.config.max_evaluation_steps,archive.config.alpha,archive.config.beta,archive.config.evaporation,archive.config.exploitation_probability,archive.config.generator.shape,archive.config.generator.sectors,archive.config.generator.radial_levels,archive.config.generator.widths));
                 });
             }
             ui.checkbox(&mut self.playing, "Reproduzir construção / evolução");
@@ -469,7 +469,7 @@ mod tests {
             ..Default::default()
         };
         let context = egui::Context::default();
-        let output = context.run_ui(
+        let mut output = context.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -480,6 +480,8 @@ mod tests {
             |ui| dashboard.show(ui.ctx(), &mut Shell::default()),
         );
         assert!(!output.shapes.is_empty());
+        // This software UI fixture has no renderer to consume font textures.
+        output.textures_delta.clear();
         assert_eq!(
             ron::to_string(dashboard.archive.as_ref().unwrap()).unwrap(),
             expected

@@ -57,6 +57,12 @@ pub enum ResearchCommand {
         /// Screening uses screening_rollouts; full uses rollouts. Finalists are manually selected.
         #[arg(long)]
         screening: bool,
+        /// Run Original/FrontDense observation cells only.
+        #[arg(long, conflicts_with = "curricula")]
+        observations: bool,
+        /// Run the four curriculum cells with original observations only.
+        #[arg(long, conflicts_with = "observations")]
+        curricula: bool,
         /// Continue selected cells from a prepared screening directory, restoring Adam/RNGs.
         #[arg(long)]
         continue_from: Option<PathBuf>,
@@ -80,6 +86,7 @@ pub struct MatrixConfig {
     pub base: PathBuf,
     pub rollouts: usize,
     pub screening_rollouts: usize,
+    pub observation_screening_rollouts: usize,
     pub seeds: Vec<u64>,
     pub repetitions: usize,
     pub max_parallel: usize,
@@ -96,7 +103,8 @@ impl Default for MatrixConfig {
         Self {
             base: "configs/rl/ppo_e_continue_8h.ron".into(),
             rollouts: 500,
-            screening_rollouts: 100,
+            screening_rollouts: 200,
+            observation_screening_rollouts: 100,
             seeds: vec![11],
             repetitions: 1,
             max_parallel: 1,
@@ -214,6 +222,15 @@ fn cells() -> Vec<(String, SensorLayout, bool, Option<CurriculumKind>)> {
     }
     out
 }
+fn protocol_cell(id: &str, observations: bool, curricula: bool) -> bool {
+    if observations {
+        id.ends_with("-original")
+    } else if curricula {
+        id.starts_with("original-rays-")
+    } else {
+        true
+    }
+}
 fn project_path(path: &Path) -> PathBuf {
     if path.is_absolute() || path.is_file() {
         path.to_owned()
@@ -228,6 +245,9 @@ fn base() -> Result<Config, String> {
         .map_err(|e| e.to_string())
 }
 fn new_output(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
     fs::create_dir(path).map_err(|e| format!("new output {}: {e}", path.display()))
 }
 fn save<T: Serialize>(p: &Path, value: &T) -> Result<(), String> {
@@ -300,6 +320,8 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
             dry_run,
             include,
             screening,
+            observations,
+            curricula,
             continue_from,
         } => {
             let m: MatrixConfig =
@@ -311,6 +333,8 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
                 || m.rollouts > 500
                 || m.screening_rollouts == 0
                 || m.screening_rollouts > m.rollouts
+                || m.observation_screening_rollouts == 0
+                || m.observation_screening_rollouts > m.rollouts
                 || !["cpu", "gpu"].contains(&m.backend.as_str())
             {
                 return Err("invalid matrix budgets/seeds/backend".into());
@@ -318,11 +342,19 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
             if screening && continue_from.is_some() {
                 return Err("continuation requires full phase".into());
             }
-            let budget = if screening {
+            let screening_budget = if observations {
+                m.observation_screening_rollouts
+            } else {
                 m.screening_rollouts
+            };
+            let budget = if screening {
+                screening_budget
             } else {
                 m.rollouts
             };
+            if screening && !observations && budget <= CurriculumConfig::default().warmup as usize {
+                return Err("curriculum screening must train after warmup (100); use at least 101, default 200".into());
+            }
             let policy = PlannedRun {
                 cell: String::new(),
                 seed: 0,
@@ -351,21 +383,30 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
             let chosen: Vec<_> = all
                 .into_iter()
                 .filter(|(id, ..)| {
-                    include.is_empty() || include.contains(id) || id == "original-rays-original"
+                    protocol_cell(id, observations, curricula)
+                        && (include.is_empty()
+                            || include.contains(id)
+                            || id == "original-rays-original")
                 })
                 .collect();
+            if chosen.is_empty() {
+                return Err("selected protocol has no cells".into());
+            }
             let total = chosen.len() * m.repetitions * m.seeds.len();
             if dry_run {
                 println!(
-                    "matrix: {total} runs, {} cells; paired seeds {:?}; parallel {}; rollouts {}; no training",
+                    "matrix: {total} runs, {} cells; protocol={}; paired seeds {:?}; parallel {}; rollouts {}; no training",
                     chosen.len(),
+                    if observations {
+                        "observations"
+                    } else if curricula {
+                        "curricula"
+                    } else {
+                        "full factorial"
+                    },
                     m.seeds,
                     m.max_parallel,
-                    if screening {
-                        m.screening_rollouts
-                    } else {
-                        m.rollouts
-                    }
+                    budget
                 );
                 return Ok(());
             }
@@ -393,11 +434,7 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
                         } else {
                             DeviceChoice::Gpu { adapter: 0 }
                         };
-                        c.total_rollouts = if screening {
-                            m.screening_rollouts
-                        } else {
-                            m.rollouts
-                        };
+                        c.total_rollouts = budget;
                         c.observation = c
                             .observation
                             .with_sensor_layout(layout)
@@ -420,8 +457,22 @@ pub fn run(command: ResearchCommand) -> Result<(), String> {
                                     .map_err(|e| {
                                         format!("missing screening receipt for {name}: {e}")
                                     })?;
-                            let p = PathBuf::from(receipt.trim())
-                                .join(format!("checkpoint-{:06}.ron", m.screening_rollouts));
+                            let previous_config =
+                                Config::load(&previous.join(&name).join("config.ron"))
+                                    .map_err(|e| e.to_string())?;
+                            let p = PathBuf::from(receipt.trim()).join(format!(
+                                "checkpoint-{:06}.ron",
+                                previous_config.total_rollouts
+                            ));
+                            let saved: racing_rl::persistence::Checkpoint =
+                                persistence::load(&p).map_err(|e| e.to_string())?;
+                            crate::rl::validate_resume(&c, &saved.config)
+                                .map_err(|e| e.to_string())?;
+                            if saved.completed_rollouts != previous_config.total_rollouts as u64
+                                || saved.completed_rollouts >= budget as u64
+                            {
+                                return Err("screening checkpoint is not a completed stage below the new cap".into());
+                            }
                             if !p.is_file() {
                                 return Err(format!(
                                     "missing screening checkpoint {}",
@@ -502,7 +553,14 @@ fn execute_plan(plan: &Plan) -> Result<(), String> {
         for run in batch {
             let mut cmd = Command::new(std::env::current_exe().map_err(|e| e.to_string())?);
             cmd.args(run.training_args());
-            let log = fs::File::create(run.config.parent().unwrap().join("launcher.log"))
+            let directory = run
+                .config
+                .parent()
+                .ok_or("planned config has no directory")?;
+            let log = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(directory.join("launcher.log"))
                 .map_err(|e| e.to_string())?;
             cmd.stdout(Stdio::from(log.try_clone().map_err(|e| e.to_string())?))
                 .stderr(Stdio::from(log));
@@ -523,7 +581,11 @@ fn execute_plan(plan: &Plan) -> Result<(), String> {
             let dir = fs::read_to_string(&run.receipt).map_err(|e| e.to_string())?;
             let checkpoint =
                 PathBuf::from(dir.trim()).join(format!("checkpoint-{:06}.ron", c.total_rollouts));
-            let log_path = run.config.parent().unwrap().join("validation.log");
+            let log_path = run
+                .config
+                .parent()
+                .ok_or("planned config has no directory")?
+                .join("validation.log");
             let log = fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -627,7 +689,7 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
     let mut json = vec![];
     let mut performance_rows = Vec::new();
     let mut summary_csv = String::from(
-        "run,status,backend,rollouts,transitions,total_seconds,rollout_mean_seconds,rollout_median_seconds,rollout_p90_seconds,rollout_p95_seconds,transitions_per_second,peak_resident_kib\n",
+        "run,configuration,seed,status,backend,rollouts,transitions,total_seconds,rollout_mean_seconds,rollout_median_seconds,rollout_p90_seconds,rollout_p95_seconds,transitions_per_second,peak_resident_kib\n",
     );
     let mut validation_csv = String::from(
         "run,track,episodes,completion_rate,progress_mean,progress_median,progress_p10,progress_p90,lap_seconds_mean\n",
@@ -660,6 +722,8 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
                         serde_json::from_str(&text).map_err(|e| e.to_string())?;
                     if name == "performance_summary.json" {
                         let fields = [
+                            value.pointer("/config/results_root"),
+                            value.pointer("/config/network_seed"),
                             value.get("status"),
                             value.get("backend"),
                             value.get("completed_rollouts_in_this_run"),
@@ -677,6 +741,7 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
                             summary_csv.push(',');
                             summary_csv.push_str(&quote(
                                 &field
+                                    .filter(|v| !v.is_null())
                                     .map(|v| {
                                         v.as_str()
                                             .map(str::to_owned)
@@ -705,6 +770,7 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
                                     validation_csv.push(',');
                                     validation_csv.push_str(&quote(
                                         &t.get(key)
+                                            .filter(|v| !v.is_null())
                                             .map(|v| {
                                                 v.as_str()
                                                     .map(str::to_owned)
@@ -753,8 +819,29 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
                 }
                 c
             };
-            if clean(base) == clean(row)
+            if !clean(base).is_null()
+                && clean(base) == clean(row)
+                && base
+                    .get("transitions")
+                    .and_then(|v| v.as_u64())
+                    .is_some_and(|n| n > 0)
                 && base.get("transitions") == row.get("transitions")
+                && base.get("completed_rollouts_in_this_run")
+                    == row.get("completed_rollouts_in_this_run")
+                && matches!(
+                    base.get("status").and_then(|v| v.as_str()),
+                    Some("completed" | "rollout_limit")
+                )
+                && base
+                    .get("completed_rollouts_in_this_run")
+                    .and_then(|v| v.as_u64())
+                    == base
+                        .pointer("/config/total_rollouts")
+                        .and_then(|v| v.as_u64())
+                && base
+                    .pointer("/config/total_rollouts")
+                    .and_then(|v| v.as_u64())
+                    .is_some()
                 && base.get("status") == row.get("status")
             {
                 if let (Some(a), Some(b)) = (
@@ -775,7 +862,7 @@ fn compare(runs: &[PathBuf], output: &Path) -> Result<(), String> {
     fs::write(output.join("comparison.csv"), csv).map_err(|e| e.to_string())?;
     fs::write(
         output.join("comparison.json"),
-        serde_json::to_string_pretty(&json).unwrap(),
+        serde_json::to_string_pretty(&json).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
     fs::write(output.join("report.md"), report).map_err(|e| e.to_string())?;
@@ -809,6 +896,24 @@ mod tests {
         }
     }
     #[test]
+    fn protocols_keep_four_controls_and_screening_exposes_curriculum() {
+        let all = cells();
+        let observations: Vec<_> = all
+            .iter()
+            .filter(|(id, ..)| protocol_cell(id, true, false))
+            .collect();
+        let curricula: Vec<_> = all
+            .iter()
+            .filter(|(id, ..)| protocol_cell(id, false, true))
+            .collect();
+        assert_eq!(observations.len(), 4);
+        assert_eq!(curricula.len(), 4);
+        assert!(curricula.iter().any(|(_, _, _, kind)| kind.is_none()));
+        assert!(MatrixConfig::default().screening_rollouts > 100);
+        assert_eq!(MatrixConfig::default().observation_screening_rollouts, 100);
+    }
+
+    #[test]
     fn hardware_preserves_science() {
         let a = base().unwrap();
         let mut b = a.clone();
@@ -819,6 +924,50 @@ mod tests {
         assert_eq!(a.reward, b.reward);
         assert_eq!(b.parameter_count(), 204805);
         assert_eq!(b.rollout_size(), 8192);
+        assert_eq!(b.hidden, [256, 256, 256, 256]);
+        assert_eq!(b.num_envs, 32);
+        assert_eq!(b.rollout_length, 256);
+        assert_eq!(b.minibatch_size, 512);
+        assert_eq!(b.update_epochs, 4);
+        assert_eq!(b.observation.angles(), SensorLayout::Original.angles());
+        assert!(b.observation.anticipation.is_none());
+        assert!(b.curriculum.is_none());
+    }
+    #[test]
+    fn speed_ratios_require_complete_compatible_science_and_missing_fields_stay_blank() {
+        let root =
+            persistence::run_directory(&std::env::temp_dir().join("research-speed-tests")).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        fs::create_dir(&a).unwrap();
+        fs::create_dir(&b).unwrap();
+        let row = serde_json::json!({"config":{"hidden":[4],"total_rollouts":1},
+            "completed_rollouts_in_this_run":1,"transitions":16,"status":"rollout_limit",
+            "total_seconds":1.0,"rollout_p95_seconds":null});
+        for directory in [&a, &b] {
+            fs::write(directory.join("performance_summary.json"), row.to_string()).unwrap();
+        }
+        compare(&[a.clone(), b.clone()], &root.join("compatible")).unwrap();
+        assert!(
+            fs::read_to_string(root.join("compatible/report.md"))
+                .unwrap()
+                .contains("Elapsed-time ratio")
+        );
+        assert!(
+            !fs::read_to_string(root.join("compatible/performance.csv"))
+                .unwrap()
+                .contains("null")
+        );
+        let mut changed = row;
+        changed["config"]["hidden"] = serde_json::json!([8]);
+        fs::write(b.join("performance_summary.json"), changed.to_string()).unwrap();
+        compare(&[a, b], &root.join("incompatible")).unwrap();
+        assert!(
+            !fs::read_to_string(root.join("incompatible/report.md"))
+                .unwrap()
+                .contains("Elapsed-time ratio")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn comparison_includes_validation_linked_to_training_run() {
@@ -914,6 +1063,8 @@ mod tests {
                 dry_run: false,
                 include: vec!["original-rays-original".into()],
                 screening: false,
+                observations: false,
+                curricula: false,
                 continue_from: None,
             })
         };
@@ -1014,6 +1165,8 @@ mod preparation_tests {
             dry_run: true,
             include: vec![],
             screening: false,
+            observations: false,
+            curricula: false,
             continue_from: None,
         })
         .unwrap();

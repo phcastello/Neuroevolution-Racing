@@ -317,6 +317,36 @@ pub(crate) fn policy_input(ui: &mut egui::Ui, shell: &mut Shell) {
 mod tests {
     use super::*;
     #[test]
+    fn mode_roundtrips_clear_old_cars_and_disable_training_without_display() {
+        let mut world = World::new();
+        world.insert_resource(Shell::default());
+        world.init_resource::<SearchDashboard>();
+        world.init_resource::<ExperimentDashboard>();
+        world.init_resource::<simulation::TrainingFastForward>();
+        world.init_resource::<Time<Virtual>>();
+        for mode in [
+            Mode::Aco,
+            Mode::Experiments,
+            Mode::Menu,
+            Mode::Aco,
+            Mode::Menu,
+        ] {
+            world.spawn(simulation::Car { id: 0 });
+            world.resource_mut::<Shell>().pending = Some(mode);
+            apply_navigation(&mut world);
+            assert_eq!(world.resource::<Shell>().mode, mode);
+            assert_eq!(world.query::<&simulation::Car>().iter(&world).count(), 0);
+            assert!(!ga_active(&world));
+            assert!(!playback_active(&world));
+            assert!(
+                world
+                    .resource::<simulation::TrainingFastForward>()
+                    .target_generation
+                    .is_none()
+            );
+        }
+    }
+    #[test]
     fn menu_does_not_run_ga_or_ppo_and_workers_keep_original_behavior() {
         let mut world = World::new();
         assert!(ga_active(&world));

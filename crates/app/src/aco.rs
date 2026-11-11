@@ -14,6 +14,12 @@ pub enum SearchStrategy {
     AntColony,
     RandomDifficulty,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FitnessObjective {
+    #[default]
+    LegacyAdversarial,
+    UsefulProgress,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AcoConfig {
@@ -34,6 +40,9 @@ pub struct AcoConfig {
     pub max_evaluation_steps_per_candidate: usize,
     pub max_evaluation_steps: u64,
     pub strategy: SearchStrategy,
+    #[serde(default)]
+    pub fitness_objective: FitnessObjective,
+    pub target_progress: f64,
     /// Identity of the frozen training policy; never a validation checkpoint score.
     pub policy_label: Option<String>,
 }
@@ -57,6 +66,8 @@ impl Default for AcoConfig {
             max_evaluation_steps_per_candidate: 6000,
             max_evaluation_steps: 144_000,
             strategy: SearchStrategy::AntColony,
+            fitness_objective: FitnessObjective::UsefulProgress,
+            target_progress: 0.7,
             policy_label: None,
         }
     }
@@ -92,6 +103,8 @@ impl AcoConfig {
             || self.stagnation_iterations == 0
             || self.max_evaluation_steps_per_candidate == 0
             || self.max_evaluation_steps == 0
+            || !self.target_progress.is_finite()
+            || !(0.01..1.).contains(&self.target_progress)
         {
             return Err("invalid ACO population/budget/probability/pheromone bounds".into());
         }
@@ -106,14 +119,32 @@ pub struct DecisionSnapshot {
     pub probabilities: Vec<f64>,
 }
 /// Aggregate of frozen policy episodes; the reference pilot is independent of PPO.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PilotEvaluation {
     pub completion_rate: f64,
     pub mean_progress: f64,
     pub collision_rate: f64,
     pub reference_completed: bool,
+    #[serde(default)]
+    pub reference_collision: bool,
     /// Total policy AND reference physical decisions; counts against one shared budget.
     pub simulation_steps: u64,
+    #[serde(default)]
+    pub reference_steps: u64,
+    #[serde(default)]
+    pub policy_steps: u64,
+    #[serde(default)]
+    pub inference_seconds: f64,
+    #[serde(default)]
+    pub simulation_seconds: f64,
+    #[serde(default)]
+    pub reference_progress: f64,
+    #[serde(default)]
+    pub reference_episodes: usize,
+    #[serde(default)]
+    pub policy_episodes: usize,
+    #[serde(default)]
+    pub budget_insufficient: bool,
 }
 impl PilotEvaluation {
     fn validate(&self) -> GenerationResult<()> {
@@ -124,6 +155,13 @@ impl PilotEvaluation {
         ]
         .iter()
         .any(|x| !x.is_finite() || !(0.0..=1.).contains(x))
+            || !self.simulation_seconds.is_finite()
+            || self.simulation_seconds < 0.
+            || !self.reference_progress.is_finite()
+            || !(0.0..=1.).contains(&self.reference_progress)
+            || !self.inference_seconds.is_finite()
+            || self.inference_seconds < 0.
+            || self.reference_steps.saturating_add(self.policy_steps) > self.simulation_steps
         {
             Err("invalid frozen-policy evaluation metrics".into())
         } else {
@@ -141,6 +179,37 @@ pub struct FitnessComponents {
     pub simulation_steps: u64,
     pub reference_completed: Option<bool>,
     pub score: f64,
+    /// Triangular learning challenge, maximal near the configured target progress.
+    #[serde(default)]
+    pub useful_difficulty: f64,
+    #[serde(default)]
+    pub episodes: usize,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RejectionReason {
+    InvalidGeometry,
+    SelfIntersection,
+    CurvatureLimit,
+    Duplicate,
+    InsufficientDiversity,
+    ReferenceCollision,
+    ReferenceTimeout,
+    InsufficientBudget,
+    ExecutionFailure,
+    NumericalError,
+}
+impl RejectionReason {
+    fn geometry(message: &str) -> Self {
+        if message.contains("intersect") {
+            Self::SelfIntersection
+        } else if message.contains("curvature") {
+            Self::CurvatureLimit
+        } else if message.contains("finite") {
+            Self::NumericalError
+        } else {
+            Self::InvalidGeometry
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AntSnapshot {
@@ -149,6 +218,10 @@ pub struct AntSnapshot {
     pub candidate: Option<GeneratedTrack>,
     pub rejection: Option<String>,
     pub fitness: Option<FitnessComponents>,
+    #[serde(default)]
+    pub rejection_reason: Option<RejectionReason>,
+    #[serde(default)]
+    pub evaluation: Option<PilotEvaluation>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IterationSnapshot {
@@ -169,6 +242,28 @@ pub struct IterationSnapshot {
     pub evaluation_seconds: f64,
     #[serde(default)]
     pub pheromone_update_seconds: f64,
+    #[serde(default)]
+    pub candidates_built: usize,
+    #[serde(default)]
+    pub candidates_geometrically_valid: usize,
+    #[serde(default)]
+    pub candidates_evaluated: usize,
+    #[serde(default)]
+    pub reference_decisions: u64,
+    #[serde(default)]
+    pub policy_decisions: u64,
+    #[serde(default)]
+    pub inference_seconds: f64,
+    #[serde(default)]
+    pub reference_completed: usize,
+    #[serde(default)]
+    pub simulation_seconds: f64,
+    #[serde(default)]
+    pub reference_collisions: usize,
+    #[serde(default)]
+    pub reference_timeouts: usize,
+    #[serde(default)]
+    pub evaluation_failures: usize,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RankedTrack {
@@ -275,6 +370,16 @@ impl SearchArchive {
         let mut ants = Vec::new();
         let mut generation_seconds = 0.;
         let mut evaluation_seconds = 0.;
+        let mut candidates_geometrically_valid = 0;
+        let mut candidates_evaluated = 0;
+        let mut reference_decisions = 0;
+        let mut policy_decisions = 0;
+        let mut inference_seconds = 0.;
+        let mut simulation_seconds = 0.;
+        let mut reference_completed = 0;
+        let mut reference_collisions = 0;
+        let mut reference_timeouts = 0;
+        let mut evaluation_failures = 0;
         let mut iteration_best: Option<(String, f64)> = None;
         for ant in 0..self.config.ants {
             if self.state.candidates >= self.config.max_candidates {
@@ -304,13 +409,20 @@ impl SearchArchive {
                 candidate: None,
                 rejection: None,
                 fitness: None,
+                rejection_reason: None,
+                evaluation: None,
             };
             match candidate {
-                Err(reason) => snapshot.rejection = Some(reason),
+                Err(reason) => {
+                    snapshot.rejection_reason = Some(RejectionReason::geometry(&reason));
+                    snapshot.rejection = Some(reason);
+                }
                 Ok(candidate) => {
+                    candidates_geometrically_valid += 1;
                     let hash = candidate.provenance.geometry_hash.clone();
                     if !self.state.seen_hashes.insert(hash.clone()) {
                         snapshot.rejection = Some("duplicate geometry hash".into());
+                        snapshot.rejection_reason = Some(RejectionReason::Duplicate);
                         snapshot.candidate = Some(candidate);
                         ants.push(snapshot);
                         continue;
@@ -318,6 +430,7 @@ impl SearchArchive {
                     let diversity = decision_diversity(&choices, &self.state.decision_archive);
                     if diversity < self.config.minimum_diversity {
                         snapshot.rejection = Some("near-duplicate decision signature".into());
+                        snapshot.rejection_reason = Some(RejectionReason::InsufficientDiversity);
                         snapshot.candidate = Some(candidate);
                         ants.push(snapshot);
                         continue;
@@ -331,12 +444,28 @@ impl SearchArchive {
                             .config
                             .max_evaluation_steps_per_candidate
                             .min(remaining_steps.min(usize::MAX as u64) as usize);
+                        if budget < 2 {
+                            snapshot.rejection =
+                                Some("insufficient budget for reference and policy".into());
+                            snapshot.rejection_reason = Some(RejectionReason::InsufficientBudget);
+                            snapshot.candidate = Some(candidate);
+                            ants.push(snapshot);
+                            continue;
+                        }
                         let evaluation_started = Instant::now();
                         let result = evaluator.evaluate(&candidate, seed, budget);
                         evaluation_seconds += evaluation_started.elapsed().as_secs_f64();
                         match result {
                             Ok(result) => {
-                                result.validate()?;
+                                if let Err(error) = result.validate() {
+                                    // Unknown consumed work is charged conservatively, never reused.
+                                    self.state.evaluation_steps += budget as u64;
+                                    snapshot.rejection = Some(error);
+                                    snapshot.rejection_reason =
+                                        Some(RejectionReason::NumericalError);
+                                    ants.push(snapshot);
+                                    continue;
+                                }
                                 if result.simulation_steps > budget as u64 {
                                     return Err(
                                         "candidate evaluator exceeded its explicit decision budget"
@@ -344,12 +473,44 @@ impl SearchArchive {
                                     );
                                 }
                                 self.state.evaluation_steps += result.simulation_steps;
-                                if !result.reference_completed {
-                                    snapshot.rejection = Some("reference controller did not complete: unverified drivability".into());
+                                candidates_evaluated += 1;
+                                reference_decisions += result.reference_steps;
+                                policy_decisions += result.policy_steps;
+                                inference_seconds += result.inference_seconds;
+                                simulation_seconds += result.simulation_seconds;
+                                if result.reference_completed {
+                                    reference_completed += 1;
+                                } else if result.reference_collision {
+                                    reference_collisions += 1;
+                                } else {
+                                    reference_timeouts += 1;
                                 }
+                                if !result.reference_completed {
+                                    snapshot.rejection_reason =
+                                        Some(if result.budget_insufficient {
+                                            RejectionReason::InsufficientBudget
+                                        } else if result.reference_collision {
+                                            RejectionReason::ReferenceCollision
+                                        } else {
+                                            RejectionReason::ReferenceTimeout
+                                        });
+                                    snapshot.rejection = Some(format!(
+                                        "reference did not verify drivability: {:?}",
+                                        snapshot.rejection_reason
+                                    ));
+                                }
+                                snapshot.evaluation = Some(result.clone());
                                 Some(result)
                             }
                             Err(error) => {
+                                evaluation_failures += 1;
+                                self.state.evaluation_steps += budget as u64;
+                                snapshot.rejection_reason =
+                                    Some(if error.contains("finite") || error.contains("NaN") {
+                                        RejectionReason::NumericalError
+                                    } else {
+                                        RejectionReason::ExecutionFailure
+                                    });
                                 snapshot.rejection = Some(format!("evaluation failed: {error}"));
                                 None
                             }
@@ -358,23 +519,47 @@ impl SearchArchive {
                         None
                     };
                     let score = if let Some(e) = &evaluation {
-                        0.4 * (1. - e.completion_rate)
-                            + 0.2 * (1. - e.mean_progress)
-                            + 0.1 * e.collision_rate
-                            + 0.1 * geometry
-                            + 0.2 * diversity
+                        match self.config.fitness_objective {
+                            FitnessObjective::UsefulProgress => {
+                                0.7 * useful_difficulty(
+                                    e.mean_progress,
+                                    self.config.target_progress,
+                                ) + 0.1 * geometry
+                                    + 0.2 * diversity
+                            }
+                            FitnessObjective::LegacyAdversarial => {
+                                0.4 * (1. - e.completion_rate)
+                                    + 0.2 * (1. - e.mean_progress)
+                                    + 0.1 * e.collision_rate
+                                    + 0.1 * geometry
+                                    + 0.2 * diversity
+                            }
+                        }
                     } else {
                         0.4 * geometry + 0.6 * diversity
                     };
                     let fitness = FitnessComponents {
-                        completion_rate: evaluation.as_ref().map(|e| e.completion_rate),
-                        mean_progress: evaluation.as_ref().map(|e| e.mean_progress),
-                        collision_rate: evaluation.as_ref().map(|e| e.collision_rate),
+                        completion_rate: evaluation
+                            .as_ref()
+                            .filter(|e| e.policy_episodes > 0)
+                            .map(|e| e.completion_rate),
+                        mean_progress: evaluation
+                            .as_ref()
+                            .filter(|e| e.policy_episodes > 0)
+                            .map(|e| e.mean_progress),
+                        collision_rate: evaluation
+                            .as_ref()
+                            .filter(|e| e.policy_episodes > 0)
+                            .map(|e| e.collision_rate),
                         geometric_difficulty: geometry,
                         diversity,
                         simulation_steps: evaluation.as_ref().map_or(0, |e| e.simulation_steps),
                         reference_completed: evaluation.as_ref().map(|e| e.reference_completed),
                         score,
+                        useful_difficulty: evaluation.as_ref().map_or(0., |e| {
+                            useful_difficulty(e.mean_progress, self.config.target_progress)
+                        }),
+                        episodes: evaluation.as_ref().map_or(0, |e| e.policy_episodes),
                     };
                     snapshot.fitness = Some(fitness.clone());
                     if snapshot.rejection.is_none() {
@@ -440,6 +625,7 @@ impl SearchArchive {
             .filter(|a| a.rejection.is_none())
             .filter_map(|a| a.fitness.as_ref())
             .collect();
+        let candidates_built = ants.len();
         let count = accepted.len().max(1) as f64;
         let snapshot = IterationSnapshot {
             iteration: self.state.iteration,
@@ -460,6 +646,17 @@ impl SearchArchive {
             generation_seconds,
             evaluation_seconds,
             pheromone_update_seconds: pheromone_update_started.elapsed().as_secs_f64(),
+            candidates_built,
+            candidates_geometrically_valid,
+            candidates_evaluated,
+            reference_decisions,
+            policy_decisions,
+            inference_seconds,
+            reference_completed,
+            simulation_seconds,
+            reference_collisions,
+            reference_timeouts,
+            evaluation_failures,
         };
         self.state.iteration += 1;
         self.iterations.push(snapshot);
@@ -609,6 +806,14 @@ impl SearchArchive {
         Ok(ids)
     }
 }
+fn useful_difficulty(progress: f64, target: f64) -> f64 {
+    if progress <= target {
+        progress / target
+    } else {
+        (1. - progress) / (1. - target)
+    }
+    .clamp(0., 1.)
+}
 fn decision_diversity(choices: &[usize], archive: &[Vec<usize>]) -> f64 {
     // Circular shifts merely rotate radial circuits. Count them as near duplicates
     // even though their world-coordinate hashes differ.
@@ -676,6 +881,42 @@ mod tests {
             .collect()
     }
     #[test]
+    fn old_search_configs_retain_legacy_fitness_identity() {
+        let old: AcoConfig = ron::from_str("(ants:2,iterations:1)").unwrap();
+        assert_eq!(old.fitness_objective, FitnessObjective::LegacyAdversarial);
+        assert_eq!(
+            AcoConfig::default().fitness_objective,
+            FitnessObjective::UsefulProgress
+        );
+    }
+    #[test]
+    fn useful_difficulty_rewards_partial_success_and_failed_evaluation_cannot_select() {
+        assert!(useful_difficulty(0.7, 0.7) > useful_difficulty(0.01, 0.7));
+        assert!(useful_difficulty(0.7, 0.7) > useful_difficulty(1., 0.7));
+        let mut search = SearchArchive::new(
+            AcoConfig {
+                ants: 4,
+                iterations: 1,
+                max_candidates: 4,
+                max_evaluation_steps: 20,
+                policy_label: Some("test-error".into()),
+                ..Default::default()
+            },
+            17,
+        )
+        .unwrap();
+        let mut fail = |_: &GeneratedTrack, _: u64, _: usize| Err("execution failure".to_string());
+        search.run_iteration(Some(&mut fail)).unwrap();
+        assert!(search.state.selected.is_empty());
+        assert_eq!(search.state.evaluation_steps, 20);
+        assert!(
+            search.iterations[0]
+                .ants
+                .iter()
+                .any(|a| a.rejection_reason == Some(RejectionReason::ExecutionFailure))
+        );
+    }
+    #[test]
     fn probabilistic_deterministic_bounded_real_pheromone_updates() {
         let config = AcoConfig {
             ants: 4,
@@ -741,7 +982,7 @@ mod tests {
         assert_eq!(a.state.selected[0].track, b.state.selected[0].track);
     }
     #[test]
-    fn impossible_reference_rejected_and_evaluation_budget_enforced() {
+    fn unverified_reference_is_distinct_and_evaluation_budget_enforced() {
         let config = AcoConfig {
             ants: 4,
             iterations: 1,
@@ -757,17 +998,24 @@ mod tests {
                 mean_progress: 0.2,
                 collision_rate: 1.,
                 reference_completed: false,
+                reference_collision: true,
                 simulation_steps: budget.min(2) as u64,
+                reference_steps: 1,
+                policy_steps: 1,
+                policy_episodes: 1,
+                inference_seconds: 0.,
+                ..Default::default()
             })
         };
         search.run_iteration(Some(&mut evaluator)).unwrap();
         assert!(search.state.selected.is_empty());
         assert!(search.state.evaluation_steps <= 2);
-        assert!(search.iterations[0].ants.iter().any(|a| {
-            a.rejection
-                .as_ref()
-                .is_some_and(|r| r.contains("reference"))
-        }));
+        assert!(
+            search.iterations[0]
+                .ants
+                .iter()
+                .any(|a| a.rejection_reason == Some(RejectionReason::ReferenceCollision))
+        );
     }
     #[test]
     fn stagnation_resets_pheromones_after_rejections() {
@@ -806,7 +1054,13 @@ mod tests {
                 mean_progress: 0.7,
                 collision_rate: 0.2,
                 reference_completed: true,
+                reference_collision: false,
                 simulation_steps: 1,
+                reference_steps: 0,
+                policy_steps: 1,
+                policy_episodes: 1,
+                inference_seconds: 0.,
+                ..Default::default()
             })
         };
         with_eval.run_iteration(Some(&mut evaluator)).unwrap();

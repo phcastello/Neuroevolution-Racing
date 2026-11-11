@@ -945,37 +945,70 @@ mod anticipation_tests {
 #[cfg(test)]
 mod procedural_reference_tests {
     use super::*;
+    use std::time::Instant;
     #[test]
-    fn reference_completes_generated_circuit_with_bounded_real_physics() {
-        let generated = crate::simulation::procedural::generate(&Default::default(), 3).unwrap();
-        let scene = Rc::new(Scene::new(generated.validate().unwrap()));
-        let config = Config {
-            num_envs: 1,
-            timeout_ticks: 3000,
-            ..Default::default()
-        };
-        let mut env = RacingEnvironment::new(
-            0,
-            vec![scene],
-            &config,
-            &SimulationConfig::default(),
-            ChaCha12Rng::seed_from_u64(3),
-        )
-        .unwrap();
-        let mut reason = None;
-        for _ in 0..3000 {
-            let step = env.step(env.reference_action()).unwrap();
-            if step.terminated || step.truncated {
-                reason = step.reason;
-                break;
+    fn reference_battery_fixed_seeds_and_geometries() {
+        use crate::simulation::procedural::{self, GeneratorConfig, GeneratorShape};
+        let mut completions = 0;
+        for (shape, seed) in [
+            (GeneratorShape::Radial, 3),
+            (GeneratorShape::Radial, 17),
+            (GeneratorShape::RoundedRectangle, 3),
+            (GeneratorShape::RoundedRectangle, 17),
+        ] {
+            let generator = if shape == GeneratorShape::Radial {
+                GeneratorConfig::default()
+            } else {
+                GeneratorConfig {
+                    shape,
+                    radius: 700.,
+                    radial_levels: vec![1.],
+                    widths: vec![80.],
+                    ..Default::default()
+                }
+            };
+            let generated = procedural::generate(&generator, seed).unwrap();
+            let scene = Rc::new(Scene::new(generated.validate().unwrap()));
+            let config = Config {
+                num_envs: 1,
+                timeout_ticks: 3000,
+                ..Default::default()
+            };
+            let mut env = RacingEnvironment::new(
+                0,
+                vec![scene],
+                &config,
+                &SimulationConfig::default(),
+                ChaCha12Rng::seed_from_u64(seed),
+            )
+            .unwrap();
+            let started = Instant::now();
+            let mut reason = None;
+            let mut decisions = 0;
+            for _ in 0..3000 {
+                let step = env.step(env.reference_action()).unwrap();
+                decisions += 1;
+                if step.terminated || step.truncated {
+                    reason = step.reason;
+                    break;
+                }
             }
+            completions += usize::from(reason == Some(EndReason::Completed));
+            println!(
+                "reference shape={shape:?} seed={seed} curvature={} progress={} result={reason:?} decisions={decisions} simulation_seconds={}",
+                generated.geometry.max_curvature,
+                env.progress_fraction(),
+                started.elapsed().as_secs_f64()
+            );
+            assert!(env.progress_fraction().is_finite());
+            assert_eq!(
+                reason,
+                Some(EndReason::Completed),
+                "reference regression: shape={shape:?} seed={seed} progress={}",
+                env.progress_fraction()
+            );
+            assert_eq!(env.collision_events.translation, 0);
         }
-        assert_eq!(
-            reason,
-            Some(EndReason::Completed),
-            "reference progress={}",
-            env.progress_fraction()
-        );
-        assert_eq!(env.collision_events.translation, 0);
+        assert_eq!(completions, 4);
     }
 }

@@ -243,3 +243,67 @@ As saídas do Actor aparecem junto dos dois círculos globais de `log_std`, com 
 No teste CPU em perfil de testes não otimizado, com viewport de 1.000 × 700, a Stress expandida preparou as 236.160 conexões em aproximadamente 101 ms no primeiro desenho e reutilizou o cache em aproximadamente 0,63 ms no desenho estacionário seguinte. Nesse recorte, 29.963 segmentos eram visíveis. O teste verifica estruturalmente a reutilização de geometria/viewport e a integridade de todos os pesos; os tempos são observações locais, sem limite temporal artificial no teste. Esses números medem a preparação CPU do canvas, não o FPS completo do aplicativo.
 
 As sessões de QA foram encerradas. Nenhum commit ou push foi realizado.
+
+## Correções pós-auditoria — 2026-11-11
+
+Checkout inicial limpo em `cf7e9a96f93c74b19c36522b2b13a551156ba12c`. Baseline CPU: 303 testes aprovados, três diagnósticos históricos ignorados. Nenhum checkpoint histórico externo estava disponível neste checkout; a compatibilidade PPO25 foi exercitada com um arquivo compatível gerado pelo construtor real, sem antecipação, e restauração real dos parâmetros/Adam. Não se declara validação de arquivos históricos ausentes.
+
+Validação final: `cargo fmt --all --check`, check workspace sem defaults, check visual e check `cpu-parallel` aprovados. `cargo test --workspace --locked --no-default-features`: **308 aprovados** (80 GA,205 app,4 RL unitários,19 infraestrutura), três ignorados. `cargo test -p neuroevolution-racing-app --locked`: **281 aprovados**, três ignorados. Biblioteca RL com `cpu-parallel` e limites de duas threads: **23 aprovados**. O Clippy estrito solicitado **falhou** em lints legados, incluindo conversões redundantes e fixtures GA com atribuição após Default; não foram suprimidos. O check headless ainda emite50 warnings de código/imports visuais sem uso. Este registro não representa aprovação de todos os gates.
+
+Evidências locais ficam em `target/audit-validation/` (não versionado): `tests-cpu-final.log`, `tests-visual-final2.log`, `tests-parallel.log`, `clippy.log`, `check-*-final.log`, `reference-battery.log`, `integration-evidence.json`, `parallel-parity.json`, `plan-checks.json` e `consolidation-checks.json`. Os executáveis e logs registram NdArray CPU no Xeon E5-2470 v2 deste ambiente; o grafo headless e `ldd` não contêm WGPU, janela, Vulkan ou CUDA.
+
+- Smoke PPO: rede8/8, dois ambientes×8 passos, um rollout,16 transições e quatro updates Adam; checkpoint e avaliação real em três pistas Validation. Retomada CLI até o rollout2 também aprovada.
+- ACO independente: quatro construções, duas selecionadas, dois snapshots de iteração; exportação e leitura reais. Probabilidades e reforço de feromônios são verificados pelos testes.
+- PPO+ACO real: rede4, um ambiente×2 passos, duas atualizações mais uma após resume. Ativação no rollout1: oito candidatas construídas/válidas/avaliadas, oito referências concluídas, duas selecionadas. Consumiu14.212 decisões (12.568 referência+1.644 PPO), sob teto48.000. O rollout2 coletou duas transições em `generated_4c69151a2a881bd9`; o resume concluiu o rollout3, Adam2→3, com dois rollouts e dois IDs selecionados efetivamente utilizados. Arquivos de rollout validam versões de política sucessivas, sem replay de buffers antigos. Testes comparam pesos congelados, parâmetros/Adam restaurados, RNGs separados, finitude e partição Training.
+- Referência: quatro episódios, três geometrias distintas, dois formatos e seeds3/17:4/4 conclusões, sem colisões/timeouts;1.715–2.268 decisões. Os casos RoundedRectangle com um único nível radial repetem a geometria. É uma bateria de regressão pequena, sem inferência estatística.
+- CPU serial/paralela: smokes de um rollout idênticos, diferenças máximas0 nos parâmetros e nos dois momentos Adam; `RAYON_NUM_THREADS=2 MATMUL_NUM_THREADS=2`. Não é benchmark nem evidência de ganho de velocidade.
+- Preparação:16 células únicas, quatro observacionais/100 rollouts e quatro curriculares/200; nenhuma iniciou treino. Planos CPU/GPU100 diferem somente no dispositivo/destino. Sobrescrita e triagem curricular100 são rejeitadas.
+- Seleção progressiva: plano minúsculo de uma célula executou1 rollout e retomou até3, preservando checkpoint/Adam4→12. Não se executou a matriz científica. O consolidador foi exercitado com quatro runs reais e nove avaliações por pista; campos nulos ficam vazios e resultados ausentes permanecem ausentes. Fixtures sintéticas incompatíveis não produzem razão de desempenho.
+- A suíte visual sem display cobre playback/trace, checkpoints, seleção de pistas, limpeza ECS, gráficos e snapshots ACO. O fixture ACO passou a consumir explicitamente suas deltas de textura egui. Operação interativa GA/PPO/ACO/Experimentos: **NOT RUN**, sem DISPLAY/Wayland. Hardware GPU e paridade numérica GPU: **NOT RUN**; nenhuma reserva ou consulta de GPU foi feita.
+
+Para repetir apenas a integração pequena (até três rollouts):
+
+```bash
+cargo test -p neuroevolution-racing-app --locked --no-default-features \
+  rl::curriculum::training_integration_tests -- --nocapture
+cargo test -p neuroevolution-racing-app --locked --no-default-features \
+  procedural_reference_tests -- --nocapture
+RAYON_NUM_THREADS=2 MATMUL_NUM_THREADS=2 cargo test -p racing-rl --locked --features cpu-parallel
+```
+
+As alterações metodológicas e os comandos de preparação estão em `docs/PESQUISA.md` e `docs/SERVIDOR_47.md`. Permanecem: triagem com uma seed descritiva; um episódio determinístico por controlador/candidata; hipótese de fitness útil ainda sem ablação; ausência de benchmarks definitivos. Não houve treino100/500, benchmark GPU, serviços remotos, alteração da configuração do servidor, commit, push ou PR. Builds/smokes locais usaram perfis dev/test; a compilação release final deverá ser feita após revisão, com espaço de disco suficiente.
+
+## Validação final do release CPU e publicação — 2026-11-11
+
+Esta rodada repetiu as verificações abaixo; os números da seção anterior continuam sendo o registro da rodada anterior. Base de comparação: `cf7e9a96f93c74b19c36522b2b13a551156ba12c`. A versão final corresponde ao commit que introduz esta seção; após atualizar, obtenha seu SHA com `git log -1 --format='%H' -- docs/rl/VALIDACAO.md`. O relatório de publicação informa o SHA completo. Nenhum checkpoint, binário, log extenso ou diretório de auditoria é incluído no commit.
+
+| Verificação desta rodada | Status | Resultado |
+|---|---|---|
+| `cargo fmt --all --check` e `git diff --check` | PASS | Sem diferenças de formatação/whitespace |
+| `cargo check --workspace --locked --no-default-features` | PASS | Headless;50 warnings legados de imports/código visual sem uso |
+| `cargo test --workspace --locked --no-default-features` | PASS |308 aprovados,3 ignorados:80 GA+205 app+4 RL+19 infraestrutura |
+| Check e testes com feature visual | PASS |281 aprovados,3 ignorados |
+| Check `cpu-parallel` e testes RL com duas threads | PASS |23 aprovados |
+| Clippy estrito global | FAIL, legado comprovado |14 erros no GA lib e35 no lib test; sem supressão |
+| Comparação Clippy completa, sem `-D warnings` para recolher todos os diagnósticos | PASS quanto a regressões |175 diagnósticos no checkout base e175 no estado final; nenhum diagnóstico novo por arquivo/código/mensagem |
+| Build release CPU direto e `./tools/server47.sh build-cpu` | PASS |Executável CPU gerado, executável e idêntico ao build direto por SHA-256 |
+| Smoke real no executável release e leitura do checkpoint | PASS |Um rollout,16 transições,4 updates Adam, parâmetros/gradientes finitos; checkpoint restaurado em avaliação congelada CPU |
+| PPO+ACO real, referência, checkpoint e retomada | PASS |Testes pequenos existentes executados novamente nas suítes; sem mocks na integração |
+| Preparação CPU/GPU e matriz | PASS |Planos100 CPU/GPU equivalentes exceto backend/destino; dry-run16 células; nenhum treinamento iniciado pela preparação |
+| Operação gráfica real | NOT RUN |Sem DISPLAY/Wayland; testes ECS/egui/playback preservados |
+| GPU/A2000 e benchmarks100/500 | NOT RUN |Reservados para autorização posterior; nenhum dispositivo consultado ou reservado |
+
+Os diagnósticos Clippy foram recolhidos também de um worktree temporário limpo da base, usando o mesmo Rust1.99.1, lockfile e argumentos. A comparação ignora apenas números de linha, que mudam com as edições. Não houve reestruturação do GA nem alteração da matemática de backpropagation, GAE, PPO-Clip ou Adam. A bateria de referência agora exige conclusão e zero colisões de translação em **todos os quatro fixtures conhecidos**, preservando e ampliando a garantia do teste original.
+
+Smoke principal, executado por `./tools/server47.sh smoke results_ppo/release-validation-final` a partir de `/tmp`:
+
+- Backend: Burn0.20.1 NdArray f32 CPU, Xeon E5-2470 v2,12 CPUs disponíveis, `cpu_parallel=false`; nenhuma inicialização de GPU.
+- Rede:25 entradas, camadas ocultas8/8, Actor2 e Critic1,309 parâmetros;2 ambientes×8 passos,1 rollout.
+- Resultado:16 transições,4 updates Adam e4 gradientes finitos; norma média0,7878718674; status `rollout_limit`, processo encerrado com código0, zero frames renderizados.
+- Coleta0,001086405s; update com backward/Adam0,001885510s; total0,524136570s incluindo inicialização/persistência. São números de smoke, sem conclusão de desempenho.
+- Checkpoint real local: `results_ppo/release-validation-final/runs/ppo-1794417250320382417-1297499/checkpoint-000001.ron`. O recibo `run-path.txt` registra o caminho exato; `performance_summary.json`, `performance.csv`, `update_metrics.csv`, `track_metrics.csv` e `run.log` foram verificados. O checkpoint foi carregado pelo release em três episódios congelados Validation, sem realimentação do treino.
+- SHA-256 dos dois executáveis CPU: `85d37ed258628c6a8256b4b960a37d4daf20ab01adedbe3632446b3b46a2b6d1`. O build não usou `target-cpu=native` nem habilitação explícita de AVX2/AVX-512; o smoke executou no Xeon citado. `ldd` contém somente bibliotecas CPU do sistema, sem Vulkan/CUDA/X11/Wayland.
+
+O script foi conferido com `bash -n`, ajuda/pré-requisitos fora do checkout e smoke release em caminho com espaços, acentuação e barra invertida literal. A correção usa callback na substituição do caminho e mantém Unicode válido em RON; diretório já existente é rejeitado sem alterar o checkpoint. As instruções Linux agora identificam a distribuição antes de escolher Debian/Ubuntu ou RHEL/AlmaLinux. `.gitignore` protege novos resultados GA e arquivos `.env`; os133 arquivos históricos já versionados em `results/` foram preservados.
+
+Logs/evidências desta rodada permanecem localmente em `target/final-validation/`, incluindo `build-release.log`, `build-script-cpu.log`, `smoke-release.log`, `release-smoke-evidence.json`, `tests-cpu.log`, `tests-visual.log`, `tests-parallel.log`, `clippy-comparison.json`, `clippy-strict.log`, `benchmark-preparation-checks.json` e `script-path-checks.json`. Somente código, testes, configuração, scripts e documentação são publicados. Os comandos para repetir a instalação/build/smoke/preparação estão em `docs/SERVIDOR_47.md`; os smokes não demonstram convergência nem substituem o benchmark científico futuro.

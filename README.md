@@ -37,6 +37,9 @@ target/release/neuroevolution-racing aco search --output results_ppo/search-47
 # Preparação inerte da matriz: não inicia os 16 treinamentos
 target/release/neuroevolution-racing research matrix --output results_ppo/matrix --dry-run
 target/release/neuroevolution-racing research matrix --output results_ppo/matrix
+# Triagens independentes: A=observações (100), B=currículo (200)
+target/release/neuroevolution-racing research matrix --screening --observations --output results_ppo/observations
+target/release/neuroevolution-racing research matrix --screening --curricula --output results_ppo/curricula
 # Execução futura explícita de um plano já preparado:
 # target/release/neuroevolution-racing research execute --plan results_ppo/matrix/plan.ron
 ```
@@ -66,6 +69,9 @@ cargo fmt --all --check
 cargo check --workspace --locked --no-default-features
 cargo test --workspace --locked --no-default-features
 cargo check -p neuroevolution-racing-app --locked # visual
+cargo check -p neuroevolution-racing-app --locked --no-default-features --features cpu-parallel
 ```
+
+O [registro de validação](docs/rl/VALIDACAO.md#validação-final-do-release-cpu-e-publicação--2026-11-11) distingue as rodadas executadas. O release CPU e o smoke com backward/Adam foram aprovados; Clippy global continua falhando exclusivamente em diagnósticos legados comprovados, sem novos diagnósticos. Operação gráfica real e GPU permanecem pendentes.
 
 `rl benchmark` continua medindo inferência/coleta. O **benchmark completo de treinamento**, com backward e Adam, usa `research benchmark`; preparar não executa. Nenhum build ou instalação dispara experimentos automaticamente.

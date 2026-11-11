@@ -2,7 +2,9 @@
 (
     base: "configs/rl/ppo_e_continue_8h.ron",
     rollouts: 500,
-    screening_rollouts: 100,
+    // Curricula activate after rollout 100; 200 permits post-activation training.
+    screening_rollouts: 200,
+    observation_screening_rollouts: 100,
     seeds: [11],
     repetitions: 1,
     max_parallel: 1,

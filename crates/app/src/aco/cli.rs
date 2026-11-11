@@ -157,7 +157,7 @@ pub fn run(command: AcoCommand) -> GenerationResult<()> {
 }
 fn print_summary(search: &SearchArchive) {
     println!(
-        "ACO iterations={} candidates={} simulation_decisions={} selected={} policy={:?}",
+        "ACO iterations={} candidates={} evaluation_budget_charged={} selected={} policy={:?}",
         search.state.iteration,
         search.state.candidates,
         search.state.evaluation_steps,

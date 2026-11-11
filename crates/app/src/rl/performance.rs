@@ -131,6 +131,12 @@ pub struct Summary {
     pub parameter_count: usize,
     pub observation: racing_rl::config::ObservationSpec,
     pub config: Config,
+    pub search_seconds: f64,
+    pub search_overhead_percent_of_ppo: Option<f64>,
+    pub curriculum_rollouts_cumulative: u64,
+    pub selected_rollouts_cumulative: u64,
+    pub distinct_generated_tracks_used: usize,
+    pub distinct_selected_tracks_used: usize,
 }
 /// Only scalar rollout durations are retained in RAM; observations/tensors are not copied.
 pub struct Performance {
@@ -147,6 +153,8 @@ pub struct Performance {
     backend: String,
     config: Config,
     finished: bool,
+    search_seconds: f64,
+    curriculum: Option<(u64, u64, usize, usize)>,
 }
 impl Performance {
     pub fn start(dir: &Path, c: &Config, backend: &str, started: Instant) -> Result<Self> {
@@ -176,6 +184,8 @@ impl Performance {
             backend: backend.into(),
             config: c.clone(),
             finished: false,
+            search_seconds: 0.,
+            curriculum: None,
         })
     }
     pub fn record(
@@ -237,6 +247,17 @@ impl Performance {
         self.persistence_seconds += seconds;
         Ok(())
     }
+    pub fn record_search(&mut self, seconds: f64) {
+        self.search_seconds += seconds;
+    }
+    pub fn set_curriculum(&mut self, state: &super::curriculum::CurriculumState) {
+        self.curriculum = Some((
+            state.curriculum_rollouts,
+            state.selected_rollouts,
+            state.used_generated_tracks.len(),
+            state.used_selected_tracks.len(),
+        ));
+    }
     pub fn finish(&mut self, status: &str) -> Result<()> {
         self.writer.flush()?;
         let mut times = self.durations.clone();
@@ -268,6 +289,13 @@ impl Performance {
             parameter_count: self.config.parameter_count(),
             observation: self.config.observation.clone(),
             config: self.config.clone(),
+            search_seconds: self.search_seconds,
+            search_overhead_percent_of_ppo: (self.collect_seconds + self.update_seconds > 0.)
+                .then(|| 100. * self.search_seconds / (self.collect_seconds + self.update_seconds)),
+            curriculum_rollouts_cumulative: self.curriculum.map_or(0, |v| v.0),
+            selected_rollouts_cumulative: self.curriculum.map_or(0, |v| v.1),
+            distinct_generated_tracks_used: self.curriculum.map_or(0, |v| v.2),
+            distinct_selected_tracks_used: self.curriculum.map_or(0, |v| v.3),
         };
         json(&self.path.join("performance_summary.json"), &summary)?;
         self.finished = true;

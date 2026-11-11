@@ -276,6 +276,9 @@ pub struct CurriculumConfig {
     pub selected: usize,
     pub archive_limit: usize,
     pub evaluation_ticks: u64,
+    /// Optional stricter total caps; defaults preserve ants * iterations work.
+    pub max_candidates: Option<usize>,
+    pub max_evaluation_steps: Option<u64>,
     /// Existing, fresh random, selected, historical. Entries are sampling weights.
     pub mix: [usize; 4],
 }
@@ -291,11 +294,23 @@ impl Default for CurriculumConfig {
             selected: 4,
             archive_limit: 24,
             evaluation_ticks: 6000,
+            max_candidates: None,
+            max_evaluation_steps: None,
             mix: [5, 2, 2, 1],
         }
     }
 }
 impl CurriculumConfig {
+    pub fn candidate_limit(&self) -> usize {
+        self.max_candidates
+            .unwrap_or(self.ants * self.iterations)
+            .min(self.ants * self.iterations)
+    }
+    pub fn decision_limit(&self) -> u64 {
+        self.max_evaluation_steps
+            .unwrap_or(self.evaluation_ticks * self.candidate_limit() as u64)
+            .min(self.evaluation_ticks * self.candidate_limit() as u64)
+    }
     pub fn validate(&self) -> Result<()> {
         ensure(
             self.interval > 0
@@ -309,6 +324,10 @@ impl CurriculumConfig {
                 && self.selected <= 4
                 && self.archive_limit >= self.selected
                 && self.archive_limit <= 256
+                && self.max_candidates.is_none_or(|n| n > 0 && n <= 24)
+                && self
+                    .max_evaluation_steps
+                    .is_none_or(|n| n > 0 && n <= 259_200)
                 && self.evaluation_ticks > 0
                 && self.evaluation_ticks <= 10800
                 && self.mix[0] > 0
