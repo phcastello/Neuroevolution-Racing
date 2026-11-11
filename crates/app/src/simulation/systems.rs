@@ -5,6 +5,7 @@ use std::{
 
 use avian2d::prelude::*;
 use bevy::{app::FixedMain, prelude::*};
+#[cfg(feature = "visual")]
 use bevy_egui::input::EguiWantsInput;
 use neuroevolution::neural::Mlp;
 
@@ -15,11 +16,13 @@ use crate::simulation::training::{
     episode_score,
 };
 
+#[cfg(feature = "visual")]
+use super::ManualControlMode;
+
 use super::{
-    CAR_LENGTH, CAR_WIDTH, FAST_FORWARD_BATCH_BUDGET, ManualControlMode, PlaybackState,
-    RaceMetrics, RaceParticipant, RaceRoster, RaceSession, RaceTrail, RaceVisual, SimulationConfig,
-    SimulationMode, TestDriveEnvironment, TestDriveSettings, TrackLibrary, TrackSelection,
-    TrainingFastForward,
+    CAR_LENGTH, CAR_WIDTH, FAST_FORWARD_BATCH_BUDGET, PlaybackState, RaceMetrics, RaceParticipant,
+    RaceRoster, RaceSession, RaceTrail, RaceVisual, SimulationConfig, SimulationMode,
+    TestDriveEnvironment, TestDriveSettings, TrackLibrary, TrackSelection, TrainingFastForward,
     checkpoint::{CheckpointStore, LoadedNetwork},
     components::{
         Car, CarProgress, KinematicCar, ManualCar, SelectedCar, SensorReadings, SimulationLayer,
@@ -564,6 +567,7 @@ pub fn manual_controls_from_keys(
     CarControls::new(acceleration, steering)
 }
 
+#[cfg(feature = "visual")]
 pub fn produce_manual_controls(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,
@@ -1082,6 +1086,7 @@ fn log_generation_report(
     }
 }
 
+#[cfg(feature = "visual")]
 pub fn handle_test_drive_input(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,
@@ -1128,6 +1133,7 @@ pub fn reset_manual_car(
     }
 }
 
+#[cfg(feature = "visual")]
 pub fn toggle_pause_from_keyboard(
     keyboard: Res<ButtonInput<KeyCode>>,
     egui_input: Res<EguiWantsInput>,

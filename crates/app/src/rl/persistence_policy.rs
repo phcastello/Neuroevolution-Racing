@@ -38,7 +38,7 @@ pub struct PersistenceOptions {
 }
 
 impl PersistenceOptions {
-    pub(super) fn validate_evaluation(&self, total: usize) -> racing_rl::Result<()> {
+    pub(crate) fn validate_evaluation(&self, total: usize) -> racing_rl::Result<()> {
         if let Some(seconds) = self.wall_time_seconds {
             racing_rl::ensure(
                 seconds.is_finite() && seconds >= 0.,

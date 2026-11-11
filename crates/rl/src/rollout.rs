@@ -44,6 +44,10 @@ pub trait Environment {
     fn reset(&mut self) -> Result<Vec<f32>>;
     fn step(&mut self, action: [f32; 2]) -> Result<Step>;
     fn episode_id(&self) -> u64;
+    /// Optional measured observation time inside step/reset. Drained by the collector.
+    fn take_observation_seconds(&mut self) -> f64 {
+        0.
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transition {
@@ -240,6 +244,11 @@ pub fn collect<B: Backend, E: Environment>(
         .map(Environment::observe)
         .collect::<Result<Vec<_>>>()?;
     timings.observations_seconds += obs_time.elapsed().as_secs_f64();
+    for env in envs.iter_mut() {
+        // Initial observe is already measured by the wall clock above. Discard
+        // older diagnostics left by visual evaluation or another caller.
+        let _ = env.take_observation_seconds();
+    }
     let version = network.version();
     let mut transitions = Vec::with_capacity(config.rollout_size());
     for _ in 0..config.rollout_length {
@@ -266,11 +275,15 @@ pub fn collect<B: Backend, E: Environment>(
         let clock = Instant::now();
         let mut steps = vec![];
         let mut episodes = vec![];
+        let mut step_observation_seconds = 0.;
         for (i, env) in envs.iter_mut().enumerate() {
             episodes.push(env.episode_id());
             steps.push(env.step([actions[2 * i], actions[2 * i + 1]])?);
+            step_observation_seconds += env.take_observation_seconds();
         }
-        timings.simulation_seconds += clock.elapsed().as_secs_f64();
+        timings.simulation_seconds +=
+            (clock.elapsed().as_secs_f64() - step_observation_seconds).max(0.);
+        timings.observations_seconds += step_observation_seconds;
         let clock = Instant::now();
         let final_obs: Vec<_> = steps
             .iter()
@@ -312,6 +325,8 @@ pub fn collect<B: Backend, E: Environment>(
                 step.observation
             };
             timings.observations_seconds += clock.elapsed().as_secs_f64();
+            // Reset observation is included in the wall clock above.
+            let _ = envs[i].take_observation_seconds();
         }
     }
     timings.total_seconds = start.elapsed().as_secs_f64();

@@ -95,6 +95,8 @@ pub struct Checkpoint {
     /// Application-owned serialized physical configuration; app validates it on load.
     pub physics_ron: String,
     pub resume_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curriculum_ron: Option<String>,
 }
 impl Checkpoint {
     pub fn validate(&self) -> Result<()> {

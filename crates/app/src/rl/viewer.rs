@@ -2,11 +2,8 @@
 //! No GA simulation, controller, optimizer update or training schedule is installed here.
 use std::{path::PathBuf, rc::Rc};
 
-use bevy::{
-    asset::AssetPlugin, diagnostic::FrameTimeDiagnosticsPlugin, prelude::*,
-    window::WindowResolution,
-};
-use bevy_egui::{EguiPlugin, input::EguiWantsInput};
+use bevy::{ecs::system::RunSystemOnce, prelude::*};
+use bevy_egui::input::EguiWantsInput;
 use racing_rl::{
     Result,
     backend::{Cpu, matrix, read},
@@ -20,8 +17,8 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha12Rng;
 
 use crate::{
-    display::{CameraViewState, DisplayPlugin, DisplaySet},
-    rendering::{CarPresentation, RenderingPlugin, RenderingSet, SensorVisualization},
+    display::{CameraViewState, DisplaySet},
+    rendering::{CarPresentation, RenderingSet, SensorVisualization},
     simulation::{
         Car, CarObservation, CarProgress, KinematicCar, SelectedCar, SimulationConfig, Track,
         TrackLibrary,
@@ -388,64 +385,68 @@ pub(crate) fn view(
     track_id: Option<String>,
     maximum_frames: Option<u64>,
 ) -> Result<()> {
-    let library = super::library()?;
+    crate::visual::run_with_policy(saved, checkpoint_path, count, track_id, maximum_frames)
+        .map_err(racing_rl::Error::Invalid)
+}
+
+/// Installs playback adapters into the one shared visual application.
+pub(crate) struct PlaybackPlugin;
+impl Plugin for PlaybackPlugin {
+    fn build(&self, app: &mut App) {
+        app.init_resource::<ViewerControls>()
+            .add_plugins(PpoDashboardPlugin)
+            .add_systems(
+                PreUpdate,
+                apply_requests
+                    .after(bevy::input::InputSystems)
+                    .run_if(crate::visual::playback_active),
+            )
+            .add_systems(
+                FixedUpdate,
+                step_playback.run_if(crate::visual::playback_active),
+            )
+            .add_systems(
+                Update,
+                mirror_cars
+                    .before(DisplaySet::Camera)
+                    .before(RenderingSet::Visuals)
+                    .run_if(crate::visual::playback_active),
+            )
+            .add_systems(Last, count_frames.run_if(crate::visual::playback_active));
+    }
+}
+
+pub(crate) fn attach(
+    world: &mut World,
+    saved: Checkpoint,
+    checkpoint_path: PathBuf,
+    count: usize,
+    track_id: Option<&str>,
+    maximum_frames: Option<u64>,
+) -> Result<()> {
     let viewer = Viewer::new(
         saved,
         checkpoint_path,
         count,
-        track_id.as_deref(),
-        &library,
+        track_id,
+        world.resource::<TrackLibrary>(),
         maximum_frames,
     )?;
+    world.insert_non_send(viewer);
+    resume(world)
+}
+
+pub(crate) fn resume(world: &mut World) -> Result<()> {
+    crate::simulation::clear_visual_cars(world);
+    let viewer = world.non_send::<Viewer>();
     let track = viewer.track().clone();
     let dt = viewer.config.physical_dt as f64 * viewer.config.action_repeat as f64;
-    println!(
-        "PPO playback CPU f32 · {} · rollout {} · {} parameters · deterministic tanh(mean)",
-        viewer.checkpoint_path.display(),
-        viewer.saved.completed_rollouts,
-        viewer.saved.config.parameter_count(),
-    );
-    let exit = App::new()
-        .insert_resource(ClearColor(Color::srgb(0.035, 0.075, 0.055)))
-        .add_plugins(
-            DefaultPlugins
-                .set(AssetPlugin {
-                    file_path: crate::asset_directory(),
-                    ..default()
-                })
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Neuroevolution Racing · PPO".into(),
-                        resolution: WindowResolution::new(1400, 850),
-                        resizable: true,
-                        ..default()
-                    }),
-                    ..default()
-                }),
-        )
-        .add_plugins((FrameTimeDiagnosticsPlugin::default(), EguiPlugin::default()))
-        .insert_non_send(viewer)
-        .insert_resource(library)
-        .insert_resource(track)
-        .insert_resource(Time::<Fixed>::from_seconds(dt))
-        .init_resource::<ViewerControls>()
-        .add_plugins((DisplayPlugin, RenderingPlugin, PpoDashboardPlugin))
-        .add_systems(Startup, spawn_cars)
-        // Apply UI commands before any fixed decisions, including when paused.
-        .add_systems(PreUpdate, apply_requests.after(bevy::input::InputSystems))
-        .add_systems(FixedUpdate, step_playback)
-        .add_systems(
-            Update,
-            mirror_cars
-                .before(DisplaySet::Camera)
-                .before(RenderingSet::Visuals),
-        )
-        .add_systems(Last, count_frames)
-        .run();
-    ensure(
-        exit.is_success(),
-        format!("PPO viewer exited with {exit:?}"),
-    )
+    world.insert_resource(track);
+    world.insert_resource(Time::<Fixed>::from_seconds(dt));
+    world.resource_mut::<CameraViewState>().request_fit();
+    world
+        .run_system_once(spawn_cars)
+        .map_err(|e| racing_rl::Error::Invalid(format!("playback spawn: {e}")))
 }
 
 #[derive(Component)]

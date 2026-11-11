@@ -125,7 +125,7 @@ pub(super) fn training_rollout(
     }
     writeln!(
         output,
-        "   Update total includes telemetry and loss-file writes."
+        "   Update total measures synchronized PPO forward, backward and Adam."
     )
     .unwrap();
     writeln!(output, "{FOOTER}").unwrap();

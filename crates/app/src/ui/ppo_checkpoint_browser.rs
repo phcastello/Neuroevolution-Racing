@@ -333,6 +333,7 @@ mod tests {
             trained: false,
             physics_ron: String::new(),
             resume_policy: "restart environments".into(),
+            curriculum_ron: None,
         }
     }
 

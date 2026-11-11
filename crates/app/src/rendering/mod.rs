@@ -168,6 +168,7 @@ struct TrackVisualBuildData<'w, 's> {
     materials: ResMut<'w, Assets<ColorMaterial>>,
     old_visuals: TrackVisualAssets<'w, 's>,
     mode: Option<Res<'w, SimulationMode>>,
+    shell: Option<Res<'w, crate::visual::Shell>>,
     test_drive: Option<Res<'w, TestDriveSettings>>,
     last_environment: Local<'s, Option<(SimulationMode, TestDriveEnvironment)>>,
     last_track_id: Local<'s, Option<String>>,
@@ -181,11 +182,19 @@ fn rebuild_track_visuals(data: TrackVisualBuildData) {
         mut materials,
         old_visuals,
         mode,
+        shell,
         test_drive,
         mut last_environment,
         mut last_track_id,
     } = data;
-    let current_environment = visual_environment(mode.as_deref(), test_drive.as_deref());
+    let current_environment = if shell
+        .as_deref()
+        .is_some_and(|s| s.mode != crate::visual::Mode::Ga)
+    {
+        (SimulationMode::Champion, TestDriveEnvironment::Track)
+    } else {
+        visual_environment(mode.as_deref(), test_drive.as_deref())
+    };
     if *last_environment == Some(current_environment)
         && last_track_id.as_deref() == Some(track.definition.id.as_str())
         && !track.is_changed()
@@ -532,6 +541,7 @@ fn draw_debug_visuals(
     debug: Res<TrackDebug>,
     car_visuals: Res<CarVisualSettings>,
     mode: Option<Res<SimulationMode>>,
+    shell: Option<Res<crate::visual::Shell>>,
     test_drive: Option<Res<TestDriveSettings>>,
     race: Option<Res<RaceSession>>,
     trails: Query<(&RaceTrail, &RaceVisual)>,
@@ -547,7 +557,14 @@ fn draw_debug_visuals(
         With<SelectedCar>,
     >,
 ) {
-    let (mode, environment) = visual_environment(mode.as_deref(), test_drive.as_deref());
+    let (mode, environment) = if shell
+        .as_deref()
+        .is_some_and(|s| s.mode != crate::visual::Mode::Ga)
+    {
+        (SimulationMode::Champion, TestDriveEnvironment::Track)
+    } else {
+        visual_environment(mode.as_deref(), test_drive.as_deref())
+    };
     let track_visible =
         mode != SimulationMode::TestDrive || environment == TestDriveEnvironment::Track;
     if !track_visible {

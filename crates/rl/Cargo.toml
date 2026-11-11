@@ -6,6 +6,7 @@ license.workspace = true
 
 [features]
 default = []
+cpu-parallel = ["burn-ndarray/multi-threads"]
 gpu = ["dep:burn-wgpu", "dep:wgpu", "dep:pollster", "dep:naga"]
 
 [dependencies]

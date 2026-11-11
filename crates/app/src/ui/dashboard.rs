@@ -669,7 +669,7 @@ pub fn dashboard_system(mut contexts: EguiContexts, mut data: DashboardData) -> 
 
 /// The visual application shell shared by GA and frozen PPO playback.
 /// This has no dependency on either training state or a simulation controller.
-pub(super) fn draw_dashboard(
+pub(crate) fn draw_dashboard(
     ctx: &egui::Context,
     subtitle: &str,
     contents: impl FnOnce(&mut egui::Ui),
@@ -689,6 +689,9 @@ pub(super) fn draw_dashboard(
         .exact_size(TOP_BAR_HEIGHT.min(viewport_rect.height()))
         .show(&mut viewport_ui, |ui| {
             ui.horizontal_centered(|ui| {
+                if ui.button("☰ Modos").clicked() {
+                    crate::visual::request_menu(ctx);
+                }
                 ui.heading("Neuroevolution Racing");
                 if ui.available_width() > 520.0 {
                     ui.separator();
@@ -706,7 +709,7 @@ pub(super) fn draw_dashboard(
         });
 }
 
-pub(super) fn draw_display_controls(
+pub(crate) fn draw_display_controls(
     ui: &mut egui::Ui,
     display: &mut DisplaySettings,
     diagnostics: &DiagnosticsStore,
@@ -741,7 +744,7 @@ pub(super) fn draw_display_controls(
     );
 }
 
-pub(super) fn draw_camera_controls(
+pub(crate) fn draw_camera_controls(
     ui: &mut egui::Ui,
     camera: &mut CameraViewState,
     follow_label: &str,

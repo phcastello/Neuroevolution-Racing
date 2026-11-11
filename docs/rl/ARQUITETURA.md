@@ -1,3 +1,5 @@
+> Nota histórica: o backward manual e Adam já estão implementados e cobertos por testes. Para a infraestrutura atual, veja [pesquisa](../PESQUISA.md) e [Servidor47](../SERVIDOR_47.md). As referências a implementação pendente abaixo descrevem a etapa anterior do projeto.
+
 # PPO-Clip no Racing
 
 O crate `racing-rl` é independente de Bevy, Avian, egui e do núcleo GA. O app depende dos dois crates de IA; `neuroevolution` continua sem dependência de ML. Os formatos históricos de genoma, Champion e TrainingCheckpoint não foram modificados. As únicas mudanças na física antiga são visibilidades para reutilizar funções existentes.

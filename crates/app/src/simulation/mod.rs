@@ -2,6 +2,7 @@ mod checkpoint;
 mod components;
 mod controller;
 mod fast_forward;
+pub(crate) mod procedural;
 mod race;
 pub(crate) mod rl_environment;
 mod systems;
@@ -20,19 +21,29 @@ pub use race::{
     latest_checkpoint_indices, sort_race_standings,
 };
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
+#[cfg(feature = "visual")]
+pub(crate) use track::TrackDefinition;
+#[cfg(test)]
+pub(crate) use track::TrackRole;
 pub use track::{Track, TrackBounds, TrackLibrary};
 pub use training::{SavedGeneticConfig, TrainingCheckpoint, racing_architecture};
 
 use bevy::{prelude::*, time::Fixed};
-use race::{apply_race_selection, update_race_session};
+#[cfg(feature = "visual")]
+use race::apply_race_selection;
+use race::update_race_session;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use systems::{
-    SimulationSet, apply_track_selection, apply_vehicle_physics, finish_generation_evaluation,
-    handle_test_drive_input, produce_manual_controls, produce_temporary_controls,
-    rebuild_simulation, reset_manual_car, run_training_fast_forward_batch, sample_sensors,
-    select_current_leader, toggle_pause_from_keyboard, update_track_progress,
-    update_training_fast_forward,
+    SimulationSet, apply_vehicle_physics, finish_generation_evaluation, produce_temporary_controls,
+    rebuild_simulation, run_training_fast_forward_batch, sample_sensors, select_current_leader,
+    update_track_progress, update_training_fast_forward,
+};
+
+#[cfg(feature = "visual")]
+use systems::{
+    apply_track_selection, handle_test_drive_input, produce_manual_controls, reset_manual_car,
+    toggle_pause_from_keyboard,
 };
 
 #[cfg(test)]
@@ -270,7 +281,8 @@ impl Plugin for SimulationPlugin {
                     SimulationSet::Lifecycle,
                     SimulationSet::FastForward,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(visual_ga_active),
             )
             .add_systems(
                 FixedUpdate,
@@ -292,14 +304,17 @@ impl Plugin for SimulationPlugin {
                 RunFixedMainLoop,
                 run_training_fast_forward_batch
                     .in_set(RunFixedMainLoopSystems::FixedMainLoop)
-                    .before(bevy::time::run_fixed_main_schedule),
+                    .before(bevy::time::run_fixed_main_schedule)
+                    .run_if(visual_ga_active),
             );
         if self.runtime_mode == RuntimeMode::Interactive {
             app.init_resource::<TrackDebug>();
+            #[cfg(feature = "visual")]
             app.add_systems(
                 FixedUpdate,
                 produce_manual_controls.in_set(SimulationSet::ControlSource),
             );
+            #[cfg(feature = "visual")]
             app.add_systems(
                 Update,
                 (
@@ -310,10 +325,50 @@ impl Plugin for SimulationPlugin {
                     reset_manual_car,
                     toggle_pause_from_keyboard,
                 )
-                    .chain(),
+                    .chain()
+                    .run_if(visual_ga_active),
             );
         } else {
             app.add_systems(Update, rebuild_simulation);
         }
     }
+}
+
+/// No visual shell is installed in workers or historical test harnesses.
+fn visual_ga_active(world: &World) -> bool {
+    #[cfg(feature = "visual")]
+    {
+        crate::visual::ga_active(world)
+    }
+    #[cfg(not(feature = "visual"))]
+    {
+        let _ = world;
+        true
+    }
+}
+
+#[cfg(feature = "visual")]
+pub(crate) fn clear_visual_cars(world: &mut World) {
+    let entities: Vec<_> = world
+        .query_filtered::<Entity, Or<(With<Car>, With<components::TrackWall>)>>()
+        .iter(world)
+        .collect();
+    for entity in entities {
+        world.despawn(entity);
+    }
+}
+
+#[cfg(feature = "visual")]
+pub(crate) fn restore_visual_ga(world: &mut World) -> Result<(), String> {
+    clear_visual_cars(world);
+    let id = world.resource::<TrackSelection>().active_id.clone();
+    let definition = world
+        .resource::<TrackLibrary>()
+        .definition(&id)
+        .ok_or_else(|| format!("missing GA track {id}"))?;
+    let track = Track::from_definition(definition).map_err(|e| e.to_string())?;
+    world.insert_resource(track);
+    world.insert_resource(systems::SimulationLifecycleState::default());
+    world.insert_resource(Time::<Fixed>::from_hz(60.0));
+    Ok(())
 }

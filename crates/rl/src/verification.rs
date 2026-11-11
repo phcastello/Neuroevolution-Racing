@@ -673,7 +673,7 @@ mod tests {
                 assert_eq!(cache.batch_size, batch);
                 assert_eq!(cache.latent_entropy_coef, entropy);
                 assert_eq!(data(cache.ratio.clone()).len(), batch);
-                for grid in fixture.expected.chunks_exact(9) {
+                for grid in fixture.expected.as_chunks::<9>().0 {
                     for (i, row) in grid.iter().enumerate() {
                         assert_eq!(
                             row.region,

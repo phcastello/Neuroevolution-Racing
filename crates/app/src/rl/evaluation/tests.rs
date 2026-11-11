@@ -312,6 +312,7 @@ fn periodic_evaluation_leaves_training_state_rngs_and_next_trajectory_identical(
                 completed_rollouts: 1,
                 decisions: 2,
                 physical_ticks: 2,
+                curriculum_ron: None,
             },
         )
         .unwrap()

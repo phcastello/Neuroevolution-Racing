@@ -403,6 +403,7 @@ fn ppo_checkpoint_roundtrip_validates_shapes_state_and_cache_restoration() {
     let checkpoint = persistence::Checkpoint {
         format: "racing-ppo".into(),
         version: 1,
+        curriculum_ron: None,
         config: c.clone(),
         features: c.observation.features(),
         parameter_shapes: n.parameters().iter().map(|p| p.dims()).collect(),
@@ -470,4 +471,164 @@ fn speed_normalization_old_specs_default_and_new_specs_persist_metadata() {
     assert_eq!(new.features()[1].normalization, "v/(250+abs(v))");
     new.kind = ObservationKind::Legacy6;
     assert!(new.validate().is_err());
+}
+
+#[test]
+fn ray_layouts_isolate_angles_and_geometry_extends_exactly_six_inputs() {
+    use racing_rl::config::SensorLayout;
+    let historical = ObservationSpec::default();
+    for layout in [SensorLayout::Original, SensorLayout::FrontDense] {
+        let spec = historical.clone().with_sensor_layout(layout);
+        spec.validate().unwrap();
+        let angles = spec.angles();
+        assert_eq!(angles.len(), 21);
+        assert_eq!(angles[0], 90.);
+        assert_eq!(angles[20], -90.);
+        assert_eq!(angles[10], 0.);
+        assert!(angles.iter().all(|a| (-90.0..=90.0).contains(a)));
+        assert!(
+            angles
+                .iter()
+                .zip(angles.iter().rev())
+                .all(|(a, b)| *a == -*b)
+        );
+        assert_eq!(spec.sensor_range, historical.sensor_range);
+        assert_eq!(spec.speed_scale, historical.speed_scale);
+        assert_eq!(spec.speed_normalization, historical.speed_normalization);
+        assert_eq!(spec.angular_speed_scale, historical.angular_speed_scale);
+        assert_eq!(spec.dimension(), 25);
+        let future = spec.with_anticipation(true);
+        future.validate().unwrap();
+        assert_eq!(future.dimension(), 31);
+        assert_eq!(future.features().len(), 31);
+        let text = ron::to_string(&future).unwrap();
+        assert_eq!(ron::from_str::<ObservationSpec>(&text).unwrap(), future);
+    }
+    assert_eq!(historical.angles(), SensorLayout::Original.angles());
+    assert!(
+        !ron::to_string(&historical)
+            .unwrap()
+            .contains("anticipation")
+    );
+    let mut invalid = historical.with_anticipation(true);
+    invalid.version = 1;
+    assert!(invalid.validate().is_err());
+    invalid.version = 2;
+    invalid.anticipation.as_mut().unwrap().arc_distances = [150., 150., 700.];
+    assert!(invalid.validate().is_err());
+    invalid.anticipation.as_mut().unwrap().arc_distances = [150., 350., f32::NAN];
+    assert!(invalid.validate().is_err());
+    invalid.anticipation.as_mut().unwrap().arc_distances = [150., 350., 700.];
+    invalid.anticipation.as_mut().unwrap().coordinate_scale = 0.;
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn observation_geometry_parameter_count_and_forward() {
+    use racing_rl::config::SensorLayout;
+    let c = Config {
+        observation: ObservationSpec::default()
+            .with_sensor_layout(SensorLayout::FrontDense)
+            .with_anticipation(true),
+        hidden: vec![256; 4],
+        ..Default::default()
+    };
+    let network = Network::<Cpu>::new(&c, &Default::default()).unwrap();
+    assert_eq!(
+        c.parameter_count(),
+        network
+            .snapshot()
+            .unwrap()
+            .iter()
+            .map(Vec::len)
+            .sum::<usize>()
+    );
+    assert_eq!(c.parameter_count(), 206_341);
+    let cache = network.forward(m(&[0.; 31], 1, 31)).unwrap();
+    assert_eq!(cache.mean.dims(), [1, 2]);
+    assert_eq!(cache.value.dims(), [1, 1]);
+}
+
+#[test]
+fn anticipation_observations_collect_and_update_the_manual_policy_on_cpu() {
+    use racing_rl::{
+        config::SensorLayout,
+        rollout::{Environment, Step},
+    };
+    struct TinyEnvironment {
+        id: usize,
+        tick: u64,
+    }
+    impl Environment for TinyEnvironment {
+        fn env_id(&self) -> usize {
+            self.id
+        }
+        fn episode_id(&self) -> u64 {
+            0
+        }
+        fn observe(&mut self) -> racing_rl::Result<Vec<f32>> {
+            Ok((0..31)
+                .map(|i| ((self.tick + i as u64) as f32 * 0.1).sin())
+                .collect())
+        }
+        fn reset(&mut self) -> racing_rl::Result<Vec<f32>> {
+            self.observe()
+        }
+        fn step(&mut self, action: [f32; 2]) -> racing_rl::Result<Step> {
+            self.tick += 1;
+            Ok(Step {
+                observation: self.observe()?,
+                reward: RewardParts {
+                    progress: 0.2 + action[1] * 0.1,
+                    ..Default::default()
+                },
+                terminated: false,
+                truncated: false,
+                reason: None,
+                physical_ticks: 1,
+                progress: 0.,
+            })
+        }
+    }
+    let c = Config {
+        observation: ObservationSpec::default()
+            .with_sensor_layout(SensorLayout::FrontDense)
+            .with_anticipation(true),
+        hidden: vec![8],
+        num_envs: 2,
+        rollout_length: 4,
+        minibatch_size: 4,
+        update_epochs: 1,
+        target_kl: 10.,
+        ..Default::default()
+    };
+    let device = Default::default();
+    let mut network = Network::<Cpu>::new(&c, &device).unwrap();
+    let before = network.snapshot().unwrap();
+    let mut optimizer = Optimizer::new(c.optimizer.clone(), &network.parameters());
+    let mut rngs = persistence::Rngs::new(&c);
+    let mut envs = vec![
+        TinyEnvironment { id: 0, tick: 0 },
+        TinyEnvironment { id: 1, tick: 3 },
+    ];
+    let rollout =
+        racing_rl::rollout::collect(&network, &mut envs, &c, &mut rngs.action, &device).unwrap();
+    let metrics = racing_rl::trainer::update(
+        &mut network,
+        &mut optimizer,
+        &rollout,
+        &c,
+        &mut rngs.shuffle,
+        &device,
+    )
+    .unwrap();
+    assert_eq!(rollout.observation_spec.dimension(), 31);
+    assert_eq!(optimizer.step, 2);
+    assert!(network.version() > rollout.policy_version);
+    assert_ne!(network.snapshot().unwrap(), before);
+    assert!(
+        metrics
+            .iter()
+            .all(|m| m.gradient_norm_before_clip.is_some_and(f32::is_finite))
+    );
 }

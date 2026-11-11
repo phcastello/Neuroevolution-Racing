@@ -113,3 +113,17 @@ cargo run --locked -p neuroevolution-racing-app -- rl evaluate --checkpoint resu
 ```
 
 Trocar a pista para inspeção interativa não modifica a suíte nem os critérios usados por esse comando. Resultados de testes e verificações efetivamente realizados são registrados separadamente em [VALIDACAO.md](VALIDACAO.md).
+
+## Aplicação unificada: GA, PPO, ACO e Experimentos
+
+`cargo run --locked -p neuroevolution-racing-app` abre o menu dos quatro modos. Todos usam a mesma janela Bevy, o mesmo renderer, câmera e recursos visuais. O botão **☰ Modos** retorna ao menu. O comando histórico `rl view` continua disponível e entra diretamente no modo PPO dessa aplicação. Builds `--no-default-features` removem a interface e suas dependências gráficas; use a feature `visual` para habilitá-la explicitamente.
+
+A evolução GA só avança no modo GA. A observação PPO só avança no modo PPO e utiliza o ambiente físico original com política congelada em CPU. Ao trocar de modo, os espelhos visuais dos carros são removidos. O estado da evolução GA e a política PPO carregada permanecem disponíveis durante a sessão. Retornar ao GA reinicia a avaliação visual atual, sem alterar pesos, população ou checkpoints; o estado de um episódio visual parcial não é um checkpoint de treinamento.
+
+No modo **ACO**, abra o `search.ron` produzido por `aco search`. A interface permite selecionar iteração, formiga e etapa de construção, reproduzir a evolução e inspecionar probabilidades, decisões sorteadas, motivos de rejeição, fitness decomposto, diversidade e melhores soluções. A matriz mostra feromônios antes da evaporação, após evaporação e após reforço. Cada linha representa uma posição no grafo de decisões e cada coluna uma alternativa discreta do gerador; os feromônios não são desenhados como se fossem posições físicas na pista. Os gráficos usam os snapshots reais do algoritmo headless. Não há uma segunda implementação de ACO no visualizador.
+
+A pista da formiga selecionada aparece no renderer compartilhado. Em **Piloto congelado na pista**, informe um checkpoint e carregue a política. O candidato é registrado somente na partição de treinamento da biblioteca da sessão; pistas de validação não recebem pistas geradas. O playback passa ao modo PPO, preservando as observações e física do checkpoint.
+
+No modo **Experimentos**, informe um diretório de resultados ou de planos e consulte os manifests, configurações efetivas, relatórios e CSV existentes. Selecione a mesma métrica e marque execuções para comparar curvas. Abrir um checkpoint entra no PPO; um artefato de pista pode ser aberto no renderer. A interface mostra um ranking pelo último valor finito da coluna selecionada, com ordenação crescente ou decrescente escolhida pelo usuário. Esse ranking é apenas uma comparação dos dados carregados; ele não declara uma configuração cientificamente vencedora. A interface não executa treinamentos nem fabrica resultados. A escolha científica dos finalistas deve usar os relatórios de avaliação em pistas desconhecidas, separadamente dos CSV de coleta de treinamento.
+
+A interface foi preparada para compilação sem iniciar dispositivos gráficos durante os testes headless. A inspeção interativa de janela, mouse e renderização precisa ser realizada em uma sessão gráfica autorizada.

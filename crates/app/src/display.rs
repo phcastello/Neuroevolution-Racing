@@ -408,6 +408,7 @@ fn update_camera_view(
     track: Res<Track>,
     mode: Option<Res<SimulationMode>>,
     test_drive: Option<Res<TestDriveSettings>>,
+    shell: Option<Res<crate::visual::Shell>>,
     followed_car: Query<(&Transform, &CarObservation), With<SelectedCar>>,
     mut state: ResMut<CameraViewState>,
 ) {
@@ -418,14 +419,22 @@ fn update_camera_view(
     let scale_factor = window.resolution.scale_factor();
     // A standalone policy playback has no GA mode or test-drive resources.
     // Their presence only determines the original app's open-field scene.
-    let scene = mode.as_deref().copied().map(|mode| {
-        (
-            mode,
-            test_drive
+    let scene = mode
+        .as_deref()
+        .copied()
+        .filter(|_| {
+            shell
                 .as_deref()
-                .map_or(TestDriveEnvironment::Track, |settings| settings.environment),
-        )
-    });
+                .is_none_or(|s| s.mode == crate::visual::Mode::Ga)
+        })
+        .map(|mode| {
+            (
+                mode,
+                test_drive
+                    .as_deref()
+                    .map_or(TestDriveEnvironment::Track, |settings| settings.environment),
+            )
+        });
     let resized = state.last_window_size.x.abs_diff(window_size.x) >= SIGNIFICANT_RESIZE_PIXELS
         || state.last_window_size.y.abs_diff(window_size.y) >= SIGNIFICANT_RESIZE_PIXELS
         || (state.last_scale_factor - scale_factor).abs() > 0.001;

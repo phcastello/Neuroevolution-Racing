@@ -43,6 +43,7 @@ const RACE_PALETTE: [[u8; 3]; 16] = [
 pub struct RaceColor(pub [u8; 3]);
 
 impl RaceColor {
+    #[cfg(feature = "visual")]
     pub fn as_srgba(self, alpha: f32) -> Color {
         Color::srgba_u8(self.0[0], self.0[1], self.0[2], (alpha * 255.0) as u8)
     }

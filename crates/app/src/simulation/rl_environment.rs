@@ -15,7 +15,7 @@ use avian2d::prelude::*;
 use bevy::{ecs::system::SystemState, prelude::*, time::TimeUpdateStrategy};
 use racing_rl::{
     Result,
-    config::{Config, ObservationKind, SpeedNormalization},
+    config::{AnticipationSpec, Config, ObservationKind, SpeedNormalization},
     ensure,
     rollout::{EndReason, Environment, RewardParts, Step},
 };
@@ -30,6 +30,32 @@ fn normalize_signed_speed(speed: f32, scale: f32) -> f32 {
         return 0.;
     }
     normalize_speed(speed, scale).copysign(speed)
+}
+
+/// Pure geometry: local left/forward offsets from the actual vehicle position.
+/// The topology hint follows the same connected branch as physical progress.
+fn future_centerline_coordinates(
+    track: &Track,
+    state: VehicleState,
+    hint_segment: usize,
+    search_radius: usize,
+    spec: &AnticipationSpec,
+) -> [f32; 6] {
+    let projection = track.project_near(state.position, hint_segment, search_radius);
+    let (sin, cos) = f64::from(state.heading).sin_cos();
+    let scale = f64::from(spec.coordinate_scale);
+    let mut coordinates = [0.; 6];
+    for (index, distance) in spec.arc_distances.iter().enumerate() {
+        // f64 addition/modulo avoids overflow even for a large finite preset.
+        let arc = (f64::from(projection.track_distance) + f64::from(*distance))
+            .rem_euclid(f64::from(track.total_length));
+        let point = track.point_at_distance(arc as f32);
+        let dx = f64::from(point.x) - f64::from(state.position.x);
+        let dy = f64::from(point.y) - f64::from(state.position.y);
+        coordinates[2 * index] = ((-sin * dx + cos * dy) / scale).clamp(-1., 1.) as f32;
+        coordinates[2 * index + 1] = ((cos * dx + sin * dy) / scale).clamp(-1., 1.) as f32;
+    }
+    coordinates
 }
 
 pub struct Scene {
@@ -199,6 +225,7 @@ pub struct RacingEnvironment {
     progress_position: Vec2,
     nearest: usize,
     finished: bool,
+    observation_seconds: f64,
 }
 fn movement_is_connected(stored: Vec2, before: Vec2, old: usize, new: usize, count: usize) -> bool {
     stored == before && old != new && ((old + 1) % count == new || (new + 1) % count == old)
@@ -234,6 +261,7 @@ impl RacingEnvironment {
             progress_position: Vec2::ZERO,
             nearest: 0,
             finished: false,
+            observation_seconds: 0.,
         };
         env.reset_state()?;
         Ok(env)
@@ -265,6 +293,35 @@ impl RacingEnvironment {
             "RL spawn overlaps a wall",
         )
     }
+    /// Deterministic geometric reference: pure pursuit with curvature-limited target speed.
+    pub(crate) fn reference_action(&self) -> [f32; 2] {
+        let track = &self.scenes[self.scene_index].track;
+        let projection = track.project(self.state.position);
+        let lookahead = (45. + self.state.speed.abs() * 0.35).clamp(45., 130.);
+        let target = track.point_at_distance(projection.track_distance + lookahead);
+        let delta = target - self.state.position;
+        let forward = Vec2::from_angle(self.state.heading);
+        let curvature = 2. * forward.perp_dot(delta) / delta.length_squared().max(1.);
+        let desired = self.state.speed.max(30.) * curvature;
+        let steering = (desired
+            / super::systems::desired_yaw_rate(self.state.speed, 1., &self.physics)
+                .abs()
+                .max(0.05))
+        .clamp(-1., 1.);
+        let ahead = track.point_at_distance(projection.track_distance + lookahead * 2.);
+        let bend = (target - projection.point)
+            .normalize_or_zero()
+            .angle_to((ahead - target).normalize_or_zero())
+            .abs()
+            / lookahead;
+        let target_speed = (self.physics.max_lateral_acceleration * 0.45 / bend.max(0.001))
+            .sqrt()
+            .clamp(55., 160.);
+        [
+            steering,
+            ((target_speed - self.state.speed) / 25.).clamp(-1., 1.),
+        ]
+    }
     pub fn progress_fraction(&self) -> f32 {
         self.progress.best / self.scenes[self.scene_index].track.total_length
     }
@@ -286,6 +343,7 @@ impl Environment for RacingEnvironment {
         self.env_id
     }
     fn observe(&mut self) -> Result<Vec<f32>> {
+        let observation_started = std::time::Instant::now();
         let scene = &self.scenes[self.scene_index];
         let spec = &self.config.observation;
         let mut obs: Vec<_> = spec
@@ -317,7 +375,17 @@ impl Environment for RacingEnvironment {
                 obs.extend(self.previous_action);
             }
         }
+        if let Some(anticipation) = &spec.anticipation {
+            obs.extend(future_centerline_coordinates(
+                &scene.track,
+                self.state,
+                self.nearest,
+                self.physics.progress_search_radius,
+                anticipation,
+            ));
+        }
         racing_rl::finite(&obs, "environment observation")?;
+        self.observation_seconds += observation_started.elapsed().as_secs_f64();
         Ok(obs)
     }
     fn reset(&mut self) -> Result<Vec<f32>> {
@@ -327,6 +395,9 @@ impl Environment for RacingEnvironment {
     }
     fn episode_id(&self) -> u64 {
         self.episode
+    }
+    fn take_observation_seconds(&mut self) -> f64 {
+        std::mem::take(&mut self.observation_seconds)
     }
     fn step(&mut self, action: [f32; 2]) -> Result<Step> {
         ensure(!self.finished, "step after done: reset this environment")?;
@@ -756,5 +827,155 @@ mod tests {
             assert!(reverse.observation[21] < 0.);
             assert_eq!(&reverse.observation[23..], [0., -0.5]);
         }
+    }
+}
+
+#[cfg(test)]
+mod anticipation_tests {
+    use super::*;
+    use racing_rl::config::{AnticipationSpec, ObservationSpec, SensorLayout};
+
+    #[test]
+    fn local_coordinates_rotate_and_include_lateral_position() {
+        let library = TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let distance = track.total_length * 0.2;
+        let (position, tangent) = track.pose_at_distance(distance);
+        let state = VehicleState {
+            position: position + tangent.perp() * 3.,
+            heading: tangent.to_angle(),
+            speed: 0.,
+        };
+        let projection = track.project(state.position);
+        let spec = AnticipationSpec {
+            arc_distances: [15., 35., 70.],
+            coordinate_scale: 70.,
+        };
+        let actual =
+            future_centerline_coordinates(&track, state, projection.segment_index, 24, &spec);
+        for (i, distance) in spec.arc_distances.iter().enumerate() {
+            let delta =
+                track.point_at_distance(projection.track_distance + distance) - state.position;
+            assert!(
+                (actual[2 * i]
+                    - (delta.dot(tangent.perp()) / spec.coordinate_scale).clamp(-1., 1.))
+                .abs()
+                    < 1e-5
+            );
+            assert!(
+                (actual[2 * i + 1] - (delta.dot(tangent) / spec.coordinate_scale).clamp(-1., 1.))
+                    .abs()
+                    < 1e-5
+            );
+        }
+        let reverse = VehicleState {
+            heading: state.heading + std::f32::consts::PI,
+            ..state
+        };
+        let reversed =
+            future_centerline_coordinates(&track, reverse, projection.segment_index, 24, &spec);
+        for (a, b) in actual.iter().zip(reversed) {
+            assert!((a + b).abs() < 1e-5);
+        }
+    }
+
+    #[test]
+    fn closed_arc_wraps_continuously_and_large_distances_stay_finite() {
+        let library = TrackLibrary::load_default().unwrap();
+        let track = Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let (position, tangent) = track.pose_at_distance(track.total_length - 1.);
+        let state = VehicleState {
+            position,
+            heading: tangent.to_angle(),
+            speed: 400.,
+        };
+        let projection = track.project(position);
+        let spec = AnticipationSpec {
+            arc_distances: [150., 350., 700.],
+            coordinate_scale: 700.,
+        };
+        let actual =
+            future_centerline_coordinates(&track, state, projection.segment_index, 24, &spec);
+        for (i, distance) in spec.arc_distances.iter().enumerate() {
+            let point = track.point_at_distance(
+                (projection.track_distance + distance).rem_euclid(track.total_length),
+            );
+            let delta = point - position;
+            assert!(
+                (actual[2 * i] - (delta.dot(tangent.perp()) / 700.).clamp(-1., 1.)).abs() < 1e-5
+            );
+            assert!((actual[2 * i + 1] - (delta.dot(tangent) / 700.).clamp(-1., 1.)).abs() < 1e-5);
+        }
+        let huge = AnticipationSpec {
+            arc_distances: [1e10, 1e20, f32::MAX],
+            coordinate_scale: f32::MIN_POSITIVE,
+        };
+        let actual =
+            future_centerline_coordinates(&track, state, projection.segment_index, 24, &huge);
+        assert!(actual.iter().all(|v| v.is_finite() && v.abs() <= 1.));
+    }
+
+    #[test]
+    fn environment_has_21_rays_and_31_inputs_without_changing_first_25() {
+        let mut config = Config {
+            num_envs: 1,
+            ..Default::default()
+        };
+        let library = TrackLibrary::load_default().unwrap();
+        let scenes = scenes(&library, &["interlagos".into()], false).unwrap();
+        config.observation =
+            ObservationSpec::default().with_sensor_layout(SensorLayout::FrontDense);
+        let mut original =
+            seeded_environments(scenes.clone(), &config, &SimulationConfig::default(), 9).unwrap();
+        let old = original[0].observe().unwrap();
+        config.observation = config.observation.with_anticipation(true);
+        let mut future =
+            seeded_environments(scenes, &config, &SimulationConfig::default(), 9).unwrap();
+        let observation = future[0].observe().unwrap();
+        assert_eq!(config.observation.angles().len(), 21);
+        assert_eq!(observation.len(), 31);
+        assert_eq!(&observation[..25], old.as_slice());
+        assert!(observation.iter().all(|v| v.is_finite()));
+        let observed = future[0].take_observation_seconds();
+        assert!(observed >= 0. && observed.is_finite());
+        assert_eq!(future[0].take_observation_seconds(), 0.);
+    }
+}
+
+#[cfg(test)]
+mod procedural_reference_tests {
+    use super::*;
+    #[test]
+    fn reference_completes_generated_circuit_with_bounded_real_physics() {
+        let generated = crate::simulation::procedural::generate(&Default::default(), 3).unwrap();
+        let scene = Rc::new(Scene::new(generated.validate().unwrap()));
+        let config = Config {
+            num_envs: 1,
+            timeout_ticks: 3000,
+            ..Default::default()
+        };
+        let mut env = RacingEnvironment::new(
+            0,
+            vec![scene],
+            &config,
+            &SimulationConfig::default(),
+            ChaCha12Rng::seed_from_u64(3),
+        )
+        .unwrap();
+        let mut reason = None;
+        for _ in 0..3000 {
+            let step = env.step(env.reference_action()).unwrap();
+            if step.terminated || step.truncated {
+                reason = step.reason;
+                break;
+            }
+        }
+        assert_eq!(
+            reason,
+            Some(EndReason::Completed),
+            "reference progress={}",
+            env.progress_fraction()
+        );
+        assert_eq!(env.collision_events.translation, 0);
     }
 }

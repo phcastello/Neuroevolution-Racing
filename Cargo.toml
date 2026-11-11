@@ -9,19 +9,9 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 bevy = { version = "0.19.1", default-features = false, features = [
-    "default_app",
-    "2d_bevy_render",
-    "std",
-    "bevy_winit",
-    "default_font",
-    "multi_threaded",
-    # WSLg's Wayland/Vulkan surface is lost during interactive resize with
-    # Bevy 0.19.1; X11/XWayland remains stable and handles monitor selection.
-    "x11",
-    "custom_cursor",
-    "sysinfo_plugin",
+    "std", "async_executor", "multi_threaded", "bevy_color"
 ] }
-avian2d = "0.7.0"
+avian2d = { version = "0.7.0", default-features = false, features = ["2d", "f32", "parry-f32", "parallel", "xpbd_joints"] }
 bevy_egui = "0.42.0"
 egui_plot = "0.37.0"
 serde = { version = "1.0", features = ["derive"] }

@@ -1,11 +1,14 @@
 //! CLI orchestration. GA commands and all historical formats remain separate.
 mod console;
+pub(crate) mod curriculum;
 mod evaluation;
 #[cfg(test)]
 mod experiment_tests;
+mod performance;
 mod persistence_policy;
 mod session_budget;
 mod telemetry;
+#[cfg(feature = "visual")]
 pub(crate) mod viewer;
 use crate::simulation::{
     SimulationConfig, TrackLibrary,
@@ -33,6 +36,11 @@ use std::{
     path::{Path, PathBuf},
     time::Instant,
 };
+
+static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn interruption_requested() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Subcommand)]
 pub enum RlCommand {
@@ -126,6 +134,10 @@ fn run_inner(command: RlCommand) -> Result<()> {
             resume,
             mut persistence,
         } => {
+            ctrlc::set_handler(|| {
+                INTERRUPTED.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+            .map_err(|e| racing_rl::Error::Invalid(format!("interrupt handler: {e}")))?;
             persistence.started = Some(command_started);
             ensure(
                 persistence.wall_time_seconds.is_none() || resume.is_some(),
@@ -164,7 +176,17 @@ fn run_inner(command: RlCommand) -> Result<()> {
             ensure(frames.is_none_or(|f| f > 0), "viewer frames > 0")?;
             let saved: Checkpoint = persistence::load(&checkpoint)?;
             saved.validate()?;
-            viewer::view(saved, checkpoint, cars, track, frames)
+            #[cfg(feature = "visual")]
+            {
+                viewer::view(saved, checkpoint, cars, track, frames)
+            }
+            #[cfg(not(feature = "visual"))]
+            {
+                let _ = (saved, checkpoint, cars, track, frames);
+                Err(racing_rl::Error::Invalid(
+                    "viewer requires --features visual".into(),
+                ))
+            }
         }
     }
 }
@@ -191,16 +213,7 @@ fn validate_resume(requested: &Config, saved: &Config) -> Result<()> {
 }
 fn dispatch(c: &Config, job: Job) -> Result<()> {
     match c.device {
-        DeviceChoice::Cpu => execute::<Cpu>(
-            c,
-            job,
-            &Default::default(),
-            &format!(
-                "Burn 0.20.1 NdArray f32; CPU={}; OS={}",
-                std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unreported".into()),
-                std::env::consts::OS
-            ),
-        ),
+        DeviceChoice::Cpu => execute::<Cpu>(c, job, &Default::default(), &backend::cpu_label()),
         DeviceChoice::Gpu { adapter } => {
             #[cfg(feature = "rl-gpu")]
             {
@@ -220,7 +233,7 @@ fn dispatch(c: &Config, job: Job) -> Result<()> {
 fn library() -> Result<TrackLibrary> {
     TrackLibrary::load_default().map_err(|e| racing_rl::Error::Invalid(e.to_string()))
 }
-fn resolve_config(mut c: Config) -> Result<Config> {
+pub(crate) fn resolve_config(mut c: Config) -> Result<Config> {
     let library = library()?;
     if c.training_tracks.is_empty() {
         c.training_tracks = library.training_tracks().map(|d| d.id.clone()).collect();
@@ -291,6 +304,7 @@ struct SaveContext<'a> {
     completed_rollouts: u64,
     decisions: u64,
     physical_ticks: u64,
+    curriculum_ron: Option<String>,
 }
 fn checkpoint<B: Backend>(
     network: &Network<B>,
@@ -305,8 +319,9 @@ fn checkpoint<B: Backend>(
         completed_rollouts,
         decisions,
         physical_ticks,
+        curriculum_ron,
     } = context;
-    Ok(Checkpoint{format:"racing-ppo".into(),version:1,config:config.clone(),features:config.observation.features(),parameter_shapes:network.parameters().iter().map(|p|p.dims()).collect(),parameters:network.snapshot()?,policy_version:network.version(),optimizer:optimizer.snapshot()?,rngs:rngs.clone(),completed_rollouts,decisions,physical_ticks,rendered_frames:0,backend:backend.into(),trained:optimizer.step>0,physics_ron:ron::to_string(physics).map_err(|e|racing_rl::Error::Invalid(e.to_string()))?,resume_policy:"restore parameters/optimizer/RNG; restart every environment; no exact trajectory continuation".into()})
+    Ok(Checkpoint{curriculum_ron,format:"racing-ppo".into(),version:1,config:config.clone(),features:config.observation.features(),parameter_shapes:network.parameters().iter().map(|p|p.dims()).collect(),parameters:network.snapshot()?,policy_version:network.version(),optimizer:optimizer.snapshot()?,rngs:rngs.clone(),completed_rollouts,decisions,physical_ticks,rendered_frames:0,backend:backend.into(),trained:optimizer.step>0,physics_ron:ron::to_string(physics).map_err(|e|racing_rl::Error::Invalid(e.to_string()))?,resume_policy:"restore parameters/optimizer/RNG; restart every environment; no exact trajectory continuation".into()})
 }
 #[derive(Serialize)]
 struct Manifest<'a> {
@@ -372,6 +387,10 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
     label: &str,
     clock: C,
 ) -> Result<()> {
+    let run_started = match &job {
+        Job::Train(_, options) => options.started.unwrap_or_else(Instant::now),
+        _ => Instant::now(),
+    };
     println!(
         "{label}\nN={} T={} N*T={} M={} E={} D={} estimated={:.3} MiB",
         c.num_envs,
@@ -408,7 +427,21 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             let o = Optimizer::new(c.optimizer.clone(), &n.parameters());
             (n, o, physics(), Rngs::new(c), 0, 0, 0)
         };
-    let scenes = env::scenes(&library, &c.training_tracks, false)?;
+    let saved_curriculum = match &job {
+        Job::Train(Some(path), _) => persistence::load::<Checkpoint>(path)?.curriculum_ron,
+        _ => None,
+    };
+    ensure(
+        completed == 0 || c.curriculum.is_none() || saved_curriculum.is_some(),
+        "resume missing curriculum state",
+    )?;
+    let mut curriculum = curriculum::CurriculumState::decode(saved_curriculum.as_deref(), c)?;
+    let original_scenes = env::scenes(&library, &c.training_tracks, false)?;
+    let scenes = if let Some(options) = &c.curriculum {
+        curriculum.scenes(&original_scenes, options)?
+    } else {
+        original_scenes.clone()
+    };
     let mut envs = env::environments(scenes, c, &p, &rngs.environments)?;
     // Validate held-out suite too, before creating a run.
     let _evaluation = env::scenes(&library, &c.evaluation_tracks, true)?;
@@ -422,6 +455,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
         }
     }
     manifest(&dir, c, &p, label, &library)?;
+    let mut performance = performance::Performance::start(&dir, c, label, run_started)?;
     let mut log = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -542,6 +576,10 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
         source_ready = true;
     }
     for _ in 0..count {
+        if interruption_requested() {
+            stop_reason = "interrupted_at_rollout_boundary";
+            break;
+        }
         let next_completed = completed + u64::from(train);
         let evaluation_due = train
             && persistence
@@ -552,6 +590,9 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             break;
         }
         let rollout_start = Instant::now();
+        let mut measured_update_seconds = 0.;
+        let mut measured_persistence_seconds = 0.;
+        let optimizer_step_start = optimizer.step;
         let mut stop_after_rollout = false;
         // This decision gates files/snapshots only. Collection, every update,
         // RNG advancement, counters and telemetry still run for every rollout.
@@ -596,6 +637,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                 device,
             )?;
             backend::sync::<B>(device)?;
+            let update_compute_seconds = start.elapsed().as_secs_f64();
             let log_std = read(network.log_std.clone())?;
             ensure(log_std.len() == 2, "telemetry log_std shape")?;
             let update = telemetry::UpdateTelemetry::from_metrics(
@@ -610,7 +652,8 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                 writer.flush()?;
             }
             writeln!(log, "update_telemetry={update:?}")?;
-            let update_seconds = start.elapsed().as_secs_f64();
+            let update_seconds = update_compute_seconds;
+            measured_update_seconds = update_seconds;
             writeln!(log, "update_seconds={update_seconds}")?;
             print!(
                 "{}",
@@ -635,9 +678,20 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             completed += 1;
         }
         rngs.environments = envs.iter().map(|e| e.rng.clone()).collect();
+        if train
+            && c.curriculum
+                .as_ref()
+                .is_some_and(|options| options.due(completed))
+        {
+            curriculum.activate(&network, c, &p, device, completed, &dir)?;
+            let scenes = curriculum.scenes(&original_scenes, c.curriculum.as_ref().unwrap())?;
+            envs = env::environments(scenes, c, &p, &rngs.environments)?;
+            // Environment reconstruction consumes only each environment's private stream.
+            rngs.environments = envs.iter().map(|e| e.rng.clone()).collect();
+        }
         budget.observe_rollout(rollout_start.elapsed().as_secs_f64());
         latest_evaluated = false;
-        if save_heavy {
+        if save_heavy || (train && interruption_requested()) {
             let save_start = Instant::now();
             let saved = checkpoint(
                 &network,
@@ -650,6 +704,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                     completed_rollouts: completed,
                     decisions,
                     physical_ticks: ticks,
+                    curriculum_ron: curriculum.encode(c)?,
                 },
             )?;
             let checkpoint_path = dir.join(format!("checkpoint-{completed:06}.ron"));
@@ -673,6 +728,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                 persistence::save(&dir.join(format!("rollout-{completed:06}.ron")), &r)?;
             }
             let seconds = save_start.elapsed().as_secs_f64();
+            measured_persistence_seconds = seconds;
             budget.observe_persistence(seconds);
             writeln!(
                 log,
@@ -730,6 +786,15 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
         metrics.flush()?;
         track_metrics.flush()?;
         log.flush()?;
+        performance.record(
+            next_completed,
+            r.transitions.len(),
+            &r.timings,
+            measured_update_seconds,
+            measured_persistence_seconds,
+            rollout_start.elapsed().as_secs_f64(),
+            optimizer.step - optimizer_step_start,
+        )?;
         if bounded {
             let best_description = best.as_ref().map_or_else(
                 || "not_evaluated".into(),
@@ -759,6 +824,25 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             break;
         }
     }
+    if train && !bounded && !dir.join(format!("checkpoint-{completed:06}.ron")).exists() {
+        let final_save_started = Instant::now();
+        let saved = checkpoint(
+            &network,
+            &optimizer,
+            SaveContext {
+                config: c,
+                physics: &p,
+                rngs: &rngs,
+                backend: label,
+                completed_rollouts: completed,
+                decisions,
+                physical_ticks: ticks,
+                curriculum_ron: curriculum.encode(c)?,
+            },
+        )?;
+        persistence::save(&dir.join(format!("checkpoint-{completed:06}.ron")), &saved)?;
+        performance.record_final_persistence(final_save_started.elapsed().as_secs_f64())?;
+    }
     if bounded {
         // Mandatory final snapshot at a complete rollout boundary, including an
         // off-interval budget stop (or initialization that exhausted the budget).
@@ -779,16 +863,18 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
                     completed_rollouts: completed,
                     decisions,
                     physical_ticks: ticks,
+                    curriculum_ron: curriculum.encode(c)?,
                 },
             )?;
             persistence::save(&final_path, &saved)?;
             if let Some(losses) = &last_losses {
                 persistence::save(&dir.join(format!("losses-{completed:06}.ron")), losses)?;
             }
+            let final_save_seconds = start.elapsed().as_secs_f64();
+            performance.record_final_persistence(final_save_seconds)?;
             writeln!(
                 log,
-                "final_persistence_wall_seconds={:.6}",
-                start.elapsed().as_secs_f64()
+                "final_persistence_wall_seconds={final_save_seconds:.6}"
             )?;
             let path = std::fs::canonicalize(&final_path)?;
             let writer = index.as_mut().unwrap();
@@ -868,6 +954,7 @@ fn execute_with_clock<B: Backend, C: session_budget::Clock>(
             final_path.display()
         );
     }
+    performance.finish(stop_reason)?;
     println!("run={}", dir.display());
     Ok(())
 }
@@ -1054,6 +1141,7 @@ fn benchmark<B: Backend>(c: &Config, device: &B::Device, label: &str) -> Result<
     }
     let dir = persistence::run_directory(Path::new(&c.results_root))?;
     manifest(&dir, c, &p, label, &library)?;
+
     persistence::save(&dir.join("benchmark.ron"), &rows)?;
     println!("benchmark={}", dir.display());
     Ok(())

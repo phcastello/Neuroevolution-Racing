@@ -6,6 +6,38 @@ pub enum ObservationKind {
     Legacy6,
     Extended { ray_angles_degrees: Vec<f32> },
 }
+/// Experimental ray layouts. Angles, rather than this label, are persisted.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SensorLayout {
+    Original,
+    FrontDense,
+}
+impl SensorLayout {
+    pub fn angles(self) -> Vec<f32> {
+        match self {
+            Self::Original => (0..21).map(|i| 90. - i as f32 * 9.).collect(),
+            Self::FrontDense => vec![
+                90., 80., 60., 45., 33., 25., 18., 12., 7., 3., 0., -3., -7., -12., -18., -25.,
+                -33., -45., -60., -80., -90.,
+            ],
+        }
+    }
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AnticipationSpec {
+    /// Fixed forward arc distances, in world units, measured from the projection.
+    pub arc_distances: [f32; 3],
+    /// The same positive scale applies to lateral and longitudinal coordinates.
+    pub coordinate_scale: f32,
+}
+impl Default for AnticipationSpec {
+    fn default() -> Self {
+        Self {
+            arc_distances: [150., 350., 700.],
+            coordinate_scale: 700.,
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Feature {
     pub name: String,
@@ -23,6 +55,9 @@ pub struct ObservationSpec {
     #[serde(default)]
     pub speed_normalization: SpeedNormalization,
     pub angular_speed_scale: f32,
+    /// Historical checkpoints omit this field and retain their exact observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anticipation: Option<AnticipationSpec>,
 }
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SpeedNormalization {
@@ -41,10 +76,23 @@ impl Default for ObservationSpec {
             speed_scale: 250.0,
             speed_normalization: SpeedNormalization::LinearClamp,
             angular_speed_scale: 2.15,
+            anticipation: None,
         }
     }
 }
 impl ObservationSpec {
+    pub fn with_sensor_layout(mut self, layout: SensorLayout) -> Self {
+        self.version = 2;
+        self.kind = ObservationKind::Extended {
+            ray_angles_degrees: layout.angles(),
+        };
+        self
+    }
+    pub fn with_anticipation(mut self, enabled: bool) -> Self {
+        self.version = 2;
+        self.anticipation = enabled.then(AnticipationSpec::default);
+        self
+    }
     pub fn angles(&self) -> Vec<f32> {
         match &self.kind {
             ObservationKind::Legacy6 => vec![60., 30., 0., -30., -60.],
@@ -58,6 +106,7 @@ impl ObservationSpec {
             } else {
                 4
             }
+            + if self.anticipation.is_some() { 6 } else { 0 }
     }
     /// Ordered metadata is persisted; this method accepts no privileged environment state.
     pub fn features(&self) -> Vec<Feature> {
@@ -100,10 +149,35 @@ impl ObservationSpec {
                 });
             }
         }
+        if let Some(anticipation) = &self.anticipation {
+            for (point, distance) in anticipation.arc_distances.iter().enumerate() {
+                for axis in ["lateral", "longitudinal"] {
+                    features.push(Feature {
+                        name: format!("future_centerline_{point}_{axis}"),
+                        source: format!("current track centerline, +{distance} world units of arc from vehicle projection, vehicle frame"),
+                        unit: "world unit".into(),
+                        normalization: format!("clamp(coordinate/{},-1,1)", anticipation.coordinate_scale),
+                    });
+                }
+            }
+        }
         features
     }
     pub fn validate(&self) -> Result<()> {
-        ensure(self.version == 1, "observation version")?;
+        ensure(matches!(self.version, 1 | 2), "observation version")?;
+        if let Some(a) = &self.anticipation {
+            ensure(
+                self.version == 2 && matches!(self.kind, ObservationKind::Extended { .. }),
+                "anticipation requires version 2 Extended observations",
+            )?;
+            ensure(
+                a.coordinate_scale.is_finite()
+                    && a.coordinate_scale > 0.
+                    && a.arc_distances.iter().all(|d| d.is_finite() && *d > 0.)
+                    && a.arc_distances.windows(2).all(|w| w[0] < w[1]),
+                "anticipation distances/scales must be positive, finite, increasing",
+            )?;
+        }
         ensure(
             !matches!(self.kind, ObservationKind::Legacy6)
                 || self.speed_normalization == SpeedNormalization::LinearClamp,
@@ -183,10 +257,75 @@ pub enum OptimizerKind {
 pub enum LogStdMode {
     GlobalPerActionDimension,
 }
+/// Optional bounded curriculum. Separate from PPO mathematics and environment RNGs.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum CurriculumKind {
+    Random,
+    Difficulty,
+    Aco,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct CurriculumConfig {
+    pub kind: CurriculumKind,
+    pub seed: u64,
+    pub warmup: u64,
+    pub interval: u64,
+    pub ants: usize,
+    pub iterations: usize,
+    pub selected: usize,
+    pub archive_limit: usize,
+    pub evaluation_ticks: u64,
+    /// Existing, fresh random, selected, historical. Entries are sampling weights.
+    pub mix: [usize; 4],
+}
+impl Default for CurriculumConfig {
+    fn default() -> Self {
+        Self {
+            kind: CurriculumKind::Aco,
+            seed: 660,
+            warmup: 100,
+            interval: 50,
+            ants: 8,
+            iterations: 3,
+            selected: 4,
+            archive_limit: 24,
+            evaluation_ticks: 6000,
+            mix: [5, 2, 2, 1],
+        }
+    }
+}
+impl CurriculumConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure(
+            self.interval > 0
+                && self.ants > 0
+                && self.iterations > 0
+                && self
+                    .ants
+                    .checked_mul(self.iterations)
+                    .is_some_and(|n| n <= 24)
+                && self.selected > 0
+                && self.selected <= 4
+                && self.archive_limit >= self.selected
+                && self.archive_limit <= 256
+                && self.evaluation_ticks > 0
+                && self.evaluation_ticks <= 10800
+                && self.mix[0] > 0
+                && self.mix.iter().all(|n| *n <= 32),
+            "invalid bounded curriculum budget/mix",
+        )
+    }
+    pub fn due(&self, completed: u64) -> bool {
+        completed >= self.warmup && (completed - self.warmup).is_multiple_of(self.interval)
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub curriculum: Option<CurriculumConfig>,
     pub device: DeviceChoice,
     pub observation: ObservationSpec,
     pub reward: RewardConfig,
@@ -228,6 +367,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
+            curriculum: None,
             device: DeviceChoice::Cpu,
             observation: ObservationSpec::default(),
             reward: RewardConfig::default(),
@@ -293,6 +433,9 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         ensure(self.version == 1, "config version")?;
+        if let Some(curriculum) = &self.curriculum {
+            curriculum.validate()?;
+        }
         self.observation.validate()?;
         ensure(
             !self.hidden.is_empty()

@@ -248,6 +248,28 @@ impl TrackLibrary {
         self.definitions.get(id)
     }
 
+    /// Adds a generated training circuit without touching held-out suite membership.
+    pub fn insert_generated(&mut self, definition: TrackDefinition) -> Result<(), TrackLoadError> {
+        if definition.role != TrackRole::Training || !definition.id.starts_with("generated_") {
+            return Err(TrackLoadError::new(
+                "generated circuits must be training-only with a generated_ identifier",
+            ));
+        }
+        Track::from_definition(&definition)?;
+        if let Some(existing) = self.definitions.get(&definition.id) {
+            return if existing == &definition {
+                Ok(())
+            } else {
+                Err(TrackLoadError::new(
+                    "generated track identifier conflicts with existing geometry",
+                ))
+            };
+        }
+        self.training_ids.push(definition.id.clone());
+        self.definitions.insert(definition.id.clone(), definition);
+        Ok(())
+    }
+
     pub fn training_tracks(&self) -> impl ExactSizeIterator<Item = &TrackDefinition> {
         self.training_ids
             .iter()
@@ -659,6 +681,31 @@ fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_registration_cannot_change_held_out_membership() {
+        let mut library = TrackLibrary::load_default().unwrap();
+        let validation: Vec<_> = library.validation_tracks().map(|t| t.id.clone()).collect();
+        let count = library.training_tracks().len();
+        let generated = super::super::procedural::generate(&Default::default(), 47).unwrap();
+        library
+            .insert_generated(generated.definition.clone())
+            .unwrap();
+        library
+            .insert_generated(generated.definition.clone())
+            .unwrap();
+        assert_eq!(library.training_tracks().len(), count + 1);
+        assert_eq!(
+            library
+                .validation_tracks()
+                .map(|t| t.id.clone())
+                .collect::<Vec<_>>(),
+            validation
+        );
+        let mut invalid = generated.definition;
+        invalid.role = TrackRole::Validation;
+        assert!(library.insert_generated(invalid).is_err());
+    }
 
     fn definition(control_points: Vec<[f32; 2]>) -> TrackDefinition {
         TrackDefinition {

@@ -5,8 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["visual"]
+visual = ["bevy/default_app", "bevy/2d_bevy_render", "bevy/bevy_winit", "bevy/default_font", "bevy/x11", "bevy/custom_cursor", "bevy/sysinfo_plugin", "dep:bevy_egui", "dep:egui_plot", "avian2d/debug-plugin"]
 rl-gpu = ["racing-rl/gpu"]
+cpu-parallel = ["racing-rl/cpu-parallel"]
 
 [[bin]]
 name = "neuroevolution-racing"
@@ -15,8 +17,8 @@ path = "src/main.rs"
 [dependencies]
 avian2d.workspace = true
 bevy.workspace = true
-bevy_egui.workspace = true
-egui_plot.workspace = true
+bevy_egui = { workspace = true, optional = true }
+egui_plot = { workspace = true, optional = true }
 neuroevolution = { path = "../neuroevolution" }
 racing-rl = { path = "../rl" }
 serde.workspace = true
@@ -25,3 +27,5 @@ clap.workspace = true
 bincode.workspace = true
 rand_chacha.workspace = true
 rand = "0.10.2"
+serde_json = "1"
+ctrlc = "3.5"

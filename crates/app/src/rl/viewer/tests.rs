@@ -75,6 +75,7 @@ fn saved_policy(config: &Config, update: u64) -> Checkpoint {
             completed_rollouts: update,
             decisions: update * config.rollout_size() as u64,
             physical_ticks: update * config.rollout_size() as u64 * config.action_repeat as u64,
+            curriculum_ron: None,
         },
     )
     .unwrap()
@@ -520,10 +521,7 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
     for _ in 0..3 {
         app.update();
     }
-    assert_eq!(
-        app.world().non_send_resource::<Viewer>().cars[0].decisions,
-        0
-    );
+    assert_eq!(app.world().non_send::<Viewer>().cars[0].decisions, 0);
     assert!(app.world().resource::<Time<Virtual>>().is_paused());
     assert!(
         !app.world()
@@ -537,16 +535,13 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
     for _ in 0..3 {
         app.update();
     }
-    assert!(app.world().non_send_resource::<Viewer>().cars[0].decisions > 0);
+    assert!(app.world().non_send::<Viewer>().cars[0].decisions > 0);
     app.world_mut().resource_mut::<ViewerControls>().paused = true;
-    let before_pause = integrity(app.world().non_send_resource::<Viewer>());
+    let before_pause = integrity(app.world().non_send::<Viewer>());
     for _ in 0..3 {
         app.update();
     }
-    assert_eq!(
-        integrity(app.world().non_send_resource::<Viewer>()),
-        before_pause
-    );
+    assert_eq!(integrity(app.world().non_send::<Viewer>()), before_pause);
     {
         let mut controls = app.world_mut().resource_mut::<ViewerControls>();
         controls.checkpoint_requested = Some(second.clone());
@@ -555,7 +550,7 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
         controls.speed = 20.0;
     }
     app.update();
-    let viewer = app.world().non_send_resource::<Viewer>();
+    let viewer = app.world().non_send::<Viewer>();
     assert_eq!(viewer.checkpoint_path, second);
     assert_eq!(viewer.track_id, training);
     assert_eq!(viewer.config, next_config);
@@ -591,22 +586,16 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
         app.world().resource::<Time<Fixed>>().overstep(),
         Duration::ZERO
     );
-    assert_eq!(
-        app.world().non_send_resource::<Viewer>().cars[1].decisions,
-        0
-    );
-    let before_invalid = integrity(app.world().non_send_resource::<Viewer>());
+    assert_eq!(app.world().non_send::<Viewer>().cars[1].decisions, 0);
+    let before_invalid = integrity(app.world().non_send::<Viewer>());
     app.world_mut()
         .resource_mut::<ViewerControls>()
         .checkpoint_requested = Some(directory.0.join("missing.ron"));
     app.update();
-    assert_eq!(
-        integrity(app.world().non_send_resource::<Viewer>()),
-        before_invalid
-    );
+    assert_eq!(integrity(app.world().non_send::<Viewer>()), before_invalid);
     assert!(
         app.world()
-            .non_send_resource::<Viewer>()
+            .non_send::<Viewer>()
             .error
             .as_deref()
             .is_some_and(|e| e.contains("Checkpoint"))

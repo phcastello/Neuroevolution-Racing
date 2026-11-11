@@ -1,3 +1,6 @@
+pub(crate) mod experiment_dashboard;
+pub(crate) mod search_dashboard;
+pub(crate) use dashboard::{draw_camera_controls, draw_dashboard, draw_display_controls};
 mod checkpoint_browser;
 mod dashboard;
 mod fitness_plot;
@@ -16,6 +19,9 @@ pub struct DashboardPlugin;
 
 impl Plugin for DashboardPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(EguiPrimaryContextPass, dashboard_system);
+        app.add_systems(
+            EguiPrimaryContextPass,
+            dashboard_system.run_if(crate::visual::ga_active),
+        );
     }
 }

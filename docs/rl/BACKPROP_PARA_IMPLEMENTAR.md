@@ -1,3 +1,5 @@
+> Nota histórica: o backward manual e Adam já estão implementados e cobertos por testes. Para a infraestrutura atual, veja [pesquisa](../PESQUISA.md) e [Servidor47](../SERVIDOR_47.md). As referências a implementação pendente abaixo descrevem a etapa anterior do projeto.
+
 # Backpropagation explícito: cinco funções implementadas
 
 As cinco funções estão implementadas em **`crates/rl/src/manual.rs`**, com operações tensoriais vetorizadas e comentários em português. Toda a matemática do backward permanece nesse arquivo, sem autodiferenciação, derivadas em shaders ou diferenças finitas no treino. O nome histórico deste documento foi preservado como guia de estudo.

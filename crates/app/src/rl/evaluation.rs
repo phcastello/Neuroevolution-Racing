@@ -157,6 +157,13 @@ struct TrackSummary {
     timeout: usize,
     progress_mean: f64,
     progress_max: f32,
+    progress_median: f64,
+    progress_p10: f64,
+    progress_p90: f64,
+    completion_rate: f64,
+    completed_lap_seconds_mean: Option<f64>,
+    #[serde(skip)]
+    progress_samples: Vec<f64>,
     reward_sum: f64,
     reward_mean: f64,
     decisions: u64,
@@ -169,6 +176,26 @@ impl TrackSummary {
         self.track_role.clone_from(&e.track_role);
         self.episodes += 1;
         self.completed += usize::from(e.completed);
+        self.completion_rate = self.completed as f64 / self.episodes as f64;
+        if e.completed {
+            self.completed_lap_seconds_mean = Some(
+                self.completed_lap_seconds_mean.unwrap_or(0.)
+                    + (e.simulated_seconds - self.completed_lap_seconds_mean.unwrap_or(0.))
+                        / self.completed as f64,
+            );
+        }
+        self.progress_samples.push(e.progress as f64);
+        self.progress_samples.sort_by(f64::total_cmp);
+        let percentile = |p: f64| {
+            let at = p * (self.progress_samples.len() - 1) as f64;
+            let lo = at.floor() as usize;
+            let hi = at.ceil() as usize;
+            self.progress_samples[lo]
+                + (self.progress_samples[hi] - self.progress_samples[lo]) * (at - lo as f64)
+        };
+        self.progress_median = percentile(0.5);
+        self.progress_p10 = percentile(0.1);
+        self.progress_p90 = percentile(0.9);
         self.collision += usize::from(e.collision);
         self.timeout += usize::from(e.timeout);
         self.progress_mean += (e.progress as f64 - self.progress_mean) / self.episodes as f64;
@@ -297,6 +324,48 @@ pub(super) fn evaluate<B: Backend>(
             tracks: &tracks,
         },
     )?;
+    let report = EvaluationReport {
+        version: 1,
+        options: &options,
+        environment_seed_root,
+        action_seed_root,
+        policy_version: saved.policy_version,
+        tracks: &tracks,
+    };
+    std::fs::write(
+        dir.join("evaluation_summary.json"),
+        serde_json::to_string_pretty(&report)
+            .map_err(|e| racing_rl::Error::Invalid(e.to_string()))?,
+    )?;
+    let mut csv = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join("evaluation.csv"))?;
+    writeln!(
+        csv,
+        "track,role,episodes,completion_rate,progress_mean,progress_median,progress_p10,progress_p90,collisions,timeouts,completed_lap_seconds_mean,reward_mean"
+    )?;
+    for t in &tracks {
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            csv_string(&t.track),
+            csv_string(&t.track_role),
+            t.episodes,
+            t.completion_rate,
+            t.progress_mean,
+            t.progress_median,
+            t.progress_p10,
+            t.progress_p90,
+            t.collision,
+            t.timeout,
+            t.completed_lap_seconds_mean
+                .map(|x| x.to_string())
+                .unwrap_or_default(),
+            t.reward_mean
+        )?;
+    }
+    csv.sync_all()?;
     println!(
         "evaluation={} episodes={} mode={:?} trained={}",
         dir.display(),

@@ -1,27 +1,27 @@
+mod aco;
+#[cfg(feature = "visual")]
 mod display;
 mod experiment;
+#[cfg(feature = "visual")]
 mod rendering;
+mod research;
 mod rl;
 mod simulation;
+#[cfg(feature = "visual")]
 mod ui;
+#[cfg(feature = "visual")]
+mod visual;
 
 use std::{path::PathBuf, process::ExitCode, time::Duration};
 
 use avian2d::prelude::*;
 use bevy::{
     app::{ScheduleRunnerPlugin, TaskPoolOptions, TaskPoolPlugin},
-    asset::AssetPlugin,
-    diagnostic::FrameTimeDiagnosticsPlugin,
     prelude::*,
-    window::WindowResolution,
 };
-use bevy_egui::EguiPlugin;
 use clap::{Parser, Subcommand};
-use display::DisplayPlugin;
 use experiment::{WorkerOptions, WorkerRuntime, mark_run_failed, prepare_worker, run_batch};
-use rendering::RenderingPlugin;
 use simulation::{SimulationPlugin, TrackLibrary, TrainingFastForward, TrainingSetup};
-use ui::DashboardPlugin;
 
 #[derive(Parser)]
 #[command(name = "neuroevolution-racing", version, about)]
@@ -36,6 +36,16 @@ enum CommandLine {
     Rl {
         #[command(subcommand)]
         command: rl::RlCommand,
+    },
+    /// Deterministic procedural tracks and headless Ant Colony Optimization.
+    Aco {
+        #[command(subcommand)]
+        command: aco::cli::AcoCommand,
+    },
+    /// Procedural search, factorial experiments and hardware preparation.
+    Research {
+        #[command(subcommand)]
+        command: research::ResearchCommand,
     },
     /// Launches one isolated worker process per configured experiment run.
     Batch { config: PathBuf },
@@ -67,11 +77,10 @@ enum CommandLine {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        None => {
-            run_interactive();
-            Ok(())
-        }
+        None => run_interactive(),
         Some(CommandLine::Batch { config }) => run_batch(&config),
+        Some(CommandLine::Research { command }) => research::run(command),
+        Some(CommandLine::Aco { command }) => aco::cli::run(command),
         Some(CommandLine::Rl { command }) => rl::run(command),
         Some(CommandLine::Worker {
             name,
@@ -109,39 +118,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn run_interactive() {
-    App::new()
-        .insert_resource(ClearColor(Color::srgb(0.035, 0.075, 0.055)))
-        .add_plugins(
-            DefaultPlugins
-                .set(AssetPlugin {
-                    file_path: asset_directory(),
-                    ..default()
-                })
-                .set(WindowPlugin {
-                    primary_window: Some(Window {
-                        title: "Neuroevolution Racing".into(),
-                        resolution: WindowResolution::new(1400, 850),
-                        resizable: true,
-                        ..default()
-                    }),
-                    ..default()
-                }),
-        )
-        .add_plugins(PhysicsPlugins::default().with_length_unit(20.0))
-        .insert_resource(Gravity::ZERO)
-        .add_plugins(FrameTimeDiagnosticsPlugin::default())
-        .add_plugins(EguiPlugin::default())
-        .add_plugins((
-            SimulationPlugin::interactive(),
-            DisplayPlugin,
-            RenderingPlugin,
-            DashboardPlugin,
-        ))
-        .run();
+fn run_interactive() -> Result<(), String> {
+    #[cfg(feature = "visual")]
+    {
+        visual::run()
+    }
+    #[cfg(not(feature = "visual"))]
+    {
+        Err("Visual modes require --features visual; headless PPO uses `rl train`.".into())
+    }
 }
 
-/// Both visual modes resolve the same assets independently of the launch directory.
+/// All visual modes resolve the same assets independently of the launch directory.
+#[cfg(feature = "visual")]
 pub(crate) fn asset_directory() -> String {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets")

@@ -22,7 +22,10 @@ impl Plugin for PpoDashboardPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PpoCheckpointBrowser>()
             .init_resource::<PpoDashboardState>()
-            .add_systems(EguiPrimaryContextPass, ppo_dashboard_system);
+            .add_systems(
+                EguiPrimaryContextPass,
+                ppo_dashboard_system.run_if(crate::visual::playback_active),
+            );
     }
 }
 
