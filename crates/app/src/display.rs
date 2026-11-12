@@ -410,6 +410,7 @@ fn update_camera_view(
     test_drive: Option<Res<TestDriveSettings>>,
     shell: Option<Res<crate::visual::Shell>>,
     followed_car: Query<(&Transform, &CarObservation), With<SelectedCar>>,
+    aco_bounds: Option<Res<crate::rendering::aco_preview::AcoPreviewBounds>>,
     mut state: ResMut<CameraViewState>,
 ) {
     let Ok(window) = window.single() else {
@@ -454,8 +455,18 @@ fn update_camera_view(
     }
 
     if !state.initialized || resized || scene_changed || track.is_changed() || state.fit_requested {
-        let bounds = if scene == Some((SimulationMode::TestDrive, TestDriveEnvironment::OpenField))
+        let bounds = if shell
+            .as_ref()
+            .is_some_and(|s| s.mode == crate::visual::Mode::Aco)
         {
+            aco_bounds
+                .as_ref()
+                .and_then(|b| b.0)
+                .unwrap_or(TrackBounds {
+                    min: Vec2::splat(-500.),
+                    max: Vec2::splat(500.),
+                })
+        } else if scene == Some((SimulationMode::TestDrive, TestDriveEnvironment::OpenField)) {
             TrackBounds {
                 min: Vec2::splat(-600.0),
                 max: Vec2::splat(600.0),

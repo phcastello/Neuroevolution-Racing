@@ -34,7 +34,7 @@ use super::{
 
 // Array order is left -> right, matching the future MLP input contract.
 const SENSOR_ANGLES: [f32; 5] = [FRAC_PI_3, FRAC_PI_6, 0.0, -FRAC_PI_6, -FRAC_PI_3];
-const WALL_THICKNESS: f32 = 14.0;
+const WALL_THICKNESS: f32 = super::WALL_THICKNESS;
 const MIN_GRIP_SPEED: f32 = 10.0;
 const CANONICAL_START_DISTANCE: f32 = 16.0;
 const CANONICAL_INITIAL_SPEED: f32 = 45.0;

@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     dashboard::{draw_camera_controls, draw_dashboard, draw_display_controls},
-    ppo_checkpoint_browser::{PpoCheckpointBrowser, draw_policy_history},
+    ppo_checkpoint_browser::draw_policy_history,
     ppo_network_view::draw_ppo_network,
 };
 
@@ -20,12 +20,10 @@ pub(crate) struct PpoDashboardPlugin;
 
 impl Plugin for PpoDashboardPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<PpoCheckpointBrowser>()
-            .init_resource::<PpoDashboardState>()
-            .add_systems(
-                EguiPrimaryContextPass,
-                ppo_dashboard_system.run_if(crate::visual::playback_active),
-            );
+        app.init_resource::<PpoDashboardState>().add_systems(
+            EguiPrimaryContextPass,
+            ppo_dashboard_system.run_if(crate::visual::playback_active),
+        );
     }
 }
 
@@ -47,7 +45,7 @@ fn ppo_dashboard_system(
     mut contexts: EguiContexts,
     viewer: NonSend<Viewer>,
     mut controls: ResMut<ViewerControls>,
-    mut browser: ResMut<PpoCheckpointBrowser>,
+    mut shell: ResMut<crate::visual::Shell>,
     mut state: ResMut<PpoDashboardState>,
     track: Res<Track>,
     library: Res<TrackLibrary>,
@@ -58,6 +56,7 @@ fn ppo_dashboard_system(
     diagnostics: Res<DiagnosticsStore>,
 ) -> Result {
     let ctx = contexts.ctx_mut()?;
+    let browser = &mut shell.checkpoint_browser;
     browser.sync_source(&viewer.checkpoint_path, &viewer.saved.config.results_root);
     draw_dashboard(
         ctx,
@@ -229,7 +228,7 @@ fn ppo_dashboard_system(
             ui.separator();
             draw_policy_history(
                 ui,
-                &mut browser,
+                browser,
                 &viewer.checkpoint_path,
                 &mut controls.checkpoint_requested,
             );

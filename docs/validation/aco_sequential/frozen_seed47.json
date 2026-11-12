@@ -1,0 +1,70 @@
+{
+  "seed": 47,
+  "ants": 2,
+  "iterations": 2,
+  "candidates": 4,
+  "reference_completed": 4,
+  "policy_completed": 0,
+  "evaluation_steps": 7685,
+  "episodes": [
+    {
+      "completion_rate": 0.0,
+      "mean_progress": 0.11479867249727249,
+      "collision_rate": 1.0,
+      "reference_completed": true,
+      "simulation_steps": 2177,
+      "reference_steps": 1986,
+      "policy_steps": 191,
+      "reference_progress": 1.0,
+      "policy_episodes": 1,
+      "id": "generated_43833e8731e40244",
+      "iteration": 0,
+      "ant": 0
+    },
+    {
+      "completion_rate": 0.0,
+      "mean_progress": 0.26006683707237244,
+      "collision_rate": 1.0,
+      "reference_completed": true,
+      "simulation_steps": 1648,
+      "reference_steps": 1401,
+      "policy_steps": 247,
+      "reference_progress": 1.0,
+      "policy_episodes": 1,
+      "id": "generated_d76b70df93b7fd97",
+      "iteration": 0,
+      "ant": 1
+    },
+    {
+      "completion_rate": 0.0,
+      "mean_progress": 0.21000511944293976,
+      "collision_rate": 1.0,
+      "reference_completed": true,
+      "simulation_steps": 1338,
+      "reference_steps": 1156,
+      "policy_steps": 182,
+      "reference_progress": 1.0,
+      "policy_episodes": 1,
+      "id": "generated_f60e031c046f6ca6",
+      "iteration": 1,
+      "ant": 0
+    },
+    {
+      "completion_rate": 0.0,
+      "mean_progress": 0.34205567836761475,
+      "collision_rate": 1.0,
+      "reference_completed": true,
+      "simulation_steps": 2522,
+      "reference_steps": 2019,
+      "policy_steps": 503,
+      "reference_progress": 1.0,
+      "policy_episodes": 1,
+      "id": "generated_498918d167a4bff9",
+      "iteration": 1,
+      "ant": 1
+    }
+  ],
+  "checkpoint_sha256": "952e25a69c517157558f1544c9b3a3c497cefa3ef934ec4de728c89877279c29",
+  "checkpoint_unchanged": true,
+  "source": "target/sequential-frozen47-1794434611211/search/search.ron"
+}

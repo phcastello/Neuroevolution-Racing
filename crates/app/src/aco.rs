@@ -1,6 +1,11 @@
 //! Max-Min Ant System on a layered decision graph (sector radius choices + width).
 //! The search has no access to training/validation libraries or PPO optimizers.
 pub mod cli;
+pub mod inspection;
+#[cfg(test)]
+mod inspection_tests;
+pub mod live;
+use inspection::{GeometryDiagnostic, RetentionPolicy};
 
 use crate::simulation::procedural::{self, GeneratedTrack, GenerationResult, GeneratorConfig};
 use rand::{RngExt, SeedableRng};
@@ -23,6 +28,7 @@ pub enum FitnessObjective {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AcoConfig {
+    #[serde(default = "GeneratorConfig::legacy")]
     pub generator: GeneratorConfig,
     pub ants: usize,
     pub iterations: usize,
@@ -45,6 +51,7 @@ pub struct AcoConfig {
     pub target_progress: f64,
     /// Identity of the frozen training policy; never a validation checkpoint score.
     pub policy_label: Option<String>,
+    pub retention: RetentionPolicy,
 }
 impl Default for AcoConfig {
     fn default() -> Self {
@@ -69,12 +76,18 @@ impl Default for AcoConfig {
             fitness_objective: FitnessObjective::UsefulProgress,
             target_progress: 0.7,
             policy_label: None,
+            retention: RetentionPolicy::default(),
         }
     }
 }
 impl AcoConfig {
     pub fn validate(&self) -> GenerationResult<()> {
         self.generator.validate()?;
+        if self.retention.detailed_candidates > 100_000
+            || self.retention.pheromone_iterations > 10_000
+        {
+            return Err("invalid retention limits".into());
+        }
         if self.ants == 0
             || self.ants > 256
             || self.iterations == 0
@@ -117,6 +130,8 @@ pub struct DecisionSnapshot {
     pub position: usize,
     pub choice: usize,
     pub probabilities: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub construction: Option<procedural::sequential::ConstructionView>,
 }
 /// Aggregate of frozen policy episodes; the reference pilot is independent of PPO.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -184,10 +199,14 @@ pub struct FitnessComponents {
     pub useful_difficulty: f64,
     #[serde(default)]
     pub episodes: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organic_quality: Option<f64>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RejectionReason {
     InvalidGeometry,
+    ClosureInfeasible,
+    CorridorClearance,
     SelfIntersection,
     CurvatureLimit,
     Duplicate,
@@ -197,10 +216,15 @@ pub enum RejectionReason {
     InsufficientBudget,
     ExecutionFailure,
     NumericalError,
+    SelectionCapacity,
 }
 impl RejectionReason {
     fn geometry(message: &str) -> Self {
-        if message.contains("intersect") {
+        if message.contains("closure") {
+            Self::ClosureInfeasible
+        } else if message.contains("corridor") || message.contains("border gap") {
+            Self::CorridorClearance
+        } else if message.contains("intersect") {
             Self::SelfIntersection
         } else if message.contains("curvature") {
             Self::CurvatureLimit
@@ -222,6 +246,14 @@ pub struct AntSnapshot {
     pub rejection_reason: Option<RejectionReason>,
     #[serde(default)]
     pub evaluation: Option<PilotEvaluation>,
+    #[serde(default)]
+    pub geometry_valid: Option<bool>,
+    #[serde(default)]
+    pub diagnostic: Option<GeometryDiagnostic>,
+    #[serde(default)]
+    pub retention_evicted: bool,
+    #[serde(default)]
+    pub candidate_id: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IterationSnapshot {
@@ -281,6 +313,8 @@ pub struct AcoState {
     pub selected: Vec<RankedTrack>,
     pub seen_hashes: BTreeSet<String>,
     pub decision_archive: Vec<Vec<usize>>,
+    #[serde(default)]
+    pub geometry_archive: Vec<Vec<f32>>,
     #[serde(with = "saved_rng")]
     construction_rng: ChaCha12Rng,
     #[serde(with = "saved_rng")]
@@ -292,6 +326,11 @@ pub struct SearchArchive {
     pub config: AcoConfig,
     pub state: AcoState,
     pub iterations: Vec<IterationSnapshot>,
+    #[serde(default)]
+    pub inspection_version: u32,
+    /// Inspection-only records from a UI save made before an iteration completed.
+    #[serde(default)]
+    pub in_progress: Vec<AntSnapshot>,
 }
 /// Caller owns the immutable network and independent environment RNGs. There is
 /// deliberately no optimizer or mutable policy argument at this boundary.
@@ -335,14 +374,17 @@ impl SearchArchive {
             selected: Vec::new(),
             seen_hashes: BTreeSet::new(),
             decision_archive: Vec::new(),
+            geometry_archive: Vec::new(),
             construction_rng: ChaCha12Rng::seed_from_u64(seed ^ 0x41434f5f434f4e53),
             evaluation_rng: ChaCha12Rng::seed_from_u64(seed ^ 0x41434f5f4556414c),
         };
         Ok(Self {
-            version: 1,
+            version: config.generator.version(),
             config,
             state,
             iterations: Vec::new(),
+            inspection_version: 1,
+            in_progress: vec![],
         })
     }
     pub fn is_finished(&self) -> bool {
@@ -351,9 +393,21 @@ impl SearchArchive {
     }
     pub fn run_iteration(
         &mut self,
+        evaluator: Option<&mut dyn CandidateEvaluator>,
+    ) -> GenerationResult<&IterationSnapshot> {
+        self.run_iteration_observed(evaluator, &mut live::Unobserved)
+    }
+    /// The headless and interactive paths execute exactly the same search code.
+    /// Observers can block at safe boundaries, or cancel by returning an error.
+    pub fn run_iteration_observed(
+        &mut self,
         mut evaluator: Option<&mut dyn CandidateEvaluator>,
+        observer: &mut dyn live::SearchObserver,
     ) -> GenerationResult<&IterationSnapshot> {
         self.validate()?;
+        if !self.in_progress.is_empty() {
+            return Err("partial inspection snapshot: replay/export available; restart search to construct a new iteration".into());
+        }
         if self.is_finished() {
             return Err("ACO configured iteration/candidate budget exhausted".into());
         }
@@ -392,9 +446,16 @@ impl SearchArchive {
             if evaluator.is_some() && remaining_steps == 0 {
                 break;
             }
+            observer.checkpoint()?;
+            observer.event(live::SearchEvent::AntStarted {
+                iteration: self.state.iteration,
+                ant,
+                pheromones: self.state.pheromones.clone(),
+            })?;
             self.state.candidates += 1;
             let generation_started = Instant::now();
-            let decisions = self.construct();
+            let mut terminal = None;
+            let decisions = self.construct_observed(observer, &mut terminal)?;
             let choices: Vec<_> = decisions.iter().map(|d| d.choice).collect();
             let candidate = procedural::from_decisions(
                 &self.config.generator,
@@ -402,6 +463,15 @@ impl SearchArchive {
                 self.state.candidates - 1,
                 &choices,
             );
+            let raw_definition =
+                procedural::definition_from_decisions(&self.config.generator, &choices).ok();
+            if let Some(definition) = raw_definition.clone() {
+                observer.event(live::SearchEvent::Geometry {
+                    definition,
+                    error: candidate.as_ref().err().cloned(),
+                })?;
+            }
+            observer.checkpoint()?;
             generation_seconds += generation_started.elapsed().as_secs_f64();
             let mut snapshot = AntSnapshot {
                 ant,
@@ -411,9 +481,19 @@ impl SearchArchive {
                 fitness: None,
                 rejection_reason: None,
                 evaluation: None,
+                geometry_valid: Some(candidate.is_ok()),
+                diagnostic: None,
+                retention_evicted: false,
+                candidate_id: candidate.as_ref().ok().map(|c| c.definition.id.clone()),
             };
             match candidate {
                 Err(reason) => {
+                    snapshot.diagnostic = Some(GeometryDiagnostic::capture(
+                        raw_definition,
+                        &snapshot.decisions,
+                        terminal,
+                        &reason,
+                    ));
                     snapshot.rejection_reason = Some(RejectionReason::geometry(&reason));
                     snapshot.rejection = Some(reason);
                 }
@@ -424,14 +504,30 @@ impl SearchArchive {
                         snapshot.rejection = Some("duplicate geometry hash".into());
                         snapshot.rejection_reason = Some(RejectionReason::Duplicate);
                         snapshot.candidate = Some(candidate);
+                        observer.event(live::SearchEvent::Candidate(snapshot.clone()))?;
                         ants.push(snapshot);
                         continue;
                     }
-                    let diversity = decision_diversity(&choices, &self.state.decision_archive);
+                    let diversity = if self.config.generator.is_sequential() {
+                        self.state
+                            .geometry_archive
+                            .iter()
+                            .map(|other| {
+                                procedural::sequential::descriptor_distance(
+                                    &candidate.geometry.descriptor,
+                                    other,
+                                ) as f64
+                            })
+                            .min_by(f64::total_cmp)
+                            .unwrap_or(1.)
+                    } else {
+                        decision_diversity(&choices, &self.state.decision_archive)
+                    };
                     if diversity < self.config.minimum_diversity {
                         snapshot.rejection = Some("near-duplicate decision signature".into());
                         snapshot.rejection_reason = Some(RejectionReason::InsufficientDiversity);
                         snapshot.candidate = Some(candidate);
+                        observer.event(live::SearchEvent::Candidate(snapshot.clone()))?;
                         ants.push(snapshot);
                         continue;
                     }
@@ -449,6 +545,7 @@ impl SearchArchive {
                                 Some("insufficient budget for reference and policy".into());
                             snapshot.rejection_reason = Some(RejectionReason::InsufficientBudget);
                             snapshot.candidate = Some(candidate);
+                            observer.event(live::SearchEvent::Candidate(snapshot.clone()))?;
                             ants.push(snapshot);
                             continue;
                         }
@@ -463,6 +560,9 @@ impl SearchArchive {
                                     snapshot.rejection = Some(error);
                                     snapshot.rejection_reason =
                                         Some(RejectionReason::NumericalError);
+                                    snapshot.candidate = Some(candidate);
+                                    observer
+                                        .event(live::SearchEvent::Candidate(snapshot.clone()))?;
                                     ants.push(snapshot);
                                     continue;
                                 }
@@ -518,7 +618,7 @@ impl SearchArchive {
                     } else {
                         None
                     };
-                    let score = if let Some(e) = &evaluation {
+                    let mut score = if let Some(e) = &evaluation {
                         match self.config.fitness_objective {
                             FitnessObjective::UsefulProgress => {
                                 0.7 * useful_difficulty(
@@ -538,7 +638,21 @@ impl SearchArchive {
                     } else {
                         0.4 * geometry + 0.6 * diversity
                     };
+                    let organic_quality = (self.config.generator.is_sequential()
+                        && self.config.generator.organic)
+                        .then(|| {
+                            let m = &candidate.geometry.organic;
+                            (0.35 * m.complexity
+                                + 0.25 * (1. - m.rectangularity)
+                                + 0.20 * m.heading_entropy
+                                + 0.20 * (1. - (m.longest_straight_ratio / 0.45).min(1.)))
+                                as f64
+                        });
+                    if let Some(quality) = organic_quality {
+                        score = 0.8 * score + 0.2 * quality;
+                    }
                     let fitness = FitnessComponents {
+                        organic_quality,
                         completion_rate: evaluation
                             .as_ref()
                             .filter(|e| e.policy_episodes > 0)
@@ -574,6 +688,14 @@ impl SearchArchive {
                             .selected
                             .sort_by(|a, b| b.fitness.score.total_cmp(&a.fitness.score));
                         self.state.selected.truncate(self.config.max_selected);
+                        if self.config.generator.is_sequential() {
+                            self.state
+                                .geometry_archive
+                                .push(candidate.geometry.descriptor.clone());
+                            if self.state.geometry_archive.len() > 256 {
+                                self.state.geometry_archive.remove(0);
+                            }
+                        }
                         self.state.decision_archive.push(choices);
                         if self.state.decision_archive.len() > 256 {
                             self.state.decision_archive.remove(0);
@@ -582,8 +704,10 @@ impl SearchArchive {
                     snapshot.candidate = Some(candidate);
                 }
             }
+            observer.event(live::SearchEvent::Candidate(snapshot.clone()))?;
             ants.push(snapshot);
         }
+        observer.checkpoint()?;
         let pheromone_update_started = Instant::now();
         // Only accepted solutions deposit. Evaporation is observable separately.
         if self.config.strategy == SearchStrategy::AntColony {
@@ -595,10 +719,26 @@ impl SearchArchive {
         }
         let evaporated = self.state.pheromones.clone();
         if self.config.strategy == SearchStrategy::AntColony {
-            if let Some(best) = self.state.selected.first() {
-                for (position, choice) in best.track.provenance.decisions.iter().enumerate() {
-                    let p = &mut self.state.pheromones[position][*choice];
-                    *p = (*p + self.config.evaporation * (0.25 + best.fitness.score))
+            let elite = if self.config.generator.is_sequential() {
+                ants.iter()
+                    .filter(|a| a.rejection.is_none())
+                    .filter_map(|a| a.candidate.as_ref().zip(a.fitness.as_ref()))
+                    .max_by(|a, b| a.1.score.total_cmp(&b.1.score))
+                    .or_else(|| self.state.selected.first().map(|b| (&b.track, &b.fitness)))
+            } else {
+                self.state.selected.first().map(|b| (&b.track, &b.fitness))
+            };
+            if let Some((track, fitness)) = elite {
+                for (position, choice) in track.provenance.decisions.iter().enumerate() {
+                    let row = if self.config.generator.is_sequential()
+                        && position + 1 == track.provenance.decisions.len()
+                    {
+                        self.config.generator.sectors
+                    } else {
+                        position
+                    };
+                    let p = &mut self.state.pheromones[row][*choice];
+                    *p = (*p + self.config.evaporation * (0.25 + fitness.score))
                         .min(self.config.pheromone_max);
                 }
             }
@@ -660,11 +800,51 @@ impl SearchArchive {
         };
         self.state.iteration += 1;
         self.iterations.push(snapshot);
+        let selected_ids: BTreeSet<_> = self
+            .state
+            .selected
+            .iter()
+            .map(|s| s.track.definition.id.clone())
+            .collect();
+        for it in &mut self.iterations {
+            for a in &mut it.ants {
+                if a.rejection.is_none()
+                    && a.candidate_id
+                        .as_ref()
+                        .or_else(|| a.candidate.as_ref().map(|c| &c.definition.id))
+                        .is_some_and(|id| !selected_ids.contains(id))
+                {
+                    a.rejection_reason = Some(RejectionReason::SelectionCapacity);
+                    a.rejection = Some(
+                        "Geometria válida; score abaixo das vagas disponíveis na seleção".into(),
+                    );
+                }
+            }
+        }
+        self.apply_retention();
+        if observer.is_observing() {
+            observer.event(live::SearchEvent::Iteration {
+                archive: Box::new(self.clone()),
+            })?;
+        }
         Ok(self.iterations.last().unwrap())
     }
+    #[cfg(test)]
     fn construct(&mut self) -> Vec<DecisionSnapshot> {
+        self.construct_observed(&mut live::Unobserved, &mut None)
+            .unwrap()
+    }
+    fn construct_observed(
+        &mut self,
+        observer: &mut dyn live::SearchObserver,
+        terminal: &mut Option<procedural::sequential::ConstructionView>,
+    ) -> GenerationResult<Vec<DecisionSnapshot>> {
+        if self.config.generator.is_sequential() {
+            return self.construct_sequential(observer, terminal);
+        }
         let mut decisions: Vec<DecisionSnapshot> = Vec::new();
         for position in 0..self.state.pheromones.len() {
+            observer.checkpoint()?;
             let log_weights = self.state.pheromones[position]
                 .iter()
                 .enumerate()
@@ -709,18 +889,130 @@ impl SearchArchive {
                     sample < cumulative
                 })
                 .unwrap_or(probabilities.len() - 1);
-            decisions.push(DecisionSnapshot {
+            let decision = DecisionSnapshot {
                 position,
                 choice,
                 probabilities,
-            });
+                construction: None,
+            };
+            decisions.push(decision.clone());
+            observer.event(live::SearchEvent::Decision(decision))?;
         }
-        decisions
+        Ok(decisions)
+    }
+    fn construct_sequential(
+        &mut self,
+        observer: &mut dyn live::SearchObserver,
+        terminal: &mut Option<procedural::sequential::ConstructionView>,
+    ) -> GenerationResult<Vec<DecisionSnapshot>> {
+        use procedural::sequential::Construction;
+        let config = &self.config.generator;
+        let mut state = Construction::new(config);
+        let mut decisions = vec![];
+        while !state.closed() && state.used < config.sectors {
+            observer.checkpoint()?;
+            let mut options = state.options(config, &mut || observer.checkpoint())?;
+            let log_weights: Vec<_> = options
+                .iter()
+                .enumerate()
+                .map(|(choice, a)| {
+                    if a.next.is_none() {
+                        f64::NEG_INFINITY
+                    } else if self.config.strategy == SearchStrategy::RandomDifficulty {
+                        0.
+                    } else {
+                        self.config.alpha * self.state.pheromones[state.used][choice].ln()
+                            + self.config.beta * a.eta.ln()
+                    }
+                })
+                .collect();
+            let weights = weights_from_logs(&log_weights);
+            if weights.iter().sum::<f64>() == 0. {
+                *terminal = Some(state.view(
+                    state.points().len(),
+                    options.iter().map(|a| a.view.clone()).collect(),
+                ));
+                return Ok(decisions);
+            }
+            let probabilities = choice_probabilities(
+                &weights,
+                if self.config.strategy == SearchStrategy::AntColony {
+                    self.config.exploitation_probability
+                } else {
+                    0.
+                },
+            );
+            let sample = self.state.construction_rng.random::<f64>();
+            let mut total = 0.;
+            let choice = probabilities
+                .iter()
+                .position(|p| {
+                    total += p;
+                    sample < total
+                })
+                .unwrap_or_else(|| probabilities.iter().rposition(|p| *p > 0.).unwrap());
+            let start = state.points().len();
+            let position = state.used;
+            let views = options.iter().map(|a| a.view.clone()).collect();
+            state = options[choice].next.take().unwrap();
+            let decision = DecisionSnapshot {
+                position,
+                choice,
+                probabilities,
+                construction: Some(state.view(start, views)),
+            };
+            decisions.push(decision.clone());
+            observer.event(live::SearchEvent::Decision(decision))?;
+        }
+        if state.closed() {
+            observer.checkpoint()?;
+            let row = config.sectors;
+            let logs = self.state.pheromones[row]
+                .iter()
+                .map(|p| {
+                    if self.config.strategy == SearchStrategy::RandomDifficulty {
+                        0.
+                    } else {
+                        self.config.alpha * p.ln()
+                    }
+                })
+                .collect::<Vec<_>>();
+            let weights = weights_from_logs(&logs);
+            let probabilities = choice_probabilities(
+                &weights,
+                if self.config.strategy == SearchStrategy::AntColony {
+                    self.config.exploitation_probability
+                } else {
+                    0.
+                },
+            );
+            let sample = self.state.construction_rng.random::<f64>();
+            let mut total = 0.;
+            let choice = probabilities
+                .iter()
+                .position(|p| {
+                    total += p;
+                    sample < total
+                })
+                .unwrap_or(probabilities.len() - 1);
+            let decision = DecisionSnapshot {
+                position: row,
+                choice,
+                probabilities,
+                construction: Some(state.view(state.points().len(), vec![])),
+            };
+            decisions.push(decision.clone());
+            observer.event(live::SearchEvent::Decision(decision))?;
+        }
+        Ok(decisions)
     }
     pub fn validate(&self) -> GenerationResult<()> {
         self.config.validate()?;
-        if self.version != 1
-            || self.state.pheromones.len() != self.config.generator.sectors + 1
+        if self.inspection_version > 1 {
+            return Err("unsupported inspection metadata version".into());
+        }
+        if self.version != self.config.generator.version()
+            || self.state.pheromones.len() != self.config.generator.choice_counts().len()
             || self
                 .state
                 .pheromones
@@ -743,6 +1035,12 @@ impl SearchArchive {
         }
         if self.state.selected.len() > self.config.max_selected
             || self.state.decision_archive.len() > 256
+            || self.state.geometry_archive.len() > 256
+            || self
+                .state
+                .geometry_archive
+                .iter()
+                .any(|d| d.len() != 40 || d.iter().any(|v| !v.is_finite()))
         {
             return Err("saved ACO archive exceeds configured bounds".into());
         }
@@ -763,19 +1061,18 @@ impl SearchArchive {
                 .chain(selected.fitness.completion_rate)
                 .chain(selected.fitness.mean_progress)
                 .chain(selected.fitness.collision_rate)
+                .chain(selected.fitness.organic_quality)
                 .any(|x| !x.is_finite() || !(0.0..=1.).contains(&x))
             {
                 return Err("saved ACO selected-track provenance/fitness is invalid".into());
             }
         }
-        let counts = self.config.generator.choice_counts();
-        if self.state.decision_archive.iter().any(|choices| {
-            choices.len() != counts.len()
-                || choices
-                    .iter()
-                    .zip(&counts)
-                    .any(|(choice, count)| choice >= count)
-        }) {
+        if self
+            .state
+            .decision_archive
+            .iter()
+            .any(|choices| !self.config.generator.decisions_valid(choices))
+        {
             return Err("saved ACO decision archive shape is invalid".into());
         }
         Ok(())
@@ -805,6 +1102,35 @@ impl SearchArchive {
         }
         Ok(ids)
     }
+}
+fn weights_from_logs(logs: &[f64]) -> Vec<f64> {
+    let max = logs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    logs.iter()
+        .map(|log| {
+            if log.is_finite() && max.is_finite() {
+                (log - max).exp()
+            } else {
+                0.
+            }
+        })
+        .collect()
+}
+fn choice_probabilities(weights: &[f64], exploitation: f64) -> Vec<f64> {
+    let max = weights.iter().copied().fold(0., f64::max);
+    let scaled = weights.iter().map(|w| w / max).collect::<Vec<_>>();
+    let sum = scaled.iter().sum::<f64>();
+    let mut p = scaled
+        .iter()
+        .map(|w| w / sum * (1. - exploitation))
+        .collect::<Vec<_>>();
+    let best = weights
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .unwrap()
+        .0;
+    p[best] += exploitation;
+    p
 }
 fn useful_difficulty(progress: f64, target: f64) -> f64 {
     if progress <= target {
@@ -895,6 +1221,7 @@ mod tests {
         assert!(useful_difficulty(0.7, 0.7) > useful_difficulty(1., 0.7));
         let mut search = SearchArchive::new(
             AcoConfig {
+                generator: GeneratorConfig::legacy(),
                 ants: 4,
                 iterations: 1,
                 max_candidates: 4,
@@ -919,6 +1246,7 @@ mod tests {
     #[test]
     fn probabilistic_deterministic_bounded_real_pheromone_updates() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             ants: 4,
             iterations: 2,
             max_candidates: 8,
@@ -958,7 +1286,8 @@ mod tests {
         for ant in &s.ants {
             for d in &ant.decisions {
                 assert!((d.probabilities.iter().sum::<f64>() - 1.).abs() < 1.0e-10);
-                assert!(d.probabilities.iter().all(|p| *p > 0.));
+                assert!(d.probabilities.iter().all(|p| *p >= 0.));
+                assert!(d.probabilities[d.choice] > 0.);
             }
         }
         assert!(a.run_iteration(None).is_err());
@@ -966,6 +1295,7 @@ mod tests {
     #[test]
     fn saved_rng_resumes_exact_decisions_and_selected_tracks() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             ants: 3,
             iterations: 2,
             max_candidates: 6,
@@ -984,6 +1314,7 @@ mod tests {
     #[test]
     fn unverified_reference_is_distinct_and_evaluation_budget_enforced() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             ants: 4,
             iterations: 1,
             max_candidates: 4,
@@ -1040,6 +1371,7 @@ mod tests {
     #[test]
     fn construction_and_evaluation_rngs_are_isolated() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             ants: 3,
             iterations: 1,
             max_candidates: 3,
@@ -1070,6 +1402,7 @@ mod tests {
     #[test]
     fn extreme_pheromone_ranges_keep_selection_probabilities_finite() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             ants: 1,
             iterations: 1,
             max_candidates: 1,
@@ -1095,6 +1428,7 @@ mod tests {
     #[test]
     fn random_difficulty_has_equal_candidate_budget_without_pheromone_learning() {
         let config = AcoConfig {
+            generator: GeneratorConfig::legacy(),
             strategy: SearchStrategy::RandomDifficulty,
             ants: 3,
             iterations: 1,

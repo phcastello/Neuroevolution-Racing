@@ -1,0 +1,19 @@
+(
+    generator: (
+        shape: Sequential,
+        sectors: 26,
+        organic: true,
+        width_geometry_version: 1,
+        widths: [96.0, 100.0, 104.0],
+        primitive_radius: 75.0,
+        minimum_border_gap: 12.0,
+        min_length: 1800.0,
+        max_length: 10000.0,
+        max_curvature: 0.02094,
+    ),
+    ants: 2,
+    iterations: 2,
+    max_candidates: 4,
+    max_selected: 4,
+    fitness_objective: UsefulProgress,
+)

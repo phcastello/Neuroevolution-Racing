@@ -674,6 +674,15 @@ pub(crate) fn draw_dashboard(
     subtitle: &str,
     contents: impl FnOnce(&mut egui::Ui),
 ) {
+    draw_dashboard_with_toolbar(ctx, subtitle, |_| {}, contents);
+}
+
+pub(crate) fn draw_dashboard_with_toolbar(
+    ctx: &egui::Context,
+    subtitle: &str,
+    toolbar: impl FnOnce(&mut egui::Ui),
+    contents: impl FnOnce(&mut egui::Ui),
+) {
     let viewport_rect = ctx.viewport_rect();
     if !viewport_rect.is_finite() || viewport_rect.width() < 1.0 || viewport_rect.height() < 1.0 {
         return;
@@ -693,6 +702,7 @@ pub(crate) fn draw_dashboard(
                     crate::visual::request_menu(ctx);
                 }
                 ui.heading("Neuroevolution Racing");
+                toolbar(ui);
                 if ui.available_width() > 520.0 {
                     ui.separator();
                     ui.label(subtitle);

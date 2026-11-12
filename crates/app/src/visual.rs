@@ -39,6 +39,7 @@ pub(crate) struct Shell {
     pub cars: usize,
     pub load_policy: bool,
     pub status: String,
+    pub checkpoint_browser: crate::ui::ppo_checkpoint_browser::PpoCheckpointBrowser,
 }
 
 pub(crate) fn ga_active(world: &World) -> bool {
@@ -56,11 +57,15 @@ pub(crate) fn request_menu(ctx: &egui::Context) {
     ctx.data_mut(|data| data.insert_temp(egui::Id::new("visual_menu_requested"), true));
 }
 
-fn base_app() -> App {
+pub(crate) fn base_app() -> App {
     let mut app = App::new();
     app.insert_resource(ClearColor(Color::srgb(0.035, 0.075, 0.055)))
         .add_plugins(
             DefaultPlugins
+                .set(bevy::winit::WinitPlugin {
+                    run_on_any_thread: cfg!(test),
+                    ..default()
+                })
                 .set(AssetPlugin {
                     file_path: crate::asset_directory(),
                     ..default()
@@ -136,7 +141,8 @@ pub(crate) fn run_with_policy(
     }
 }
 
-fn apply_navigation(world: &mut World) {
+pub(crate) fn apply_navigation(world: &mut World) {
+    world.resource_mut::<SearchDashboard>().poll();
     let (pending, load, path, cars, mut track) = {
         let mut shell = world.resource_mut::<Shell>();
         (
@@ -158,6 +164,7 @@ fn apply_navigation(world: &mut World) {
                 .pending_track
                 .take()
         });
+    let mut selection_error = None;
     if let Some(definition) = selected {
         let result = if definition.id.starts_with("generated_") {
             world
@@ -170,15 +177,20 @@ fn apply_navigation(world: &mut World) {
             Ok(selected_track) => {
                 track = definition.id.clone();
                 world.resource_mut::<Shell>().track = track.clone();
-                world.insert_resource(selected_track);
-                world
-                    .resource_mut::<crate::display::CameraViewState>()
-                    .request_fit();
+                // Playback commits its own Track only after the checkpoint loads.
+                if !load {
+                    world.insert_resource(selected_track);
+                    world
+                        .resource_mut::<crate::display::CameraViewState>()
+                        .request_fit();
+                }
             }
-            Err(error) => world.resource_mut::<Shell>().status = error.to_string(),
+            Err(error) => selection_error = Some(error.to_string()),
         }
     }
-    if load {
+    if let Some(error) = selection_error {
+        world.resource_mut::<Shell>().status = error;
+    } else if load {
         let result = persistence::load::<Checkpoint>(&PathBuf::from(&path)).and_then(|saved| {
             viewer::attach(
                 world,
@@ -191,6 +203,7 @@ fn apply_navigation(world: &mut World) {
         });
         match result {
             Ok(()) => {
+                world.resource::<SearchDashboard>().suspend();
                 let mut shell = world.resource_mut::<Shell>();
                 shell.mode = Mode::Ppo;
                 shell.status.clear();
@@ -209,6 +222,9 @@ fn apply_navigation(world: &mut World) {
         }
     }
     if let Some(mode) = pending {
+        if mode != Mode::Aco {
+            world.resource::<SearchDashboard>().suspend();
+        }
         let result = match mode {
             Mode::Ga => {
                 let playback = *world.resource::<simulation::PlaybackState>();
@@ -269,7 +285,7 @@ fn shell_ui(
                 .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).collapsible(false).resizable(false)
                 .show(ctx, |ui| {
                     ui.heading("Escolha o modo");
-                    ui.label("GA treina visualmente. PPO observa políticas congeladas. ACO reproduz a busca de pistas.");
+                    ui.label("GA treina visualmente. PPO observa políticas congeladas. ACO constrói e otimiza pistas ao vivo.");
                     ui.add_space(12.0);
                     for (mode, label) in [(Mode::Ga,"GA · evolução e corridas"),(Mode::Ppo,"PPO · avaliar checkpoint"),(Mode::Aco,"ACO · decisões e pistas"),(Mode::Experiments,"Experimentos · resultados e configurações")] {
                         if ui.add_sized([420.0, 38.0], egui::Button::new(label)).clicked() { shell.pending = Some(mode); }
@@ -287,7 +303,7 @@ fn shell_ui(
         Mode::Aco => search.show(ctx, &mut shell),
         Mode::Experiments => experiments.show(ctx, &mut shell),
     }
-    if matches!(shell.mode, Mode::Aco | Mode::Experiments) {
+    if shell.mode == Mode::Experiments {
         egui::Window::new("Câmera e exibição")
             .default_pos([750.0, 600.0])
             .default_open(false)
@@ -300,14 +316,18 @@ fn shell_ui(
 }
 
 pub(crate) fn policy_input(ui: &mut egui::Ui, shell: &mut Shell) {
-    ui.label("Checkpoint (.ron)");
-    ui.text_edit_singleline(&mut shell.policy_path);
+    ui.push_id("open_policy_picker", |ui| {
+        if crate::ui::ppo_checkpoint_browser::draw_policy_picker(
+            ui,
+            &mut shell.checkpoint_browser,
+            &mut shell.policy_path,
+        ) {
+            shell.load_policy = true;
+        }
+    });
     ui.add(egui::Slider::new(&mut shell.cars, 1..=16).text("Veículos"));
     ui.label("ID da pista (vazio: checkpoint)");
     ui.text_edit_singleline(&mut shell.track);
-    if ui.button("Carregar política").clicked() {
-        shell.load_policy = true;
-    }
     if !shell.status.is_empty() {
         ui.colored_label(egui::Color32::LIGHT_RED, &shell.status);
     }
@@ -358,5 +378,43 @@ mod tests {
         assert!(ga_active(&world));
         world.resource_mut::<Shell>().mode = Mode::Aco;
         assert!(!ga_active(&world));
+    }
+
+    #[test]
+    fn rejected_playback_track_cannot_fall_back_to_the_previous_track() {
+        let mut world = World::new();
+        world.init_resource::<SearchDashboard>();
+        world.init_resource::<ExperimentDashboard>();
+        world.init_resource::<simulation::TrainingFastForward>();
+        world.init_resource::<Time<Virtual>>();
+        let library = simulation::TrackLibrary::load_default().unwrap();
+        let original =
+            simulation::Track::from_definition(library.definition("interlagos").unwrap()).unwrap();
+        let mut invalid = original.definition.clone();
+        invalid.id = "generated_invalid_preview".into();
+        invalid.width = -1.;
+        world.insert_resource(original.clone());
+        world.insert_resource(library);
+        world.insert_resource(Shell {
+            mode: Mode::Aco,
+            load_policy: true,
+            policy_path: "missing-checkpoint.ron".into(),
+            track: "interlagos".into(),
+            cars: 1,
+            ..Default::default()
+        });
+        world.resource_mut::<SearchDashboard>().pending_track = Some(invalid);
+        apply_navigation(&mut world);
+        assert_eq!(world.resource::<Shell>().mode, Mode::Aco);
+        assert!(!world.resource::<Shell>().status.is_empty());
+        assert!(
+            world.resource::<Shell>().status.contains("width"),
+            "track failure must stop before attempting the checkpoint or falling back to the previous track"
+        );
+        assert!(!world.contains_non_send::<Viewer>());
+        assert_eq!(
+            world.resource::<simulation::Track>().definition,
+            original.definition
+        );
     }
 }

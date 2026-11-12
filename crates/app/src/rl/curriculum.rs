@@ -303,6 +303,20 @@ pub fn evaluate_candidate<B: Backend>(
     seed: u64,
     budget: usize,
 ) -> std::result::Result<PilotEvaluation, String> {
+    evaluate_candidate_controlled(n, c, p, device, track, seed, budget, &mut || Ok(()))
+}
+
+fn evaluate_candidate_controlled<B: Backend>(
+    n: &Network<B>,
+    c: &Config,
+    p: &SimulationConfig,
+    device: &B::Device,
+    track: &GeneratedTrack,
+    seed: u64,
+    budget: usize,
+    checkpoint: &mut dyn FnMut() -> std::result::Result<(), String>,
+) -> std::result::Result<PilotEvaluation, String> {
+    checkpoint()?;
     let t = track.validate()?;
     let scene = Rc::new(env::Scene::new(t));
     let mut config = c.clone();
@@ -329,6 +343,7 @@ pub fn evaluate_candidate<B: Backend>(
         ..Default::default()
     };
     for _ in 0..per_pilot {
+        checkpoint()?;
         let started = Instant::now();
         let a = reference.reference_action();
         let step = reference.step(a).map_err(|e| e.to_string())?;
@@ -355,6 +370,7 @@ pub fn evaluate_candidate<B: Backend>(
             .map_err(|e| e.to_string())?;
     result.policy_episodes = 1;
     for _ in 0..per_pilot {
+        checkpoint()?;
         let observation = policy.observe().map_err(|e| e.to_string())?;
         let started = Instant::now();
         let output = n
@@ -386,6 +402,22 @@ pub fn checkpoint_evaluator(path: &Path) -> std::result::Result<impl CandidateEv
     let c = saved.config;
     Ok(move |track: &GeneratedTrack, seed, budget| {
         evaluate_candidate(&n, &c, &p, &device, track, seed, budget)
+    })
+}
+/// Visual ACO uses the identical frozen evaluation with cooperative tick gates.
+pub fn checkpoint_evaluator_controlled(
+    path: &Path,
+    control: crate::aco::live::SearchControl,
+) -> std::result::Result<impl CandidateEvaluator, String> {
+    let saved: Checkpoint = persistence::load(path).map_err(|e| e.to_string())?;
+    control.checkpoint()?;
+    let device = Default::default();
+    let (n, _optimizer, p) = restore::<Cpu>(&saved, &device).map_err(|e| e.to_string())?;
+    let c = saved.config;
+    Ok(move |track: &GeneratedTrack, seed, budget| {
+        evaluate_candidate_controlled(&n, &c, &p, &device, track, seed, budget, &mut || {
+            control.checkpoint()
+        })
     })
 }
 #[cfg(test)]
@@ -468,6 +500,174 @@ mod tests {
         assert!(restore::<Cpu>(&loaded, &Default::default()).is_err());
     }
     #[test]
+    fn live_worker_loads_frozen_checkpoint_and_runs_real_policy_evaluation() {
+        use crate::aco::live::{LiveSearch, RunMode, SearchEvent};
+        let c = Config {
+            hidden: vec![4],
+            num_envs: 1,
+            rollout_length: 2,
+            minibatch_size: 2,
+            timeout_ticks: 10800,
+            ..Default::default()
+        };
+        let network = Network::<Cpu>::new(&c, &Default::default()).unwrap();
+        let optimizer = Optimizer::new(c.optimizer.clone(), &network.parameters());
+        let saved = checkpoint(
+            &network,
+            &optimizer,
+            SaveContext {
+                config: &c,
+                physics: &SimulationConfig::default(),
+                rngs: &Rngs::new(&c),
+                backend: "live-aco-test-cpu",
+                completed_rollouts: 0,
+                decisions: 0,
+                physical_ticks: 0,
+                curriculum_ron: None,
+            },
+        )
+        .unwrap();
+        let root = persistence::run_directory(
+            &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/aco-frozen-worker-test"),
+        )
+        .unwrap();
+        let path = root.join("checkpoint.ron");
+        persistence::save(&path, &saved).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let live = LiveSearch::start(
+            AcoConfig {
+                ants: 1,
+                iterations: 1,
+                max_candidates: 1,
+                max_evaluation_steps: 16000,
+                max_evaluation_steps_per_candidate: 16000,
+                ..Default::default()
+            },
+            47,
+            Some(path.clone()),
+            RunMode::Iteration,
+            120.,
+        )
+        .unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let archive = loop {
+            let mut finished = None;
+            for event in live.poll() {
+                match event {
+                    SearchEvent::Finished { archive } => finished = Some(archive),
+                    SearchEvent::Failed(e) => panic!("{e}"),
+                    _ => (),
+                }
+            }
+            if let Some(a) = finished {
+                break a;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let evaluation = archive.iterations[0].ants[0].evaluation.as_ref().unwrap();
+        assert!(evaluation.reference_completed);
+        assert!(evaluation.policy_steps > 0);
+        assert!(
+            archive
+                .config
+                .policy_label
+                .as_ref()
+                .unwrap()
+                .contains("fnv1a64=")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(network.snapshot().unwrap(), saved.parameters);
+        println!(
+            "frozen worker: reference={} PPO={} decisions; immutable checkpoint",
+            evaluation.reference_steps, evaluation.policy_steps
+        );
+    }
+    #[test]
+    fn evaluation_tick_pause_resume_cancel_and_frozen_network() {
+        use crate::aco::live::{RunMode, SearchControl};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use std::time::Duration;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let control = SearchControl::new(RunMode::Running, 120.);
+        let worker_control = control.clone();
+        let worker_ticks = ticks.clone();
+        let worker = std::thread::spawn(move || {
+            let c = Config {
+                hidden: vec![4],
+                timeout_ticks: 3000,
+                ..Default::default()
+            };
+            let n = Network::<Cpu>::new(&c, &Default::default()).unwrap();
+            let before = n.snapshot().unwrap();
+            let t = procedural::generate(&GeneratorConfig::legacy(), 3).unwrap();
+            let result = evaluate_candidate_controlled(
+                &n,
+                &c,
+                &Default::default(),
+                &Default::default(),
+                &t,
+                7,
+                6000,
+                &mut || {
+                    if worker_ticks.load(Ordering::SeqCst) == 4 {
+                        worker_control.set_mode(RunMode::Paused);
+                    }
+                    worker_control.checkpoint()?;
+                    worker_ticks.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(before, n.snapshot().unwrap());
+            assert!(result.reference_completed && result.policy_steps > 0);
+            assert_eq!(
+                worker_ticks.load(Ordering::SeqCst) as u64,
+                result.simulation_steps + 1
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !control.is_paused() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(ticks.load(Ordering::SeqCst), 4);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(ticks.load(Ordering::SeqCst), 4);
+        control.set_mode(RunMode::Running);
+        worker.join().unwrap();
+        let c = Config {
+            hidden: vec![4],
+            ..Default::default()
+        };
+        let n = Network::<Cpu>::new(&c, &Default::default()).unwrap();
+        let t = procedural::generate(&GeneratorConfig::legacy(), 3).unwrap();
+        let mut count = 0;
+        let error = evaluate_candidate_controlled(
+            &n,
+            &c,
+            &Default::default(),
+            &Default::default(),
+            &t,
+            7,
+            6000,
+            &mut || {
+                count += 1;
+                if count == 5 {
+                    Err("search cancelled".into())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "search cancelled");
+        assert_eq!(count, 5);
+    }
+    #[test]
     fn evaluator_freezes_parameters_and_bounds_work() {
         let c = Config {
             hidden: vec![8],
@@ -476,7 +676,7 @@ mod tests {
         };
         let n = Network::<Cpu>::new(&c, &Default::default()).unwrap();
         let before = n.snapshot().unwrap();
-        let t = procedural::generate(&Default::default(), 3).unwrap();
+        let t = procedural::generate(&GeneratorConfig::legacy(), 3).unwrap();
         let result =
             evaluate_candidate(&n, &c, &Default::default(), &Default::default(), &t, 7, 8).unwrap();
         assert!(result.simulation_steps <= 8);
@@ -527,19 +727,19 @@ mod training_integration_tests {
             minibatch_size: 2,
             update_epochs: 1,
             total_rollouts: 2,
-            timeout_ticks: 3000,
+            timeout_ticks: 10800,
             results_root: root.join("runs").display().to_string(),
             training_tracks: vec!["interlagos".into()],
             curriculum: Some(CurriculumConfig {
                 kind: CurriculumKind::Aco,
                 warmup: 1,
                 interval: 1,
-                ants: 8,
+                ants: 3,
                 iterations: 1,
                 selected: 2,
                 archive_limit: 4,
                 mix: [1, 0, 32, 0],
-                evaluation_ticks: 6000,
+                evaluation_ticks: 10800,
                 ..Default::default()
             }),
             ..Default::default()

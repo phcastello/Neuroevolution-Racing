@@ -433,7 +433,20 @@ pub(crate) fn attach(
         maximum_frames,
     )?;
     world.insert_non_send(viewer);
-    resume(world)
+    resume(world)?;
+    // A new inspection starts a fresh run. Resume of an existing viewer remains
+    // separate and preserves its pause state and preferences.
+    world.init_resource::<ViewerControls>();
+    let network = std::mem::take(&mut world.resource_mut::<ViewerControls>().network);
+    *world.resource_mut::<ViewerControls>() = ViewerControls {
+        network,
+        ..Default::default()
+    };
+    if let Some(mut time) = world.get_resource_mut::<Time<Virtual>>() {
+        time.set_relative_speed(1.);
+        time.unpause();
+    }
+    Ok(())
 }
 
 pub(crate) fn resume(world: &mut World) -> Result<()> {

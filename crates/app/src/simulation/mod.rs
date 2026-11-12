@@ -6,7 +6,7 @@ pub(crate) mod procedural;
 mod race;
 pub(crate) mod rl_environment;
 mod systems;
-mod track;
+pub(crate) mod track;
 mod training;
 
 pub use components::{
@@ -21,7 +21,6 @@ pub use race::{
     latest_checkpoint_indices, sort_race_standings,
 };
 pub(crate) use systems::{desired_yaw_rate, limited_yaw_rate, max_grip_yaw_rate};
-#[cfg(feature = "visual")]
 pub(crate) use track::TrackDefinition;
 #[cfg(test)]
 pub(crate) use track::TrackRole;
@@ -77,6 +76,8 @@ impl TrackSelection {
 
 pub const CAR_LENGTH: f32 = 28.0;
 pub const CAR_WIDTH: f32 = 15.0;
+/// Shared by visible wall strips and Avian colliders, centered on Track borders.
+pub const WALL_THICKNESS: f32 = 14.0;
 
 #[derive(Resource, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationConfig {

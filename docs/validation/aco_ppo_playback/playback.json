@@ -1,0 +1,16 @@
+{
+  "action": [
+    -0.15151172876358032,
+    0.998449981212616
+  ],
+  "checkpoint": "\\\\?\\C:\\Users\\phcastello\\Faculdade\\6o_Periodo\\IA-2\\Neuroevolution-Racing\\target\\aco-ppo-handoff\\1794501995916890300\\checkpoint-004000.ron",
+  "decisions": 16,
+  "paused": false,
+  "physical_ticks": 16,
+  "progress": 0.0012922040186822414,
+  "reason": "None",
+  "rollouts": 4000,
+  "speed": 68.7513656616211,
+  "track": "generated_990a5261d5053c80",
+  "width": 100.0
+}

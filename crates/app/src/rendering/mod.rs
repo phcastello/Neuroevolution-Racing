@@ -2,6 +2,7 @@ use bevy::{
     asset::RenderAssetUsages, ecs::system::SystemParam, mesh::Indices, prelude::*,
     render::render_resource::PrimitiveTopology,
 };
+pub(crate) mod aco_preview;
 
 use crate::simulation::{
     CAR_LENGTH, CAR_WIDTH, Car, CarProgress, EvaluationState, FinishReason, KinematicCar,
@@ -10,7 +11,7 @@ use crate::simulation::{
     TrainingFastForward, TrainingState,
 };
 
-const WALL_THICKNESS: f32 = 14.0;
+const WALL_THICKNESS: f32 = crate::simulation::WALL_THICKNESS;
 const CURB_TARGET_STRIPE_LENGTH: f32 = 18.0;
 const EDGE_MARKER_SPACING: f32 = 44.0;
 const EDGE_MARKER_LENGTH: f32 = 10.0;
@@ -62,6 +63,7 @@ pub enum RenderingSet {
 
 impl Plugin for RenderingPlugin {
     fn build(&self, app: &mut App) {
+        aco_preview::install(app);
         app.init_resource::<CarVisualSettings>()
             .init_resource::<TrackDebug>()
             .add_systems(Startup, load_car_sprite_assets)
@@ -406,12 +408,14 @@ fn rendering_enabled(fast_forward: Option<Res<TrainingFastForward>>) -> bool {
 
 fn apply_turbo_visibility(
     fast_forward: Option<Res<TrainingFastForward>>,
+    shell: Option<Res<crate::visual::Shell>>,
     mut previous: Local<Option<bool>>,
     mut cars: Query<&mut Visibility, (With<Car>, Without<TrackVisual>)>,
     mut track_visuals: Query<&mut Visibility, (With<TrackVisual>, Without<Car>)>,
 ) {
-    let turbo = fast_forward.is_some_and(|fast_forward| fast_forward.is_active());
-    if *previous == Some(turbo) {
+    let turbo = fast_forward.is_some_and(|fast_forward| fast_forward.is_active())
+        || shell.is_some_and(|s| s.mode == crate::visual::Mode::Aco);
+    if *previous == Some(turbo) && !turbo {
         return;
     }
     *previous = Some(turbo);
@@ -557,6 +561,12 @@ fn draw_debug_visuals(
         With<SelectedCar>,
     >,
 ) {
+    if shell
+        .as_ref()
+        .is_some_and(|s| s.mode == crate::visual::Mode::Aco)
+    {
+        return;
+    }
     let (mode, environment) = if shell
         .as_deref()
         .is_some_and(|s| s.mode != crate::visual::Mode::Ga)

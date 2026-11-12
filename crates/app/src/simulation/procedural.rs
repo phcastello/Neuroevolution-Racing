@@ -7,6 +7,9 @@ use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha12Rng;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
+pub mod sequential;
+#[cfg(test)]
+mod width_validation;
 
 pub type GenerationResult<T> = Result<T, String>;
 
@@ -15,10 +18,11 @@ pub enum GeneratorShape {
     #[default]
     Radial,
     RoundedRectangle,
+    Sequential,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default = "GeneratorConfig::legacy", deny_unknown_fields)]
 pub struct GeneratorConfig {
     pub shape: GeneratorShape,
     pub sectors: usize,
@@ -31,25 +35,98 @@ pub struct GeneratorConfig {
     /// Inverse world units. Radius must also exceed half-width plus half car length.
     pub max_curvature: f32,
     pub max_attempts: usize,
+    pub primitive_radius: f32,
+    pub minimum_border_gap: f32,
+    /// Opt in explicitly so archived v2 searches retain their original graph and closure.
+    pub organic: bool,
+    /// Zero preserves validation semantics of existing archived generators.
+    pub width_geometry_version: u32,
 }
 impl Default for GeneratorConfig {
     fn default() -> Self {
         Self {
-            shape: GeneratorShape::Radial,
-            sectors: 12,
+            shape: GeneratorShape::Sequential,
+            sectors: 26,
             radius: 650.,
             radial_levels: vec![0.82, 0.91, 1., 1.09, 1.18],
-            widths: vec![80., 100., 120.],
+            widths: vec![96., 100., 104.],
             samples_per_control_point: 12,
-            min_length: 2800.,
-            max_length: 6200.,
-            max_curvature: 0.012,
+            min_length: 1800.,
+            max_length: 14000.,
+            max_curvature: 0.02094,
             max_attempts: 32,
+            primitive_radius: 75.,
+            minimum_border_gap: 12.,
+            organic: true,
+            width_geometry_version: 1,
         }
     }
 }
 impl GeneratorConfig {
+    pub fn legacy() -> Self {
+        Self {
+            shape: GeneratorShape::Radial,
+            sectors: 12,
+            widths: vec![80., 100., 120.],
+            min_length: 2800.,
+            max_length: 6200.,
+            max_curvature: 0.012,
+            organic: false,
+            primitive_radius: 50.,
+            width_geometry_version: 0,
+            ..Self::default()
+        }
+    }
+    pub fn is_sequential(&self) -> bool {
+        self.shape == GeneratorShape::Sequential
+    }
+    pub fn version(&self) -> u32 {
+        if self.is_sequential() { 2 } else { 1 }
+    }
+    pub fn decisions_valid(&self, decisions: &[usize]) -> bool {
+        if self.is_sequential() {
+            (2..=self.sectors + 1).contains(&decisions.len())
+                && decisions[..decisions.len() - 1].iter().all(|c| {
+                    *c < if self.organic {
+                        sequential::CHOICES
+                    } else {
+                        sequential::LEGACY_CHOICES
+                    }
+                })
+                && decisions.last().is_some_and(|c| *c < self.widths.len())
+        } else {
+            decisions.len() == self.sectors + 1
+                && decisions
+                    .iter()
+                    .zip(self.choice_counts())
+                    .all(|(c, n)| *c < n)
+        }
+    }
     pub fn validate(&self) -> GenerationResult<()> {
+        if self.width_geometry_version > 1 {
+            return Err("unsupported width geometry parameter version".into());
+        }
+        if self.is_sequential() && self.width_geometry_version == 1 {
+            let required = (1. / self.max_curvature)
+                .max(self.widths.iter().copied().fold(0., f32::max) * 0.5 + CAR_LENGTH * 0.5 + 3.);
+            if self.primitive_radius < required {
+                return Err(format!(
+                    "road width requires primitive radius >= {required:.2}; configured {:.2}; width was not reduced",
+                    self.primitive_radius
+                ));
+            }
+        }
+        if !self.primitive_radius.is_finite()
+            || self.primitive_radius < 50.
+            || self.primitive_radius > 1000.
+            || !self.minimum_border_gap.is_finite()
+            || self.minimum_border_gap < 4.
+        {
+            return Err("invalid primitive radius / border clearance".into());
+        }
+        if self.is_sequential() && self.max_length > 100_000. {
+            return Err("sequential length budget must not exceed 100000 world units".into());
+        }
         if (self.shape == GeneratorShape::RoundedRectangle && self.sectors % 4 != 0)
             || !(6..=32).contains(&self.sectors)
             || !(4..=32).contains(&self.samples_per_control_point)
@@ -84,7 +161,18 @@ impl GeneratorConfig {
         Ok(())
     }
     pub fn choice_counts(&self) -> Vec<usize> {
-        let mut counts = vec![self.radial_levels.len(); self.sectors];
+        let mut counts = vec![
+            if self.is_sequential() {
+                if self.organic {
+                    sequential::CHOICES
+                } else {
+                    sequential::LEGACY_CHOICES
+                }
+            } else {
+                self.radial_levels.len()
+            };
+            self.sectors
+        ];
         counts.push(self.widths.len());
         counts
     }
@@ -99,7 +187,7 @@ pub struct GenerationProvenance {
     pub decisions: Vec<usize>,
     pub geometry_hash: String,
 }
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GeometryMetrics {
     pub length: f32,
     pub width: f32,
@@ -107,6 +195,28 @@ pub struct GeometryMetrics {
     pub mean_absolute_curvature: f32,
     pub direction_changes: usize,
     pub spawn_clearance: f32,
+    #[serde(default)]
+    pub longest_straight: f32,
+    #[serde(default)]
+    pub straight_fraction: f32,
+    #[serde(default)]
+    pub turns: usize,
+    #[serde(default)]
+    pub radius_quantiles: [f32; 3],
+    #[serde(default)]
+    pub curvature_variation: f32,
+    #[serde(default)]
+    pub hairpins: usize,
+    #[serde(default)]
+    pub chicanes: usize,
+    #[serde(default)]
+    pub s_bends: usize,
+    #[serde(default)]
+    pub compactness: f32,
+    #[serde(default)]
+    pub descriptor: Vec<f32>,
+    #[serde(default)]
+    pub organic: sequential::OrganicMetrics,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GeneratedTrack {
@@ -116,8 +226,10 @@ pub struct GeneratedTrack {
 }
 impl GeneratedTrack {
     pub fn validate(&self) -> GenerationResult<Track> {
-        if self.provenance.version != 1 || self.definition.role != TrackRole::Training {
-            return Err("generated tracks are version 1 and training-only; refusing validation/test registration".into());
+        if self.provenance.version != self.provenance.config.version()
+            || self.definition.role != TrackRole::Training
+        {
+            return Err("generated representation version mismatch or track is not training-only; refusing validation/test registration".into());
         }
         let rebuilt = from_decisions(
             &self.provenance.config,
@@ -151,6 +263,9 @@ impl GeneratedTrack {
 
 pub fn generate(config: &GeneratorConfig, seed: u64) -> GenerationResult<GeneratedTrack> {
     config.validate()?;
+    if config.is_sequential() {
+        return sequential::generate(config, seed);
+    }
     let mut rng = ChaCha12Rng::seed_from_u64(seed);
     let counts = config.choice_counts();
     let mut last_error = String::new();
@@ -177,66 +292,26 @@ pub fn from_decisions(
     decisions: &[usize],
 ) -> GenerationResult<GeneratedTrack> {
     config.validate()?;
-    if decisions.len() != config.sectors + 1
-        || decisions
-            .iter()
-            .zip(config.choice_counts())
-            .any(|(c, n)| *c >= n)
-    {
-        return Err("generator decision shape/choice out of bounds".into());
+    if !config.decisions_valid(decisions) {
+        return Err(if config.is_sequential() {
+            "construction incomplete: no feasible closure within the decision/length budget".into()
+        } else {
+            "generator decision shape/choice out of bounds".into()
+        });
     }
-    let control_points = decisions[..config.sectors]
-        .iter()
-        .enumerate()
-        .map(|(sector, level)| {
-            let base = match config.shape {
-                GeneratorShape::Radial => {
-                    let angle = std::f32::consts::TAU * sector as f32 / config.sectors as f32;
-                    Vec2::from_angle(angle)
-                }
-                GeneratorShape::RoundedRectangle => {
-                    // Four perimeter edges, with enough collinear controls to preserve
-                    // actual straight spans in the same closed Catmull-Rom representation.
-                    let along = sector as f32 * 4. / config.sectors as f32;
-                    let t = along.fract();
-                    match along as usize {
-                        0 => Vec2::new(1., -1. + 2. * t),
-                        1 => Vec2::new(1. - 2. * t, 1.),
-                        2 => Vec2::new(-1., 1. - 2. * t),
-                        _ => Vec2::new(-1. + 2. * t, -1.),
-                    }
-                }
-            };
-            (base * config.radius * config.radial_levels[*level]).to_array()
-        })
-        .collect::<Vec<_>>();
-    let width = config.widths[decisions[config.sectors]];
-    let hash = geometry_hash(&control_points, width, config.samples_per_control_point);
-    let definition = TrackDefinition {
-        id: format!("generated_{hash}"),
-        name: format!("Procedural {hash}"),
-        country: None,
-        category: TrackCategory::PermanentCircuit,
-        role: TrackRole::Training,
-        difficulty: TrackDifficulty::MediumHard,
-        width,
-        samples_per_control_point: config.samples_per_control_point,
-        start_index: 0,
-        control_points,
-        description: Some(
-            "Procedural training circuit; not a held-out validation/test track".into(),
-        ),
-        approximation_note: Some(
-            "Closed Catmull-Rom radial sectors; validated sampled borders and curvature".into(),
-        ),
-    };
+    let definition = definition_from_decisions(config, decisions)?;
+    let hash = geometry_hash(
+        &definition.control_points,
+        definition.width,
+        definition.samples_per_control_point,
+    );
     let track = Track::from_definition(&definition).map_err(|e| e.to_string())?;
     let geometry = validate_geometry(&track, config)?;
     Ok(GeneratedTrack {
         definition,
         geometry,
         provenance: GenerationProvenance {
-            version: 1,
+            version: config.version(),
             seed,
             attempt,
             config: config.clone(),
@@ -291,9 +366,14 @@ pub fn validate_geometry(
             last_sign = curvature.signum();
         }
     }
-    let safe_curvature = config
-        .max_curvature
-        .min(1. / (track.width * 0.5 + CAR_LENGTH));
+    let safe_curvature = config.max_curvature.min(
+        1. / (track.width * 0.5
+            + if config.is_sequential() {
+                CAR_LENGTH * 0.5 + 3.
+            } else {
+                CAR_LENGTH
+            }),
+    );
     if max_curvature > safe_curvature {
         return Err(format!(
             "curvature {max_curvature:.6} exceeds {safe_curvature:.6}"
@@ -316,14 +396,25 @@ pub fn validate_geometry(
     if spawn_clearance < 3. {
         return Err("spawn rectangle too close to track border".into());
     }
-    Ok(GeometryMetrics {
+    let mut metrics = GeometryMetrics {
         length: track.total_length,
         width: track.width,
         max_curvature,
         mean_absolute_curvature: sum / n as f32,
         direction_changes,
         spawn_clearance,
-    })
+        ..Default::default()
+    };
+    if config.is_sequential() {
+        sequential::characterize(track, &mut metrics);
+        if config.organic {
+            metrics.organic = sequential::organic_metrics(
+                &track.samples.iter().map(|s| s.position).collect::<Vec<_>>(),
+                true,
+            );
+        }
+    }
+    Ok(metrics)
 }
 
 /// FNV-1a over explicit little-endian geometry bits, stable across Rust versions.
@@ -370,7 +461,7 @@ mod tests {
     #[test]
     fn deterministic_closed_valid_training_tracks() {
         let config = GeneratorConfig::default();
-        for seed in 0..12 {
+        for seed in [3, 17, 47] {
             let a = generate(&config, seed).unwrap();
             assert_eq!(a, generate(&config, seed).unwrap());
             let track = a.validate().unwrap();
@@ -392,7 +483,7 @@ mod tests {
             radius: 700.,
             radial_levels: vec![1.],
             widths: vec![80.],
-            ..Default::default()
+            ..GeneratorConfig::legacy()
         };
         let generated = generate(&config, 47).unwrap();
         let track = generated.validate().unwrap();
@@ -454,4 +545,74 @@ mod tests {
         tampered.definition.width += 1.;
         assert!(tampered.validate().is_err());
     }
+}
+
+/// A single generator control point, shared by construction and the live view.
+pub fn control_point(config: &GeneratorConfig, sector: usize, level: usize) -> [f32; 2] {
+    let base = match config.shape {
+        GeneratorShape::Radial => {
+            let angle = std::f32::consts::TAU * sector as f32 / config.sectors as f32;
+            Vec2::from_angle(angle)
+        }
+        GeneratorShape::RoundedRectangle => {
+            // Four perimeter edges, with enough collinear controls to preserve
+            // actual straight spans in the same closed Catmull-Rom representation.
+            let along = sector as f32 * 4. / config.sectors as f32;
+            let t = along.fract();
+            match along as usize {
+                0 => Vec2::new(1., -1. + 2. * t),
+                1 => Vec2::new(1. - 2. * t, 1.),
+                2 => Vec2::new(-1., 1. - 2. * t),
+                _ => Vec2::new(-1. + 2. * t, -1.),
+            }
+        }
+        GeneratorShape::Sequential => panic!("sequential points require a construction state"),
+    };
+    (base * config.radius * config.radial_levels[level]).to_array()
+}
+
+/// Complete geometry before validation, also used to display rejected circuits honestly.
+pub fn definition_from_decisions(
+    config: &GeneratorConfig,
+    decisions: &[usize],
+) -> GenerationResult<TrackDefinition> {
+    config.validate()?;
+    if config.is_sequential() {
+        return sequential::definition(config, decisions);
+    }
+    if decisions.len() != config.sectors + 1
+        || decisions
+            .iter()
+            .zip(config.choice_counts())
+            .any(|(c, n)| *c >= n)
+    {
+        return Err("generator decision shape/choice out of bounds".into());
+    }
+    let control_points = decisions[..config.sectors]
+        .iter()
+        .enumerate()
+        .map(|(sector, level)| control_point(config, sector, *level))
+        .collect::<Vec<_>>();
+    let width = config.widths[decisions[config.sectors]];
+    let hash = geometry_hash(&control_points, width, config.samples_per_control_point);
+    let definition = TrackDefinition {
+        sampled_centerline: false,
+        id: format!("generated_{hash}"),
+        name: format!("Procedural {hash}"),
+        country: None,
+        category: TrackCategory::PermanentCircuit,
+        role: TrackRole::Training,
+        difficulty: TrackDifficulty::MediumHard,
+        width,
+        samples_per_control_point: config.samples_per_control_point,
+        start_index: 0,
+        control_points,
+        description: Some(
+            "Procedural training circuit; not a held-out validation/test track".into(),
+        ),
+        approximation_note: Some(
+            "Closed Catmull-Rom radial sectors; validated sampled borders and curvature".into(),
+        ),
+    };
+    Ok(definition)
 }

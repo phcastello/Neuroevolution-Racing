@@ -1,0 +1,26 @@
+[
+  {
+    "archive": "after-17/search.ron.zip",
+    "search_sha256": "3271d5d5c5b8226a60d5dec499e9c81897fdf6ebf36ee449565038ec92ed084a",
+    "bytes": 30960389,
+    "compressed_bytes": 3824445
+  },
+  {
+    "archive": "after-47/search.ron.zip",
+    "search_sha256": "5ff91b284b638c549d8a6371f4d8750b59314abacdaccf7a31eccc17026a45ae",
+    "bytes": 30662905,
+    "compressed_bytes": 3827008
+  },
+  {
+    "archive": "before-17/search.ron.zip",
+    "search_sha256": "c6331119a08dac9f0f85aeaf1ff1f1246fcb951111ec95445c53be21414fcbd5",
+    "bytes": 13226126,
+    "compressed_bytes": 1442340
+  },
+  {
+    "archive": "before-47/search.ron.zip",
+    "search_sha256": "81daad980504ec7232c785636d56c45b703c2b30c8785ed52b90e8d1a8e895d3",
+    "bytes": 13650638,
+    "compressed_bytes": 1558401
+  }
+]

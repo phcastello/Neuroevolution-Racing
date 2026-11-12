@@ -604,6 +604,80 @@ fn paused_ui_requests_switch_reset_and_select_without_ga_resources_or_stale_stat
 }
 
 #[test]
+fn new_track_preview_clears_old_pause_and_queued_requests_and_executes_policy() {
+    let directory = TestDirectory::new();
+    let config = small_config();
+    let old = directory.checkpoint(1, &config);
+    let next = directory.checkpoint(2, &config);
+    let original = fs::read(&next).unwrap();
+    let mut library = TrackLibrary::load_default().unwrap();
+    let generator = crate::simulation::procedural::GeneratorConfig {
+        radial_levels: vec![1.],
+        ..crate::simulation::procedural::GeneratorConfig::legacy()
+    };
+    let generated =
+        crate::simulation::procedural::from_decisions(&generator, 47, 0, &vec![0; 13]).unwrap();
+    library
+        .insert_generated(generated.definition.clone())
+        .unwrap();
+    let previous = load_viewer(&old, 2, &library);
+    let mut app = playback_app(previous, library);
+    for _ in 0..3 {
+        app.update();
+    }
+    {
+        let mut controls = app.world_mut().resource_mut::<ViewerControls>();
+        controls.paused = true;
+        controls.restart_requested = true;
+        controls.track_requested = Some("interlagos".into());
+        controls.checkpoint_requested = Some(old);
+        controls.selected = 1;
+        controls.speed = 0.1;
+    }
+    attach(
+        app.world_mut(),
+        persistence::load(&next).unwrap(),
+        next.clone(),
+        1,
+        Some(&generated.definition.id),
+        None,
+    )
+    .unwrap();
+    assert!(
+        !app.world().resource::<ViewerControls>().paused,
+        "new test must start running even if the previous PPO was paused"
+    );
+    assert!(
+        app.world()
+            .resource::<ViewerControls>()
+            .track_requested
+            .is_none()
+    );
+    assert!(
+        app.world()
+            .resource::<ViewerControls>()
+            .checkpoint_requested
+            .is_none()
+    );
+    for _ in 0..5 {
+        app.update();
+    }
+    let viewer = app.world().non_send::<Viewer>();
+    assert_eq!(viewer.track_id, generated.definition.id);
+    assert_eq!(viewer.checkpoint_path, next);
+    assert_eq!(
+        app.world().resource::<Track>().definition,
+        generated.definition
+    );
+    assert!(viewer.cars[0].decisions > 0 && viewer.cars[0].physical_ticks > 0);
+    assert_eq!(
+        fs::read(&next).unwrap(),
+        original,
+        "inspection cannot train or rewrite the checkpoint"
+    );
+}
+
+#[test]
 fn viewer_restores_saved_speed_semantics_and_metadata_without_reinterpreting_weights() {
     use racing_rl::config::SpeedNormalization;
     let library = TrackLibrary::load_default().unwrap();

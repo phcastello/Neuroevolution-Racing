@@ -1,0 +1,24 @@
+{
+  "long_evaluation": {
+    "collision": false,
+    "completed": true,
+    "progress": 1.0,
+    "ticks": 4943
+  },
+  "short_evaluation": {
+    "budget_insufficient": false,
+    "collision_rate": 0.0,
+    "completion_rate": 0.0,
+    "inference_seconds": 0.0,
+    "mean_progress": 0.0,
+    "policy_episodes": 0,
+    "policy_steps": 0,
+    "reference_collision": false,
+    "reference_completed": false,
+    "reference_episodes": 1,
+    "reference_progress": 0.01938588172197342,
+    "reference_steps": 120,
+    "simulation_seconds": 0.0,
+    "simulation_steps": 120
+  }
+}

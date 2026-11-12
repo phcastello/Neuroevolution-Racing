@@ -4,7 +4,7 @@ Projeto acadêmico em Rust para estudar controladores neurais de veículos e sua
 
 - **GA:** evolui os pesos de MLPs; preserva treinamento visual, indivíduos, gerações, corridas, checkpoints e workers headless.
 - **PPO:** Actor-Critic com PPO-Clip, GAE, backward analítico e Adam implementados manualmente sobre tensores Burn. Treinamento headless com CPU NdArray por padrão; WGPU/Vulkan é opcional.
-- **ACO:** Max-Min Ant System constrói pistas de treinamento por decisões discretas de geometria. Registra probabilidades, feromônios, fitness e rejeições para reprodução visual.
+- **ACO:** Max-Min Ant System constrói pistas de treinamento por decisões discretas de geometria. Publica decisões, geometria, probabilidades, feromônios, fitness e rejeições durante a execução visual e preserva os arquivos para replay.
 - **Currículo adaptativo:** mistura pistas originais, procedurais, selecionadas e históricas. A busca avalia uma política congelada e troca o conjunto somente entre rollouts.
 
 A hipótese científica é que sensores concentrados à frente, antecipação da linha central e seleção adaptativa de pistas possam melhorar a conclusão em pistas desconhecidas. Nenhum resultado dessa hipótese é presumido.
@@ -23,7 +23,21 @@ cargo run --locked -p neuroevolution-racing-app
 ./tools/server47.sh smoke
 ```
 
-A aplicação visual compartilha janela, renderizador, câmera e dashboard; os modos ativam seus próprios sistemas. PPO carrega checkpoints congelados e até 16 veículos. ACO reproduz snapshots de buscas headless, permite inspecionar formiga/iteração e abrir uma candidata no simulador com um checkpoint PPO. Experimentos consulta configurações, métricas, gráficos e checkpoints existentes.
+A aplicação visual compartilha janela, renderizador, câmera e dashboard; os modos ativam seus próprios sistemas. PPO carrega checkpoints congelados e até 16 veículos. Experimentos consulta configurações, métricas, gráficos e checkpoints existentes.
+
+Ao selecionar **PPO**, a tela já lista os checkpoints de `results_ppo`, incluindo subpastas e treinos antigos. Clique no checkpoint para carregar. O catálogo agrupa por treino, mostra o último checkpoint e permite expandir os anteriores ou filtrar por nome. A descoberta e a leitura dos metadados ocorrem em segundo plano; os pesos completos são validados somente ao carregar a política escolhida. No **ACO**, marque **Avaliar com PPO congelado** e selecione na mesma lista, sem copiar caminhos.
+
+No modo **ACO**, configure formigas, iterações, seed e parâmetros, escolha execução sem piloto ou com checkpoint PPO congelado e clique em **Iniciar**. Pausa, continuação, passo por decisão/iteração, velocidade, interrupção e reinício controlam o motor real em uma thread separada. A construção mostra pontos e segmentos abertos; candidatas completas exibem o circuito e a validação geométrica. As abas mostram probabilidades, feromônios, evaporação/reforço, candidatas, fitness, diversidade e histórico. **Salvar / exportar / reproduzir arquivo** preserva a exportação e o replay das buscas anteriores. Uma candidata também pode ser aberta no piloto PPO. Ao trocar de modo, a busca pausa; use **Continuar** ao retornar.
+
+O padrão agora é **Sequencial v2**: retas, arcos, hairpins, chicanes e curvas em S alteram posição e orientação. Cada expansão mantém um fechamento viável por primitivas, com tangente, largura, curvatura e orçamento verificados. **Radial legado** continua disponível. Veja a [reformulação e as pistas produzidas](docs/ACO_SEQUENCIAL.md), incluindo a calibração por La Source, métricas e capturas reais. O preset headless pequeno é `configs/aco/sequential_smoke.ron`.
+
+A construção atual inclui **exploração livre, exploração orientada e fechamento**, bends e composições assimétricas. A interface explica quando a formiga prefere passear mais. Veja a [comparação de organicidade com seeds fixas](docs/ACO_ORGANICO.md), com todas as candidatas, métricas e voltas de referência.
+
+O padrão físico usa larguras **96/100/104** e raio base **75**, comparáveis a Interlagos. A aba **Candidatas** permite filtrar, comparar, salvar e testar válidas rejeitadas; geometrias inválidas têm diagnóstico separado. Veja [largura física, retenção e inspeção de rejeições](docs/ACO_LARGURA_INSPECAO.md).
+
+O ACO usa a **visualização principal**, com **Ver melhor pista** e **Ver geração** na barra superior. **Ver pista**, na lista de candidatas, mostra a escolha nessa mesma cena. Não há janela flutuante de construção no modo ACO. [Uso e capturas](docs/ACO_VISUALIZACAO_PRINCIPAL.md).
+
+**Testar com PPO** abre a candidata selecionada com um checkpoint congelado, sem herdar a pausa do teste anterior. O seletor mantém a pista vinculada enquanto você escolhe a política. [Fluxo e validação do teste ACO → PPO](docs/ACO_TESTE_PPO.md).
 
 ## Pistas e pesquisas
 

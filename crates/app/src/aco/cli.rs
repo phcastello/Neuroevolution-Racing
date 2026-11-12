@@ -39,10 +39,31 @@ pub enum AcoCommand {
         #[arg(long)]
         output: PathBuf,
     },
+    /// Export retained valid candidates and separate diagnostic artifacts.
+    Inspect {
+        file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+        #[arg(long)]
+        rejected_valid: bool,
+        #[arg(long)]
+        diagnostics: bool,
+    },
 }
 
 pub fn run(command: AcoCommand) -> GenerationResult<()> {
     match command {
+        AcoCommand::Inspect {
+            file,
+            output,
+            rejected_valid,
+            diagnostics,
+        } => {
+            let mut search = SearchArchive::load(file)?;
+            search.config.retention.export_rejected_valid = rejected_valid;
+            search.config.retention.export_diagnostics = diagnostics;
+            search.export_inspection(output)
+        }
         AcoCommand::Generate {
             count,
             seed,
@@ -135,6 +156,11 @@ pub fn run(command: AcoCommand) -> GenerationResult<()> {
             }
             search.save(output.join("search.ron"))?;
             search.export_selected(output.join("tracks"))?;
+            if search.config.retention.export_rejected_valid
+                || search.config.retention.export_diagnostics
+            {
+                search.export_inspection(output.join("inspection"))?;
+            }
             print_summary(&search);
             Ok(())
         }
@@ -177,7 +203,7 @@ fn print_summary(search: &SearchArchive) {
     }
 }
 
-fn checkpoint_identity(path: &std::path::Path) -> GenerationResult<String> {
+pub(crate) fn checkpoint_identity(path: &std::path::Path) -> GenerationResult<String> {
     use std::io::Read;
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut buffer = [0u8; 65536];

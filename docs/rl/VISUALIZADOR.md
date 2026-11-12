@@ -1,5 +1,9 @@
 # Visualizador PPO integrado
 
+Na aplicação unificada, selecione **PPO** no menu para ver **Checkpoints PPO disponíveis**, sem carregar uma política antes. A busca automática inclui o `results_ppo` do repositório e suas subpastas, mesmo quando o executável é aberto de outro diretório. Clique no arquivo desejado para iniciar o playback. Cada treino mostra seu último checkpoint; **Outros checkpoints** expande os anteriores. O filtro procura por treino ou arquivo e **Atualizar** refaz a busca. O mesmo catálogo aparece no ACO ao marcar **Avaliar com PPO congelado**.
+
+A lista aparece enquanto os metadados são lidos em segundo plano. Para arquivos grandes no formato padrão, a prévia lê cabeçalho e rodapé, sem desserializar todos os pesos de cada treinamento. A validação completa ocorre no carregamento; uma falha é mostrada sem substituir a política anterior.
+
 O comando `rl view` abre a experiência visual do Neuroevolution-Racing para uma política PPO congelada: pista com a renderização original, sprites dos veículos, câmera compartilhada, painel egui, sensores, hitboxes e inspeção da rede Actor-Critic. Assistir às corridas não inicia treinamento.
 
 ## Abrir um checkpoint

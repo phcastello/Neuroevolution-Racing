@@ -93,7 +93,7 @@ impl Scene {
             queries,
         }
     }
-    fn intersects(&self, position: Vec2, heading: f32) -> bool {
+    pub(crate) fn intersects(&self, position: Vec2, heading: f32) -> bool {
         let mut state = self.queries.borrow_mut();
         let query = state
             .get(self.app.world())
@@ -107,7 +107,7 @@ impl Scene {
             )
             .is_empty()
     }
-    fn ray(&self, origin: Vec2, angle: f32, range: f32) -> f32 {
+    pub(crate) fn ray(&self, origin: Vec2, angle: f32, range: f32) -> f32 {
         let mut state = self.queries.borrow_mut();
         let query = state
             .get(self.app.world())
@@ -296,27 +296,42 @@ impl RacingEnvironment {
     /// Deterministic geometric reference: pure pursuit with curvature-limited target speed.
     pub(crate) fn reference_action(&self) -> [f32; 2] {
         let track = &self.scenes[self.scene_index].track;
-        let projection = track.project(self.state.position);
-        let lookahead = (45. + self.state.speed.abs() * 0.35).clamp(45., 130.);
+        let projection = track.project_near(
+            self.state.position,
+            self.nearest,
+            self.physics.progress_search_radius,
+        );
+        let lookahead = (20. + self.state.speed.abs() * 0.22).clamp(24., 65.);
         let target = track.point_at_distance(projection.track_distance + lookahead);
         let delta = target - self.state.position;
         let forward = Vec2::from_angle(self.state.heading);
         let curvature = 2. * forward.perp_dot(delta) / delta.length_squared().max(1.);
-        let desired = self.state.speed.max(30.) * curvature;
+        let desired = self.state.speed.max(15.) * curvature;
         let steering = (desired
             / super::systems::desired_yaw_rate(self.state.speed, 1., &self.physics)
                 .abs()
                 .max(0.05))
         .clamp(-1., 1.);
-        let ahead = track.point_at_distance(projection.track_distance + lookahead * 2.);
-        let bend = (target - projection.point)
-            .normalize_or_zero()
-            .angle_to((ahead - target).normalize_or_zero())
-            .abs()
-            / lookahead;
-        let target_speed = (self.physics.max_lateral_acceleration * 0.45 / bend.max(0.001))
-            .sqrt()
-            .clamp(55., 160.);
+        // Instantaneous curvature at each preview station, with the physical
+        // braking-distance envelope propagated backwards to the current pose.
+        let mut target_speed = 160_f32;
+        for distance in [0., 20., 40., 65., 100., 150., 220., 320., 480.] {
+            let arc = projection.track_distance + distance;
+            let a = track.point_at_distance(arc - 8.);
+            let b = track.point_at_distance(arc);
+            let c = track.point_at_distance(arc + 8.);
+            let ab = b - a;
+            let bc = c - b;
+            let k = (2. * ab.perp_dot(bc) / (ab.length() * bc.length() * c.distance(a)).max(1e-6))
+                .abs();
+            let corner_speed = (self.physics.max_lateral_acceleration * 0.35 / k.max(0.0001))
+                .sqrt()
+                .clamp(25., 160.);
+            let allowed = (corner_speed * corner_speed
+                + 2. * self.physics.braking_rate * 0.65 * distance)
+                .sqrt();
+            target_speed = target_speed.min(allowed);
+        }
         [
             steering,
             ((target_speed - self.state.speed) / 25.).clamp(-1., 1.),
@@ -957,14 +972,14 @@ mod procedural_reference_tests {
             (GeneratorShape::RoundedRectangle, 17),
         ] {
             let generator = if shape == GeneratorShape::Radial {
-                GeneratorConfig::default()
+                GeneratorConfig::legacy()
             } else {
                 GeneratorConfig {
                     shape,
                     radius: 700.,
                     radial_levels: vec![1.],
                     widths: vec![80.],
-                    ..Default::default()
+                    ..GeneratorConfig::legacy()
                 }
             };
             let generated = procedural::generate(&generator, seed).unwrap();

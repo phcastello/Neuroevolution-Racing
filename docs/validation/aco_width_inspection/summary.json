@@ -1,0 +1,37 @@
+{
+  "previous": {
+    "attempted": 12,
+    "valid": 12,
+    "reference_completed": 12,
+    "accepted": 11,
+    "reasons": {
+      "accepted": 11,
+      "InsufficientDiversity": 1
+    },
+    "width": 52.666666666666664,
+    "nominal_cars": 3.5111111402511597,
+    "useful_width_mean": 38.64961322148641,
+    "useful_width_min": 38.548616886138916,
+    "physical_cars": 2.5777777433395386,
+    "rectangularity": 0.09751372303192814,
+    "heading_entropy": 0.9306115359067917,
+    "complexity": 0.9487362653017044
+  },
+  "wide": {
+    "attempted": 12,
+    "valid": 12,
+    "reference_completed": 12,
+    "accepted": 12,
+    "reasons": {
+      "accepted": 12
+    },
+    "width": 100.33333333333333,
+    "nominal_cars": 6.688888827959697,
+    "useful_width_mean": 86.31758499145508,
+    "useful_width_min": 86.21863810221355,
+    "physical_cars": 5.755555431048076,
+    "rectangularity": 0.10679039568640292,
+    "heading_entropy": 0.921497051914533,
+    "complexity": 0.9430411905050278
+  }
+}

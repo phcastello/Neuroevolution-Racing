@@ -1,0 +1,15 @@
+{
+  "completion_rate": 0.0,
+  "mean_progress": 0.11479867249727249,
+  "collision_rate": 1.0,
+  "reference_completed": true,
+  "simulation_steps": 2177,
+  "reference_steps": 1986,
+  "policy_steps": 191,
+  "reference_progress": 1.0,
+  "reference_episodes": 1,
+  "policy_episodes": 1,
+  "checkpoint": "results_ppo/e_continuation_8h/runs/ppo-1792544758769280200-19876/checkpoint-004000.ron",
+  "checkpoint_sha256": "952e25a69c517157558f1544c9b3a3c497cefa3ef934ec4de728c89877279c29",
+  "checkpoint_unchanged": true
+}

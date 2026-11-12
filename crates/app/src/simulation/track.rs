@@ -66,6 +66,10 @@ impl TrackDifficulty {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TrackDefinition {
+    /// Versioned generated tracks may supply an already sampled C1 centerline.
+    /// Historical assets keep their exact Catmull-Rom interpolation.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sampled_centerline: bool,
     pub id: String,
     pub name: String,
     pub country: Option<String>,
@@ -78,6 +82,9 @@ pub struct TrackDefinition {
     pub control_points: Vec<[f32; 2]>,
     pub description: Option<String>,
     pub approximation_note: Option<String>,
+}
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl TrackDefinition {
@@ -396,6 +403,45 @@ pub struct Track {
 }
 
 impl Track {
+    /// Unvalidated geometry for diagnostics only; uses the exact production sampling.
+    pub(crate) fn preview_geometry(
+        definition: &TrackDefinition,
+    ) -> Result<[Vec<Vec2>; 3], TrackLoadError> {
+        definition.validate_input()?;
+        let mut controls: Vec<_> = definition
+            .control_points
+            .iter()
+            .copied()
+            .map(Vec2::from_array)
+            .collect();
+        controls.rotate_left(definition.start_index);
+        let mut positions = vec![];
+        if definition.sampled_centerline {
+            positions = controls;
+        } else {
+            let n = controls.len();
+            for i in 0..n {
+                for step in 0..definition.samples_per_control_point {
+                    positions.push(catmull_rom(
+                        controls[(i + n - 1) % n],
+                        controls[i],
+                        controls[(i + 1) % n],
+                        controls[(i + 2) % n],
+                        step as f32 / definition.samples_per_control_point as f32,
+                    ));
+                }
+            }
+        }
+        let mut left = vec![];
+        let mut right = vec![];
+        let n = positions.len();
+        for i in 0..n {
+            let f = (positions[(i + 1) % n] - positions[(i + n - 1) % n]).normalize_or(Vec2::X);
+            left.push(positions[i] + f.perp() * definition.width * 0.5);
+            right.push(positions[i] - f.perp() * definition.width * 0.5);
+        }
+        Ok([positions, left, right])
+    }
     pub fn from_definition(definition: &TrackDefinition) -> Result<Self, TrackLoadError> {
         definition.validate_input()?;
         let mut control_points = definition
@@ -405,6 +451,14 @@ impl Track {
             .map(Vec2::from_array)
             .collect::<Vec<_>>();
         control_points.rotate_left(definition.start_index);
+
+        if definition.sampled_centerline {
+            return Self::from_centerline(
+                definition.clone(),
+                control_points.clone(),
+                control_points,
+            );
+        }
 
         let samples_per_control_point = definition.samples_per_control_point;
         let mut positions = Vec::with_capacity(control_points.len() * samples_per_control_point);
@@ -599,6 +653,27 @@ fn catmull_rom(p0: Vec2, p1: Vec2, p2: Vec2, p3: Vec2, t: f32) -> Vec2 {
         + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3)
 }
 
+/// Sweep broad phase only: the existing exact intersection predicate is kept.
+/// Dense sequential centerlines must not require quadratic global pair testing.
+struct SegmentBounds {
+    index: usize,
+    side: u8,
+    min: Vec2,
+    max: Vec2,
+}
+fn segment_bounds(points: &[Vec2], side: u8) -> Vec<SegmentBounds> {
+    let mut bounds = closed_segments(points)
+        .enumerate()
+        .map(|(index, (a, b))| SegmentBounds {
+            index,
+            side,
+            min: a.min(b),
+            max: a.max(b),
+        })
+        .collect::<Vec<_>>();
+    bounds.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    bounds
+}
 fn validate_closed_polyline(
     points: &[Vec2],
     geometry_name: &str,
@@ -612,22 +687,27 @@ fn validate_closed_polyline(
         }
     }
 
-    for first in 0..points.len() {
-        let first_next = (first + 1) % points.len();
-        for second in first + 1..points.len() {
-            let second_next = (second + 1) % points.len();
-            let adjacent = first_next == second || second_next == first;
-            if adjacent {
+    let bounds = segment_bounds(points, 0);
+    for first in 0..bounds.len() {
+        for second in first + 1..bounds.len() {
+            let a = &bounds[first];
+            let b = &bounds[second];
+            if b.min.x > a.max.x + GEOMETRY_EPSILON {
+                break;
+            }
+            if a.max.y + GEOMETRY_EPSILON < b.min.y || b.max.y + GEOMETRY_EPSILON < a.min.y {
                 continue;
             }
-            if segments_intersect(
-                points[first],
-                points[first_next],
-                points[second],
-                points[second_next],
-            ) {
+            let i = a.index;
+            let j = b.index;
+            let ni = (i + 1) % points.len();
+            let nj = (j + 1) % points.len();
+            if ni == j || nj == i {
+                continue;
+            }
+            if segments_intersect(points[i], points[ni], points[j], points[nj]) {
                 return Err(TrackLoadError::new(format!(
-                    "track {context}: {geometry_name} self-intersects at segments {first} and {second}"
+                    "track {context}: {geometry_name} self-intersects at segments {i} and {j}"
                 )));
             }
         }
@@ -640,11 +720,35 @@ fn validate_distinct_polylines(
     right: &[Vec2],
     context: &str,
 ) -> Result<(), TrackLoadError> {
-    for (left_index, (left_start, left_end)) in closed_segments(left).enumerate() {
-        for (right_index, (right_start, right_end)) in closed_segments(right).enumerate() {
-            if segments_intersect(left_start, left_end, right_start, right_end) {
+    let mut bounds = segment_bounds(left, 0);
+    bounds.extend(segment_bounds(right, 1));
+    bounds.sort_by(|a, b| a.min.x.total_cmp(&b.min.x));
+    for first in 0..bounds.len() {
+        for second in first + 1..bounds.len() {
+            let a = &bounds[first];
+            let b = &bounds[second];
+            if b.min.x > a.max.x + GEOMETRY_EPSILON {
+                break;
+            }
+            if a.side == b.side
+                || a.max.y + GEOMETRY_EPSILON < b.min.y
+                || b.max.y + GEOMETRY_EPSILON < a.min.y
+            {
+                continue;
+            }
+            let (i, j) = if a.side == 0 {
+                (a.index, b.index)
+            } else {
+                (b.index, a.index)
+            };
+            if segments_intersect(
+                left[i],
+                left[(i + 1) % left.len()],
+                right[j],
+                right[(j + 1) % right.len()],
+            ) {
                 return Err(TrackLoadError::new(format!(
-                    "track {context}: left border segment {left_index} intersects right border segment {right_index}"
+                    "track {context}: left border segment {i} intersects right border segment {j}"
                 )));
             }
         }
@@ -652,7 +756,7 @@ fn validate_distinct_polylines(
     Ok(())
 }
 
-fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+pub(crate) fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
     let ab = b - a;
     let ac = c - a;
     let ad = d - a;
@@ -683,6 +787,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sweep_validation_agrees_with_all_pair_intersection_checks() {
+        for shift in 0..12 {
+            let points = (0..20)
+                .map(|i| {
+                    let index = if shift % 2 == 0 { i } else { (i * 7) % 20 };
+                    let angle = index as f32 * std::f32::consts::TAU / 20.;
+                    Vec2::from_angle(angle) * (100. + shift as f32)
+                })
+                .collect::<Vec<_>>();
+            let mut intersection = false;
+            for i in 0..points.len() {
+                for j in i + 1..points.len() {
+                    if (i + 1) % points.len() == j || (j + 1) % points.len() == i {
+                        continue;
+                    }
+                    intersection |= segments_intersect(
+                        points[i],
+                        points[(i + 1) % points.len()],
+                        points[j],
+                        points[(j + 1) % points.len()],
+                    );
+                }
+            }
+            assert_eq!(
+                validate_closed_polyline(&points, "test", "sweep").is_err(),
+                intersection
+            );
+            let other = points
+                .iter()
+                .map(|p| *p + Vec2::new(shift as f32 * 30., 50.))
+                .collect::<Vec<_>>();
+            let crossing = closed_segments(&points)
+                .any(|(a, b)| closed_segments(&other).any(|(c, d)| segments_intersect(a, b, c, d)));
+            assert_eq!(
+                validate_distinct_polylines(&points, &other, "sweep").is_err(),
+                crossing
+            );
+        }
+    }
+    #[test]
     fn generated_registration_cannot_change_held_out_membership() {
         let mut library = TrackLibrary::load_default().unwrap();
         let validation: Vec<_> = library.validation_tracks().map(|t| t.id.clone()).collect();
@@ -709,6 +853,7 @@ mod tests {
 
     fn definition(control_points: Vec<[f32; 2]>) -> TrackDefinition {
         TrackDefinition {
+            sampled_centerline: false,
             id: "test".into(),
             name: "Test Track".into(),
             country: None,
